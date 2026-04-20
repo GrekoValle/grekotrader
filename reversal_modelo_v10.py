@@ -2459,7 +2459,7 @@ with st.sidebar:
     if st.button("🔄 Actualizar noticias", use_container_width=True, help="Descarga y analiza las últimas noticias de cada ticker via yfinance"):
         # Combinar tickers de todos los tabs escaneados
         _all_scanned = []
-        for _k in ["scan_entrar","scan_anticipar","scan_radar","scan_detectadas"]:
+        for _k in ["scan_entrar","scan_swing","scan_detectadas"]:
             _d = st.session_state.get(_k)
             if _d is not None and not _d.empty:
                 _all_scanned.extend(_d["Ticker"].tolist())
@@ -2572,35 +2572,41 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
             unsafe_allow_html=True)
         return
 
-    # ── Selector de orden ────────────────────────────────────
-    sort_options = {
-        "Score":       "🏆 Score (relevancia)",
-        "Prob_NBIS":   "⭐ Prob NBIS (similitud patrón)",
-        "Momentum_3d": "🚀 Momentum 3 días",
-        "Volumen":     "📊 Volumen vs promedio",
-        "DD_pico":     "📉 Corrección (más castigadas)",
-        "RSI":         "📈 RSI",
-    }
-    # Filtrar solo columnas que existen
-    available = {k:v for k,v in sort_options.items() if k in resultado_df.columns}
-    # Default según tab
-    default_idx = list(available.keys()).index(default_sort) if default_sort in available else 0
+    # ── Orden automático por tab + columna Señal ────────────
+    df_show = resultado_df.copy()
 
-    sort_col_left, sort_col_right = st.columns([3,2])
-    with sort_col_left:
-        sort_by = st.selectbox(
-            "Ordenar por",
-            options=list(available.keys()),
-            format_func=lambda x: available[x],
-            index=default_idx,
-            key=f"sort_{tab_key}",
-            label_visibility="collapsed"
-        )
-    with sort_col_right:
-        sort_asc = st.toggle("Ascendente", value=(sort_by=="DD_pico"), key=f"sort_asc_{tab_key}")
+    # Agregar columna "Señal" con interpretación clara
+    def generar_senal(row):
+        rsi  = float(row.get("RSI", 50))
+        dd   = float(row.get("DD_pico", 0))
+        vol  = float(row.get("Volumen", 100))
+        prob = float(row.get("Prob_NBIS", 0))
+        dec  = str(row.get("Decision",""))
+        if dec == "ENTRAR" or (rsi < 35 and dd < -20 and vol > 150):
+            return "🔥 Entrar hoy"
+        elif dec == "ANTICIPAR" or (rsi < 45 and dd < -15 and vol > 100):
+            return "⚡ Entrada válida"
+        elif dd < -8 and rsi < 55:
+            return "👀 En corrección — vigilar"
+        elif rsi > 65:
+            return "⛔ RSI alto — esperar"
+        else:
+            return "🔵 Neutral — observar"
 
-    df_show = resultado_df.sort_values(sort_by, ascending=sort_asc) if sort_by in resultado_df.columns else resultado_df
-    render_table(df_show, cols_show)
+    if not df_show.empty:
+        df_show["Señal modelo"] = df_show.apply(generar_senal, axis=1)
+
+    # Orden automático según tab (sin selector)
+    if default_sort in df_show.columns:
+        asc = (default_sort == "DD_pico")
+        df_show = df_show.sort_values(default_sort, ascending=asc)
+
+    # Mostrar columna Señal primero
+    cols_con_senal = cols_show.copy() if cols_show else list(df_show.columns)
+    if "Señal modelo" not in cols_con_senal:
+        cols_con_senal = ["Ticker","Señal modelo"] + [c for c in cols_con_senal if c not in ("Ticker","Señal modelo")]
+
+    render_table(df_show, cols_con_senal)
 
     # Exportar señales del día
     boton_exportar(resultado_df, titulo, f"exp_{tab_key}")
@@ -2911,23 +2917,7 @@ with tab2:
             f'Sin swings activos ahora — mercado sin momentum claro de rebote.'+
             f'</div>', unsafe_allow_html=True)
     else:
-        # ── Selector orden Swing ─────────────────────────────
-        sw_sort_opts = {
-            "Momentum_3d":  "🚀 Momentum 3 días (default)",
-            "Volumen":      "📊 Volumen vs promedio",
-            "Dias_Alcistas":"📅 Días alcistas",
-            "Prob_NBIS":    "⭐ Prob NBIS",
-            "RSI":          "📈 RSI",
-        }
-        sw_av = {k:v for k,v in sw_sort_opts.items() if k in sw_result.columns}
-        sc1, sc2 = st.columns([3,2])
-        with sc1:
-            sw_sort = st.selectbox("Ordenar por", list(sw_av.keys()),
-                format_func=lambda x: sw_av[x],
-                index=0, key="sort_swing", label_visibility="collapsed")
-        with sc2:
-            sw_asc = st.toggle("Ascendente", value=False, key="sort_asc_swing")
-        sw_result = sw_result.sort_values(sw_sort, ascending=sw_asc) if sw_sort in sw_result.columns else sw_result
+        # Ordenar por Momentum 3d descendente (default Swing)
 
         # Render swing cards
         for _, r in sw_result.iterrows():
@@ -3082,50 +3072,143 @@ with tab4:
         f'</div>', unsafe_allow_html=True)
 
     st.markdown(
-        f'<div class="info-box">El screener detecta automáticamente acciones en el mismo sector '+
-        f'cuando encuentras un líder en "Entrar hoy" o "Radar". '+
-        f'Primero escanea uno de esos tabs, luego vuelve aquí para ver las arrastradas.</div>',
+        f'<div class="info-box">Lógica: si NBIS está en Swing Activo rebotando, '+
+        f'el modelo busca <strong>otras acciones del mismo sector que AÚN NO han subido</strong>. '+
+        f'Esas son las arrastradas — la oportunidad de entrar antes de que el sector complete el movimiento.<br>'+
+        f'<strong>Paso 1:</strong> Escanea Swing Activo o Entrar hoy. '+
+        f'<strong>Paso 2:</strong> Vuelve aquí para ver las arrastradas.</div>',
         unsafe_allow_html=True)
 
-    # Combinar resultados de todos los tabs escaneados
-    all_results = []
-    for key in ["scan_entrar","scan_swing","scan_detectadas"]:
+    # ── Lógica Sympathy: Líder → Arrastradas ─────────────────
+    # 1. Obtener líderes = acciones en Swing Activo o Entrar Hoy
+    lideres_df = pd.DataFrame()
+    for key in ["scan_swing","scan_entrar"]:
         df_tmp = st.session_state.get(key)
         if df_tmp is not None and not df_tmp.empty:
-            # Asegurar columnas mínimas para render_table
-            for col, default in [
-                ("Decision","SEGUIR"),("Fase","Fase 2"),("Trigger","—"),
-                ("Patron_Tipo","GRADUAL"),("Patron_Emoji","📈"),
-                ("RSI_Dir","—"),("RSI_Dir_Desc","—"),
-                ("Prob_NBIS",0.0),("Sim_NBIS",0.0),
-                ("Motivo","—"),("Lectura","—"),("Arrastradas","—"),
-                ("Score",0),("Color","#64748B"),("Bg","#F8FAFC"),
-            ]:
-                if col not in df_tmp.columns:
-                    df_tmp = df_tmp.copy()
-                    df_tmp[col] = default
-            all_results.append(df_tmp)
+            df_tmp = df_tmp.copy()
+            df_tmp["_tab_origen"] = "Swing Activo" if key=="scan_swing" else "Entrar hoy"
+            lideres_df = pd.concat([lideres_df, df_tmp], ignore_index=True)
 
-    if all_results:
-        df_combined = pd.concat(all_results).drop_duplicates(subset="Ticker")
-        # Group by area to find sector clusters
-        for area_name, group in df_combined.groupby("Area"):
-            if len(group) >= 2:
-                st.markdown(
-                    f'<div style="font-size:12px;font-weight:700;color:{B};margin:10px 0 6px">'+
-                    f'🔗 Sector {area_name} — {len(group)} acciones detectadas</div>',
-                    unsafe_allow_html=True)
-                render_table(group.sort_values("Score",ascending=False) if "Score" in group.columns else group, COLS_MAIN)
-    else:
+    # 2. Obtener candidatos = todas las acciones escaneadas (detectadas M1 + universo)
+    candidatos_df = pd.DataFrame()
+    for key in ["scan_detectadas","scan_swing","scan_entrar"]:
+        df_tmp = st.session_state.get(key)
+        if df_tmp is not None and not df_tmp.empty:
+            candidatos_df = pd.concat([candidatos_df, df_tmp], ignore_index=True)
+
+    all_results = []  # kept for compatibility
+
+    if lideres_df.empty:
         st.markdown(
             f'<div style="background:{P_BG};border:1px solid {P_BOR};border-radius:12px;'+
             f'padding:32px;text-align:center">'+
             f'<div style="font-size:36px;margin-bottom:10px">🔗</div>'+
-            f'<div style="font-size:14px;font-weight:700;color:{P};margin-bottom:6px">Sin datos aún</div>'+
-            f'<div style="font-size:12px;color:{TXT_MUT}">Primero escanea "Entrar hoy", "Anticipadas" o "Radar" '+
-            f'para detectar sympathy plays automáticamente.</div>'+
+            f'<div style="font-size:14px;font-weight:700;color:{P};margin-bottom:6px">Sin líderes detectados</div>'+
+            f'<div style="font-size:12px;color:{TXT_MUT}">'+
+            f'Paso 1: Escanea ⚡ Swing Activo<br>'+
+            f'Paso 2: Escanea 📡 Detectadas M1 (opcional — para ver arrastradas)<br>'+
+            f'Paso 3: Vuelve aquí para ver líderes y arrastradas</div>'+
             f'</div>', unsafe_allow_html=True)
+    else:
+        lideres_df["Area"] = lideres_df["Area"].fillna("—").astype(str)
+        tickers_lideres = set(lideres_df["Ticker"].str.upper().tolist())
 
+        # Agrupar líderes por sector
+        for area_name, grupo_lideres in lideres_df.groupby("Area"):
+            if area_name in ("—","","nan"):
+                continue
+
+            lideres_list = grupo_lideres["Ticker"].tolist()
+            tab_origen   = grupo_lideres["_tab_origen"].iloc[0]
+
+            # Buscar arrastradas en detectadas M1
+            arrastradas = pd.DataFrame()
+            df_detect = st.session_state.get("scan_detectadas")
+            if df_detect is not None and not df_detect.empty:
+                arrastradas = df_detect[
+                    (df_detect["Area"].fillna("—") == area_name) &
+                    (~df_detect["Ticker"].isin(tickers_lideres))
+                ]
+
+            n_lideres     = len(lideres_list)
+            n_arrastradas = len(arrastradas)
+
+            # Header del sector
+            st.markdown(
+                f'<div style="background:{P_BG};border:1px solid {P_BOR};'+
+                f'border-left:4px solid {P};border-radius:10px;'+
+                f'padding:12px 16px;margin:12px 0 6px">'+
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'+
+                f'<div style="font-size:14px;font-weight:800;color:{P}">🔗 {area_name}</div>'+
+                f'<div style="font-size:11px;color:{TXT_MUT}">'+
+                f'{n_lideres} líder(es) · {n_arrastradas} arrastrada(s)</div>'+
+                f'</div></div>',
+                unsafe_allow_html=True)
+
+            # Mostrar líderes
+            st.markdown(
+                f'<div style="font-size:11px;font-weight:700;color:{G};margin:6px 0 4px">'+
+                f'🏆 Líderes — rebotando ({tab_origen})</div>',
+                unsafe_allow_html=True)
+
+            for _, lider_row in grupo_lideres.iterrows():
+                dias = int(lider_row.get("Dias_Alcistas",0)) if "Dias_Alcistas" in lider_row.index else 0
+                mom  = float(lider_row.get("Momentum_3d",0)) if "Momentum_3d" in lider_row.index else 0
+                vol  = float(lider_row.get("Volumen",0))
+                if dias >= 3 and mom >= 8 and vol >= 150:
+                    fase_l = "🔥 ENTRAR HOY"
+                elif dias >= 2 and mom >= 4:
+                    fase_l = "⚡ ENTRADA VÁLIDA"
+                else:
+                    fase_l = "👀 TEMPRANA"
+
+                st.markdown(
+                    f'<div style="background:{G_BG};border:1px solid {G_BOR};'+
+                    f'border-radius:8px;padding:8px 14px;margin-bottom:4px;'+
+                    f'display:flex;justify-content:space-between;align-items:center">'+
+                    f'<div style="display:flex;align-items:center;gap:10px">'+
+                    f'  <span style="font-size:14px;font-weight:800;color:{G}">{lider_row["Ticker"]}</span>'+
+                    f'  <span style="font-size:11px;color:{TXT_MUT}">{str(lider_row.get("Nombre",""))[:25]}</span>'+
+                    f'  <span style="font-size:11px;font-weight:700;color:{G}">{fase_l}</span>'+
+                    f'</div>'+
+                    f'<div style="display:flex;gap:16px;font-size:10px;color:{TXT_MUT}">'+
+                    f'  <span>RSI {lider_row.get("RSI","—")}</span>'+
+                    f'  <span>Vol {int(vol)}%</span>'+
+                    f'  <span>DD {lider_row.get("DD_pico","—")}%</span>'+
+                    f'  <span>${lider_row.get("Precio","—")}</span>'+
+                    f'</div></div>',
+                    unsafe_allow_html=True)
+
+            # Mostrar arrastradas
+            if not arrastradas.empty:
+                st.markdown(
+                    f'<div style="font-size:11px;font-weight:700;color:{C};margin:8px 0 4px">'+
+                    f'🔗 Arrastradas — aún no han subido (oportunidad)</div>',
+                    unsafe_allow_html=True)
+                for _, arr_row in arrastradas.iterrows():
+                    st.markdown(
+                        f'<div style="background:{C_BG};border:1px solid {C_BOR};'+
+                        f'border-radius:8px;padding:8px 14px;margin-bottom:4px;'+
+                        f'display:flex;justify-content:space-between;align-items:center">'+
+                        f'<div style="display:flex;align-items:center;gap:10px">'+
+                        f'  <span style="font-size:14px;font-weight:800;color:{C}">{arr_row["Ticker"]}</span>'+
+                        f'  <span style="font-size:11px;color:{TXT_MUT}">{str(arr_row.get("Nombre",""))[:25]}</span>'+
+                        f'  <span style="font-size:11px;color:{C};font-weight:700">'+
+                        f'⚡ Arrastrada por {", ".join(lideres_list[:2])}</span>'+
+                        f'</div>'+
+                        f'<div style="display:flex;gap:16px;font-size:10px;color:{TXT_MUT}">'+
+                        f'  <span>RSI {arr_row.get("RSI","—")}</span>'+
+                        f'  <span>DD {arr_row.get("DD_pico","—")}%</span>'+
+                        f'  <span>Score {arr_row.get("Score","—")}</span>'+
+                        f'  <span>${arr_row.get("Precio","—")}</span>'+
+                        f'</div></div>',
+                        unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f'<div style="font-size:10px;color:{TXT_MUT};padding:6px 14px;'+
+                    f'background:{BG_HEAD};border-radius:6px;margin-bottom:6px">'+
+                    f'Sin arrastradas en Detectadas M1 — escanea 📡 Detectadas M1 para ver candidatas.</div>',
+                    unsafe_allow_html=True)
 
 
 # ══ TAB 5 — MI WATCHLIST ═══════════════════════════════════════
