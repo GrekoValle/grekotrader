@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  GREKOTRADER — 100% Automático · Sin datos en duro · v11               ║
+║  REVERSAL SCANNER v9 — 100% Automático · Sin datos en duro             ║
 ║                                                                  ║
 ║  Instalar:  pip install streamlit plotly pandas numpy           ║
 ║  Ejecutar:  streamlit run reversal_modelo_v5.py                 ║
@@ -24,8 +24,8 @@ import datetime
 import io
 
 st.set_page_config(
-    page_title="GrekoTrader v11",
-    page_icon="🦅",
+    page_title="Reversal Scanner v9",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -963,431 +963,37 @@ def boton_exportar(df: pd.DataFrame, tab_nombre: str,
             unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────
-#  ETF STRATEGY DASHBOARD
-# ─────────────────────────────────────────────────────────────
-ETF_UNIVERSE = {
-    # Índices principales
-    "VOO":  {"nombre":"Vanguard S&P500",      "categoria":"Indice",    "riesgo":"Bajo",    "rend_hist":10.0},
-    "QQQ":  {"nombre":"Nasdaq 100",            "categoria":"Indice",    "riesgo":"Medio",   "rend_hist":13.0},
-    "SPY":  {"nombre":"S&P500 SPDR",           "categoria":"Indice",    "riesgo":"Bajo",    "rend_hist":10.0},
-    "VEA":  {"nombre":"Europa/Asia Dev",       "categoria":"Indice",    "riesgo":"Medio",   "rend_hist":7.0},
-    # Renta fija / Parking
-    "SGOV": {"nombre":"Treasury 0-3m",         "categoria":"Parking",   "riesgo":"Mínimo",  "rend_hist":5.0},
-    "BIL":  {"nombre":"Treasury Bills",        "categoria":"Parking",   "riesgo":"Mínimo",  "rend_hist":5.0},
-    # Sectoriales
-    "XLK":  {"nombre":"Tech Select",           "categoria":"Sectorial", "riesgo":"Medio",   "rend_hist":12.0},
-    "XLV":  {"nombre":"Health Care",           "categoria":"Sectorial", "riesgo":"Bajo",    "rend_hist":9.0},
-    "XLE":  {"nombre":"Energy Select",         "categoria":"Sectorial", "riesgo":"Medio",   "rend_hist":8.0},
-    # Ya tienes
-    "TAN":  {"nombre":"Solar Energy",          "categoria":"Sectorial", "riesgo":"Alto",    "rend_hist":8.0},
-    "XBI":  {"nombre":"Biotech",               "categoria":"Sectorial", "riesgo":"Alto",    "rend_hist":9.0},
-    # Cripto
-    "IBIT": {"nombre":"Bitcoin ETF BlackRock", "categoria":"Cripto",    "riesgo":"MuyAlto", "rend_hist":30.0},
-    "ETHA": {"nombre":"Ethereum ETF BlackRock","categoria":"Cripto",    "riesgo":"MuyAlto", "rend_hist":25.0},
-}
-
-def fetch_etf_data(ticker: str) -> dict:
-    """Obtiene datos técnicos de un ETF desde yfinance."""
-    try:
-        import yfinance as yf
-        import numpy as np
-        tk  = yf.Ticker(ticker)
-        hist = tk.history(period="6mo")
-        if hist.empty or len(hist) < 20:
-            return None
-        close = hist["Close"].values
-        vol   = hist["Volume"].values
-
-        precio  = float(close[-1])
-        pico    = float(close.max())
-        dd      = round((precio - pico) / pico * 100, 1)
-
-        # RSI 14
-        delta  = hist["Close"].diff()
-        gain   = delta.clip(lower=0).rolling(14).mean()
-        loss   = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi    = round(float(100 - 100/(1 + gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
-
-        # Tendencia 20d
-        ema20  = float(hist["Close"].ewm(span=20).mean().iloc[-1])
-        tend   = "↑" if precio > ema20 * 1.02 else "↓" if precio < ema20 * 0.98 else "→"
-
-        # YTD
-        try:
-            hist_ytd = tk.history(period="1y")
-            ytd_price = float(hist_ytd["Close"].iloc[0]) if not hist_ytd.empty else precio
-            ytd_pct   = round((precio - ytd_price) / ytd_price * 100, 1)
-        except:
-            ytd_pct = 0.0
-
-        # Volumen ratio
-        avg_vol   = float(np.mean(vol[-20:]))
-        vol_ratio = round(float(vol[-1]) / avg_vol * 100, 0) if avg_vol > 0 else 100
-
-        # Señal de entrada
-        if rsi < 35 and dd < -15:
-            senal = "🟢 COMPRAR AHORA"
-            senal_c = "16A34A"
-        elif rsi < 50 and dd < -8:
-            senal = "🟡 BUENA ENTRADA"
-            senal_c = "D97706"
-        elif rsi > 70:
-            senal = "🔴 ESPERAR — RSI alto"
-            senal_c = "DC2626"
-        elif dd > -3:
-            senal = "⚪ EN MÁXIMOS"
-            senal_c = "64748B"
-        else:
-            senal = "🔵 NEUTRAL"
-            senal_c = "2563EB"
-
-        return {
-            "ticker":    ticker,
-            "precio":    precio,
-            "dd":        dd,
-            "rsi":       rsi,
-            "tend":      tend,
-            "ytd":       ytd_pct,
-            "vol_ratio": vol_ratio,
-            "senal":     senal,
-            "senal_c":   senal_c,
-            "ema20":     ema20,
-        }
-    except Exception:
-        return None
-
-
-def calcular_estrategia(capital: float, plazo: str, perfil: str,
-                         etf_data: dict) -> dict:
-    """
-    Calcula distribución óptima de capital en ETFs
-    basada en indicadores actuales + perfil + plazo.
-    """
-    # Pesos base por perfil y plazo
-    if perfil == "Moderado":
-        if plazo == "Corto (6-12m)":
-            base = {"Parking":0.50, "Indice":0.30, "Sectorial":0.10, "Cripto":0.10}
-        elif plazo == "Mediano (2-5a)":
-            base = {"Parking":0.20, "Indice":0.50, "Sectorial":0.20, "Cripto":0.10}
-        else:  # Largo
-            base = {"Parking":0.05, "Indice":0.55, "Sectorial":0.25, "Cripto":0.15}
-    elif perfil == "Agresivo":
-        if plazo == "Corto (6-12m)":
-            base = {"Parking":0.20, "Indice":0.40, "Sectorial":0.25, "Cripto":0.15}
-        elif plazo == "Mediano (2-5a)":
-            base = {"Parking":0.05, "Indice":0.45, "Sectorial":0.30, "Cripto":0.20}
-        else:
-            base = {"Parking":0.00, "Indice":0.40, "Sectorial":0.35, "Cripto":0.25}
-    else:  # Conservador
-        if plazo == "Corto (6-12m)":
-            base = {"Parking":0.70, "Indice":0.20, "Sectorial":0.10, "Cripto":0.00}
-        elif plazo == "Mediano (2-5a)":
-            base = {"Parking":0.40, "Indice":0.40, "Sectorial":0.15, "Cripto":0.05}
-        else:
-            base = {"Parking":0.20, "Indice":0.50, "Sectorial":0.25, "Cripto":0.05}
-
-    # Ajustar por señales técnicas — sobreponderar ETFs en zona de compra
-    allocations = []
-    for tk, meta in ETF_UNIVERSE.items():
-        d = etf_data.get(tk)
-        if d is None:
-            continue
-        cat = meta["categoria"]
-        peso_base = base.get(cat, 0)
-
-        # Ajuste por RSI y DD
-        if d["rsi"] < 40 and d["dd"] < -15:
-            ajuste = 1.3   # sobreponderar
-        elif d["rsi"] > 70:
-            ajuste = 0.6   # subponderar
-        elif d["dd"] > -3:
-            ajuste = 0.8   # en máximos, esperar
-        else:
-            ajuste = 1.0
-
-        peso_ajustado = peso_base * ajuste
-        monto         = round(capital * peso_ajustado, 0)
-
-        allocations.append({
-            "ticker":   tk,
-            "nombre":   meta["nombre"],
-            "categoria":cat,
-            "riesgo":   meta["riesgo"],
-            "rend_hist":meta["rend_hist"],
-            "peso":     round(peso_ajustado * 100, 1),
-            "monto":    monto,
-            "rsi":      d["rsi"],
-            "dd":       d["dd"],
-            "senal":    d["senal"],
-            "senal_c":  d["senal_c"],
-            "tend":     d["tend"],
-            "ytd":      d["ytd"],
-            "precio":   d["precio"],
-        })
-
-    # Normalizar a 100%
-    total_peso = sum(a["peso"] for a in allocations)
-    if total_peso > 0:
-        for a in allocations:
-            a["peso"]  = round(a["peso"] / total_peso * 100, 1)
-            a["monto"] = round(capital * a["peso"] / 100, 0)
-
-    # DCA — dividir en meses según plazo
-    meses_dca = {"Corto (6-12m)": 3, "Mediano (2-5a)": 4, "Largo (5-10a)": 6}
-    n_meses   = meses_dca.get(plazo, 4)
-    monto_mes = round(capital / n_meses, 0)
-
-    # Proyección
-    rend_ponderado = sum(
-        (a["monto"] / capital) * ETF_UNIVERSE[a["ticker"]]["rend_hist"]
-        for a in allocations if capital > 0
-    )
-    años = {"Corto (6-12m)": 1, "Mediano (2-5a)": 5, "Largo (5-10a)": 10}
-    n_años = años.get(plazo, 5)
-    proy_base = round(capital * (1 + rend_ponderado/100) ** n_años, 0)
-    proy_opt  = round(capital * (1 + (rend_ponderado+3)/100) ** n_años, 0)
-    proy_pes  = round(capital * (1 + max(rend_ponderado-4, 2)/100) ** n_años, 0)
-
-    return {
-        "allocations":      sorted(allocations, key=lambda x: -x["monto"]),
-        "n_meses":          n_meses,
-        "monto_mes":        monto_mes,
-        "rend_ponderado":   round(rend_ponderado, 1),
-        "proy_base":        proy_base,
-        "proy_opt":         proy_opt,
-        "proy_pes":         proy_pes,
-        "n_años":           n_años,
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-#  SCORE DE REBOTE v11 — Reemplaza Prob NBIS + Sim NBIS
-#  Basado en condiciones del patrón, no en comparación exacta
-# ─────────────────────────────────────────────────────────────
-def calcular_score_rebote(dd: float, rsi: float, vol_ratio: float,
-                           dias_alcistas: int, momentum_3d: float,
-                           tiene_catalizador: bool, dias_para_cat: int,
-                           beta: float) -> dict:
-    """
-    Score de rebote 0-100 basado en 4 componentes:
-    30% DD (corrección profunda)
-    25% RSI girando desde zona baja
-    25% Volumen confirmando
-    20% Catalizador próximo
-    """
-    # ── Componente 1: DD (30 pts) ─────────────────────────────
-    # Buscamos corrección real pero no destrucción
-    if dd <= -40:
-        pts_dd = 25    # muy profundo — posible destrucción
-    elif dd <= -30:
-        pts_dd = 30    # ideal — corrección severa
-    elif dd <= -20:
-        pts_dd = 28    # muy bueno
-    elif dd <= -15:
-        pts_dd = 22    # bueno
-    elif dd <= -10:
-        pts_dd = 15    # moderado
-    elif dd <= -5:
-        pts_dd = 8     # leve
-    else:
-        pts_dd = 0     # en máximos — no hay corrección
-
-    # ── Componente 2: RSI girando (25 pts) ────────────────────
-    # RSI bajo + subiendo = zona ideal de entrada
-    if rsi <= 30:
-        pts_rsi = 25   # sobreventa extrema
-    elif rsi <= 38:
-        pts_rsi = 23   # sobreventa clara
-    elif rsi <= 45:
-        pts_rsi = 18   # zona baja — buena entrada
-    elif rsi <= 55:
-        pts_rsi = 12   # zona media — aceptable
-    elif rsi <= 65:
-        pts_rsi = 5    # zona alta — precaución
-    else:
-        pts_rsi = 0    # sobrecomprado — no entrar
-
-    # Bonus si momentum positivo (RSI girando hacia arriba)
-    if momentum_3d > 0 and dias_alcistas >= 2:
-        pts_rsi = min(pts_rsi + 5, 25)
-
-    # ── Componente 3: Volumen (25 pts) ────────────────────────
-    # Volumen alto confirma que el movimiento es real
-    if vol_ratio >= 300:
-        pts_vol = 25   # excepcional — institucional
-    elif vol_ratio >= 200:
-        pts_vol = 22   # muy alto
-    elif vol_ratio >= 150:
-        pts_vol = 18   # alto — buena señal
-    elif vol_ratio >= 100:
-        pts_vol = 12   # normal
-    elif vol_ratio >= 70:
-        pts_vol = 6    # bajo
-    else:
-        pts_vol = 0    # muy bajo — señal débil
-
-    # ── Componente 4: Catalizador (20 pts) ────────────────────
-    if tiene_catalizador and dias_para_cat <= 7:
-        pts_cat = 20   # earnings en menos de 1 semana
-    elif tiene_catalizador and dias_para_cat <= 15:
-        pts_cat = 16   # earnings en 2 semanas
-    elif tiene_catalizador and dias_para_cat <= 30:
-        pts_cat = 10   # earnings en el mes
-    elif tiene_catalizador:
-        pts_cat = 5    # earnings lejanos
-    else:
-        pts_cat = 0    # sin catalizador identificado
-
-    # ── Score total ───────────────────────────────────────────
-    score_total = pts_dd + pts_rsi + pts_vol + pts_cat
-
-    # Penalización por Beta muy alto sin volumen
-    if beta > 3.0 and vol_ratio < 100:
-        score_total = max(score_total - 10, 0)
-
-    # Clasificación
-    if score_total >= 75:
-        nivel = "🔥 FUERTE"
-        color = "16A34A"
-    elif score_total >= 60:
-        nivel = "⚡ BUENO"
-        color = "D97706"
-    elif score_total >= 45:
-        nivel = "🟡 MODERADO"
-        color = "2563EB"
-    else:
-        nivel = "🔵 DÉBIL"
-        color = "64748B"
-
-    return {
-        "score":      score_total,
-        "nivel":      nivel,
-        "color":      color,
-        "pts_dd":     pts_dd,
-        "pts_rsi":    pts_rsi,
-        "pts_vol":    pts_vol,
-        "pts_cat":    pts_cat,
-        "detalle":    f"DD:{pts_dd}/30 · RSI:{pts_rsi}/25 · Vol:{pts_vol}/25 · Cat:{pts_cat}/20",
-    }
-
-
-def clasificar_sizing(score: int, vix: float) -> dict:
-    """
-    Cambio 3: Sizing dinámico por VIX + Score
-    Retorna el tamaño recomendado de posición como % del capital planificado
-    """
-    if vix < 20:
-        vix_mult = 0.5    # mercado tranquilo → reducir
-        vix_label = "VIX bajo — reducir tamaño"
-        vix_color = "D97706"
-    elif vix < 30:
-        vix_mult = 1.0    # normal
-        vix_label = "VIX normal — tamaño estándar"
-        vix_color = "2563EB"
-    else:
-        vix_mult = 1.5    # miedo/pánico → aumentar
-        vix_label = "VIX alto — aumentar tamaño"
-        vix_color = "16A34A"
-
-    if score >= 75:
-        score_pct = 1.0
-        score_label = "Señal fuerte"
-    elif score >= 60:
-        score_pct = 0.75
-        score_label = "Señal buena"
-    elif score >= 45:
-        score_pct = 0.50
-        score_label = "Señal moderada"
-    else:
-        score_pct = 0.25
-        score_label = "Señal débil"
-
-    sizing_final = round(vix_mult * score_pct * 100)
-    sizing_final = max(25, min(sizing_final, 150))  # entre 25% y 150%
-
-    return {
-        "sizing_pct":   sizing_final,
-        "vix_label":    vix_label,
-        "vix_color":    vix_color,
-        "score_label":  score_label,
-        "detalle":      f"{vix_label} × {score_label} = {sizing_final}% del capital planificado",
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-#  UNIVERSO DINÁMICO — S&P500 + Nasdaq100 + Portfolio personal
-#  Se descarga automáticamente desde Wikipedia al iniciar
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=86400)  # cache 24 horas — se refresca 1 vez al día
-def cargar_universo_dinamico() -> list:
-    """
-    Descarga automáticamente:
-    - S&P500 (~503 tickers) desde Wikipedia
-    - Nasdaq100 (~100 tickers) desde Wikipedia
-    - Portfolio personal (siempre incluido)
-    Total: ~550 tickers únicos sin hardcodear ninguno
-    """
-    portfolio_personal = [
-        "NBIS","MRNA","CROX","APLD","ASTS","NVDA","CNC","CLOV",
-        "NKE","XBI","TAN","VOO","IBIT","ETHA","SPY","IBRX",
-    ]
-
-    tickers = set(portfolio_personal)
-
-    # S&P500
-    try:
-        import pandas as pd
-        sp500 = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        )[0]
-        sp500_tickers = sp500["Symbol"].str.replace(".","-").tolist()
-        tickers.update(sp500_tickers)
-    except Exception:
-        pass
-
-    # Nasdaq100
-    try:
-        import pandas as pd
-        nq100 = pd.read_html(
-            "https://en.wikipedia.org/wiki/Nasdaq-100"
-        )[4]
-        col = "Ticker" if "Ticker" in nq100.columns else nq100.columns[1]
-        nq100_tickers = nq100[col].tolist()
-        tickers.update([str(t) for t in nq100_tickers if isinstance(t,str) and t.isupper()])
-    except Exception:
-        pass
-
-    # Si falló la descarga, usar lista base amplia
-    if len(tickers) <= len(portfolio_personal) + 5:
-        base = [
-            "MSFT","GOOGL","META","AMZN","AAPL","NVDA","TSLA","ORCL","CRM","SNOW",
-            "PLTR","ADBE","INTU","NOW","WDAY","DDOG","NET","CRWD","PANW","ZS",
-            "AMD","AVGO","MRVL","ANET","SMCI","APP","RDDT","DOMO","AI","HOOD",
-            "SOFI","COIN","AFRM","PYPL","V","MA","AXP","JPM","BAC","GS",
-            "IBRX","CELH","HIMS","RXRX","PCVX","PFE","ABBV","MRK","BIIB","GILD",
-            "AMGN","REGN","VRTX","ISRG","ZTS","MRNA","BNTX","ARWR","BEAM","CRSP",
-            "MARA","RIOT","CORZ","CLSK","HUT","IONQ","RGTI","QBTS","MSTR","BTDR",
-            "MELI","NU","BABA","PDD","SE","GRAB","GLOB","DESP","VTEX",
-            "LULU","SBUX","MCD","CMG","TGT","COST","BURL","CHWY","W","RH",
-            "OXY","DVN","XOM","CVX","ENPH","SEDG","RUN","TAN","FSLR","ARRY",
-            "BA","GE","HON","LMT","RTX","CAT","DE","AXON","KTOS","JOBY",
-            "OPEN","STAA","ACN","XBI","IBB","ARKK","SOXX","XLK","XLF","XLV",
-        ]
-        tickers.update(base)
-
-    result = sorted(list(tickers))
-    return result
-
-
-# Cargar universo al iniciar
-SCAN_UNIVERSE = cargar_universo_dinamico()
+SCAN_UNIVERSE = [
+    # ── Tu portfolio actual — siempre monitoreadas ──────────
+    "NBIS","MRNA","CROX","APLD","ASTS","NVDA","CNC","CLOV","NKE",
+    # ── AI / Tech ───────────────────────────────────────────
+    "MSFT","GOOGL","META","AMZN","AMD","CRM","ORCL","SNOW","PLTR",
+    "PANW","ZS","CRWD","NET","DDOG","MDB","SMCI","ANET","MRVL","AVGO",
+    "AAPL","NFLX","UBER","SHOP","NOW","WDAY","ADBE","INTU","TEAM","HUBS",
+    # ── Salud / Biotech ─────────────────────────────────────
+    "PFE","ABBV","MRK","BMY","GILD","AMGN","REGN","VRTX","BIIB",
+    "ILMN","ZTS","ISRG","SYK","BSX","EW","DXCM","HOLX","AXSM","TVTX",
+    # ── Fintech / Finanzas ──────────────────────────────────
+    "HOOD","SOFI","COIN","AFRM","XYZ","PYPL","V","MA","AXP","JPM","BAC",
+    "GS","MS","C","WFC","BLK","SCHW","ICE","CME","MELI","NU",
+    # ── Energía ─────────────────────────────────────────────
+    "OXY","DVN","XOM","CVX","COP","SLB","HAL","FCX","NEM","FANG",
+    # ── Consumo ─────────────────────────────────────────────
+    "LULU","SBUX","MCD","CMG","TGT","COST","HD","BURL",
+    # ── Industrial / Aero ───────────────────────────────────
+    "BA","GE","HON","LMT","RTX","GD","DE","CAT","UPS","FDX",
+    # ── Cripto / AI Infra ───────────────────────────────────
+    "MARA","CLSK","RIOT","IREN","CORZ","IONQ","RGTI","QBTS",
+    # ── Especiales / ETFs ───────────────────────────────────
+    "OPEN","ARKK","XBI","SOXX","XLF","XLV","XLK","XLI",
+    "ACN","STAA","TSLA","ENPH","SEDG","RUN","TEAM","ALB",
+]
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def scan_tab(rsi_max: float, dd_min: float,
              score_min: int, decision_filter: list,
              vol_min_k: float = 200,
-             max_results: int = 50) -> pd.DataFrame:
+             max_results: int = 25) -> pd.DataFrame:
     """
     Escanea el universo y retorna candidatos para el tab específico.
     rsi_max, dd_min: filtros técnicos del tab
@@ -2054,22 +1660,6 @@ def analizar_posicion(precio_compra, precio_actual, rsi, macd,
     # El RSI alto en posición abierta no es señal de salida
     # La señal de salida la determina el PnL vs los 3 tramos NBIS
 
-    # -1. Verificar día 10 con excepción por catalizador
-    if dias_posicion >= 10 and estrategia != "Largo_Plazo":
-        if tiene_cat_proximo and dias_para_cat <= 5:
-            # Excepción: catalizador en próximos 5 días → extender
-            pass  # continuar con análisis normal
-        elif pnl_pct > 0:
-            tramos = [(60,"VENDER",R),(40,"MANTENER",A),(0,"RUNNER",G)]
-            return {"tramos":tramos,"señal":"Día 10 — Vender 60% · Revisar",
-                    "razon":f"Día {dias_posicion} en posición. Swing venció. Vender 60% hoy. "
-                            f"Sin catalizador próximo — no extender.","color":R,"urgencia":"HOY"}
-        else:
-            tramos = [(100,"VENDER",R),(0,"MANTENER",G),(0,"RUNNER",G)]
-            return {"tramos":tramos,"señal":"Día 10 — Salida obligatoria",
-                    "razon":f"Día {dias_posicion} en posición. Swing venció sin ganancia. "
-                            f"Salir hoy — liberar capital para nueva oportunidad.","color":R,"urgencia":"HOY"}
-
     # 0. Largo plazo — sin stop, solo monitorear
     if estrategia == "Largo_Plazo":
         if pnl_pct >= t1_pct*100:
@@ -2278,11 +1868,10 @@ def render_table(df_sub, show_cols):
         row_html+="</tr>"
         rows_html+=row_html
     hdr={"Ticker":"Ticker","Area":"Área","Decision":"Decisión","Fase":"Fase","Trigger":"Trigger",
-         "Precio":"Precio","Score_Rebote":"Score Rebote","Nivel_Rebote":"Nivel","Detalle_Rebote":"Detalle Score",
-         "Prob_NBIS":"Score Rebote","Sim_NBIS":"Nivel","Motivo":"Motivo",
-         "Lectura":"Lectura Trader","Arrastradas":"Arrastradas","Patron_Tipo":"Tipo Patrón","RSI_Dir":"RSI Dir","Lider":"Líder",
+         "Precio":"Precio","Prob_NBIS":"Prob NBIS","Sim_NBIS":"Sim. NBIS","Motivo":"Motivo",
+         "Lectura":"Lectura Trader","Arrastradas":"Acciones arrastradas","Patron_Tipo":"Tipo Patrón","RSI_Dir":"RSI Dirección","Lider":"Líder",
          "Score":"Score","RSI":"RSI","Pre_Move":"Pre/Post %","Pre_Vol":"Vol Pre",
-         "Post_Vol":"Vol Post","Short_Int":"Short %","DD_pico":"DD Caída","Cat_Fecha":"Catalizador"}
+         "Post_Vol":"Vol Post","Short_Int":"Short %","DD_pico":"DD pico","Cat_Fecha":"Catalizador"}
     ths="".join([f"<th>{hdr.get(c,c)}</th>" for c in show_cols])
     st.markdown(f'<div class="tbl-wrap"><table class="dtbl"><thead><tr>{ths}</tr></thead><tbody>{rows_html}</tbody></table></div>',unsafe_allow_html=True)
 
@@ -2362,35 +1951,19 @@ def fetch_noticias_ticker(ticker: str) -> list:
     """
     Descarga y analiza las últimas noticias de un ticker via yfinance.
     Retorna lista de dicts con los campos del modelo.
-    Compatible con yfinance antiguo y nuevo formato.
     """
     noticias = []
     try:
         import yfinance as yf
         stk = yf.Ticker(ticker)
-        try:
-            raw_news = stk.news or []
-        except Exception:
-            raw_news = []
+        raw_news = stk.news or []
 
         for item in raw_news[:8]:  # máximo 8 noticias
             try:
-                # Soporte para dict (formato antiguo) y objeto (formato nuevo)
-                if isinstance(item, dict):
-                    titulo = item.get("title","") or item.get("headline","")
-                    link   = item.get("link","") or item.get("url","") or item.get("clickThroughUrl","")
-                    ts     = item.get("providerPublishTime",0) or item.get("pubDate",0)
-                    fuente = item.get("publisher","Yahoo Finance") or item.get("source","Yahoo Finance")
-                else:
-                    # Objeto con atributos
-                    titulo = getattr(item, "title", "") or getattr(item, "headline", "")
-                    link   = getattr(item, "link", "") or getattr(item, "url", "")
-                    ts     = getattr(item, "providerPublishTime", 0)
-                    fuente = getattr(item, "publisher", "Yahoo Finance")
-                    # Intentar como dict también
-                    if not titulo and hasattr(item, "get"):
-                        titulo = item.get("content",{}).get("title","") if isinstance(item.get("content"),dict) else ""
-                        link   = item.get("content",{}).get("clickThroughUrl",{}).get("url","") if isinstance(item.get("content"),dict) else ""
+                titulo   = item.get("title", "")
+                link     = item.get("link", "") or item.get("url", "")
+                ts       = item.get("providerPublishTime", 0)
+                fuente   = item.get("publisher", "Yahoo Finance")
 
                 if not titulo or not link:
                     continue
@@ -2489,13 +2062,19 @@ def render_noticias_panel(ticker: str, noticias: list, bonus: int):
 
 # ── Tabs ──────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────
+tab1,tab2,tab3,tab4,tab5,tab6,tab7=st.tabs([
+    "📡 Detectadas M1","⚡ Swing Activo","🔥 Entrar hoy",
+    "🔗 Sympathy","🔎 Mi Watchlist","💼 Mis Posiciones","💜 Posiciones Amparito",
+])
+
+
 # ─────────────────────────────────────────────────────────────
 #  SWING ACTIVO — detecta acciones que giraron alcista 2-3 días
 #  Patrón: estaban cayendo → llevan 2-3 días subiendo con vol
 #  Filtros: precio subiendo 3 días + volumen creciente + RSI girando
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=1800, show_spinner=False)
-def scan_swing(vol_min_k: float = 200, max_results: int = 50) -> pd.DataFrame:
+def scan_swing(vol_min_k: float = 200, max_results: int = 20) -> pd.DataFrame:
     """
     Detecta acciones en rebote de swing 5-10 días.
     Criterios:
@@ -2623,25 +2202,6 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 50) -> pd.DataFrame:
                     "Vol_Diario_K": round(vol_k, 0),
                     "Lectura": lectura,
                     "_source": "screener",
-                    # Score Rebote v11 para Swing
-                    "Score_Rebote": calcular_score_rebote(
-                        dd=dd, rsi=rsi, vol_ratio=vol_ratio,
-                        dias_alcistas=dias_alcistas, momentum_3d=momentum_3d,
-                        tiene_catalizador=False, dias_para_cat=999,
-                        beta=beta_v
-                    )["score"],
-                    "Nivel_Rebote": calcular_score_rebote(
-                        dd=dd, rsi=rsi, vol_ratio=vol_ratio,
-                        dias_alcistas=dias_alcistas, momentum_3d=momentum_3d,
-                        tiene_catalizador=False, dias_para_cat=999,
-                        beta=beta_v
-                    )["nivel"],
-                    "Detalle_Rebote": calcular_score_rebote(
-                        dd=dd, rsi=rsi, vol_ratio=vol_ratio,
-                        dias_alcistas=dias_alcistas, momentum_3d=momentum_3d,
-                        tiene_catalizador=False, dias_para_cat=999,
-                        beta=beta_v
-                    )["detalle"],
                 })
             except Exception:
                 continue
@@ -2659,11 +2219,7 @@ def import_np():
 
 
 with st.sidebar:
-    st.markdown(f'<div style="font-size:22px;font-weight:800;color:{B}">🦅 GrekoTrader</div>'
-            f'<div style="font-size:10px;color:{TXT_MUT};margin-top:2px">'
-            f'v11 · 21 Abr 2026 · Score Rebote · '
-            f'{len(SCAN_UNIVERSE)} tickers</div>'+
-            f'</div>',unsafe_allow_html=True)
+    st.markdown(f'<div style="font-size:19px;font-weight:800;color:{B}">📈 Reversal Scanner v9</div>',unsafe_allow_html=True)
     st.markdown(f'<div style="font-size:11px;color:{TXT_MUT};margin-bottom:6px">{datetime.date.today():%d %b %Y} · Modelo 3 Momentos</div>',unsafe_allow_html=True)
 
     # Badge indicadores live
@@ -2682,9 +2238,6 @@ with st.sidebar:
             unsafe_allow_html=True)
     st.markdown("---")
     area_fil  = st.selectbox("Área",["Todas","AI Infra","Tech","Salud","Finanzas","Consumo","Energía","Industrial","Cripto/AI","Quantum"])
-    st.markdown("---")
-    max_res = st.slider("📊 Máx. resultados por tab", min_value=10, max_value=100, value=50, step=10,
-                        help="Cuántas acciones mostrar por tab. Más = escaneo más lento.")
     st.markdown("---")
     # Refresh market data
     if st.button("🔄 Actualizar indicadores de mercado", use_container_width=True):
@@ -2710,7 +2263,7 @@ with st.sidebar:
     if st.button("🔄 Actualizar noticias", use_container_width=True, help="Descarga y analiza las últimas noticias de cada ticker via yfinance"):
         # Combinar tickers de todos los tabs escaneados
         _all_scanned = []
-        for _k in ["scan_entrar","scan_swing","scan_detectadas"]:
+        for _k in ["scan_entrar","scan_anticipar","scan_radar","scan_detectadas"]:
             _d = st.session_state.get(_k)
             if _d is not None and not _d.empty:
                 _all_scanned.extend(_d["Ticker"].tolist())
@@ -2748,138 +2301,8 @@ with st.sidebar:
 # v8: df se construye en cada tab al escanear
 df = pd.DataFrame()
 
-COLS_MAIN=["Ticker","Score_Rebote","Area","Decision","Fase","Precio","RSI","DD_pico","Nivel_Rebote","Motivo","Lectura"]
-COLS_EXT =["Ticker","Score_Rebote","Nivel_Rebote","Area","Decision","Fase","Precio","Score","RSI","DD_pico","Cat_Fecha","Detalle_Rebote","Pre_Move","Pre_Vol","Motivo","Lectura"]
-
-
-# ─────────────────────────────────────────────────────────────
-#  NOTICIAS AUTOMÁTICAS — yfinance + análisis de sentimiento
-# ─────────────────────────────────────────────────────────────
-
-# Keywords para análisis de sentimiento
-
-def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
-                    desc, rsi_max, dd_min, score_min, decisions,
-                    cols_show=None, default_sort="Score"):
-    """Renderiza un tab con botón de escaneo y resultados."""
-    if cols_show is None:
-        cols_show = COLS_MAIN
-
-    st.markdown(
-        f'<div class="sec-header" style="background:{color_bg};border-color:{color_bor}">'+
-        f'<span style="font-size:20px">{emoji}</span>'+
-        f'<div><span style="font-size:16px;font-weight:700;color:{color}">{titulo}</span>'+
-        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">{desc}</span></div>'+
-        f'</div>', unsafe_allow_html=True)
-
-    st.markdown(
-        f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:10px;'+
-        f'padding:12px 16px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center">'+
-        f'<div style="font-size:11px;color:{TXT_MUT}">'+
-        f'<strong>Filtros automáticos:</strong> RSI ≤ {rsi_max} · DD ≤ {dd_min}% · Score ≥ {score_min} · Vol ≥ 200K/día'+
-        f'</div></div>', unsafe_allow_html=True)
-
-    col_btn, col_info = st.columns([2, 3])
-    with col_btn:
-        if st.button(f"🔍 Escanear {titulo}", use_container_width=True, key=f"btn_{tab_key}"):
-            with st.spinner(f"Escaneando ~{len(SCAN_UNIVERSE)} tickers..."):
-                resultado = scan_tab(rsi_max, dd_min, score_min, decisions)
-                st.session_state[tab_key] = resultado
-    with col_info:
-        if st.session_state.get(tab_key) is not None:
-            n = len(st.session_state[tab_key])
-            ts = st.session_state.get(f"{tab_key}_ts", "")
-            st.markdown(
-                f'<div style="font-size:11px;color:{G if n>0 else TXT_MUT};padding-top:8px">'+
-                f'● {n} candidatos encontrados {ts}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(
-                f'<div style="font-size:11px;color:{TXT_SOFT};padding-top:8px">'+
-                f'Presiona el botón para escanear el mercado ahora</div>', unsafe_allow_html=True)
-
-    resultado_df = st.session_state.get(tab_key)
-    if resultado_df is None:
-        st.markdown(
-            f'<div style="background:{color_bg};border:1px solid {color_bor};border-radius:12px;'+
-            f'padding:32px;text-align:center">'+
-            f'<div style="font-size:36px;margin-bottom:10px">{emoji}</div>'+
-            f'<div style="font-size:14px;font-weight:700;color:{color};margin-bottom:6px">{titulo} — Sin escanear</div>'+
-            f'<div style="font-size:12px;color:{TXT_MUT}">Presiona el botón para buscar oportunidades en tiempo real</div>'+
-            f'</div>', unsafe_allow_html=True)
-        return
-
-    # Aplicar filtro de área si está seleccionado
-    if not resultado_df.empty and area_fil != "Todas":
-        resultado_df = resultado_df[resultado_df["Area"]==area_fil]
-
-    if resultado_df.empty:
-        st.markdown(
-            f'<div style="background:{A_BG};border:1px solid {A_BOR};border-radius:10px;'+
-            f'padding:20px;text-align:center;color:{A}">'+
-            f'🚀 Mercado en rally — ninguna acción cumple los filtros de {titulo} ahora.'+
-            f'<br><span style="font-size:11px;color:{TXT_MUT}">'+
-            f'Filtros activos: RSI ≤ {rsi_max} · DD ≤ {dd_min}% · Score ≥ {score_min}. '+
-            f'Esto es información válida — el modelo dice que no hay oportunidades en este nivel hoy.</span></div>',
-            unsafe_allow_html=True)
-        return
-
-    # ── Orden automático por tab + columna Señal ────────────
-    df_show = resultado_df.copy()
-
-    # Agregar columna "Señal" con interpretación clara
-    def generar_senal(row):
-        rsi  = float(row.get("RSI", 50))
-        dd   = float(row.get("DD_pico", 0))
-        vol  = float(row.get("Volumen", 100))
-        prob = float(row.get("Prob_NBIS", 0))
-        dec  = str(row.get("Decision",""))
-        if dec == "ENTRAR" or (rsi < 35 and dd < -20 and vol > 150):
-            return "🔥 Entrar hoy"
-        elif dec == "ANTICIPAR" or (rsi < 45 and dd < -15 and vol > 100):
-            return "⚡ Entrada válida"
-        elif dd < -8 and rsi < 55:
-            return "👀 En corrección — vigilar"
-        elif rsi > 65:
-            return "⛔ RSI alto — esperar"
-        else:
-            return "🔵 Neutral — observar"
-
-    if not df_show.empty:
-        df_show["Señal modelo"] = df_show.apply(generar_senal, axis=1)
-
-    # Orden automático según tab (sin selector)
-    if default_sort in df_show.columns:
-        asc = (default_sort == "DD_pico")
-        df_show = df_show.sort_values(default_sort, ascending=asc)
-
-    # Mostrar columna Señal primero
-    cols_con_senal = cols_show.copy() if cols_show else list(df_show.columns)
-    if "Señal modelo" not in cols_con_senal:
-        cols_con_senal = ["Ticker","Señal modelo"] + [c for c in cols_con_senal if c not in ("Ticker","Señal modelo")]
-
-    render_table(df_show, cols_con_senal)
-
-    # Exportar señales del día
-    boton_exportar(resultado_df, titulo, f"exp_{tab_key}")
-
-    # Pre/Post Market por ticker
-    if not resultado_df.empty:
-        st.markdown(
-            f'<div style="font-size:11px;font-weight:700;color:{TXT};margin:14px 0 6px">'+
-            f'📡 Pre-Market · Post-Market · Volumen en tiempo real</div>',
-            unsafe_allow_html=True)
-        for _, r in resultado_df.iterrows():
-            st.markdown(
-                f'<div style="background:{BG_CARD};border:1px solid {BOR};border-radius:10px;'+
-                f'padding:10px 14px;margin-bottom:6px">'+
-                f'<div style="font-size:12px;font-weight:700;color:{B};margin-bottom:4px">'+
-                f'{r["Ticker"]} — {r.get("Nombre","")[:30]}</div>'+
-                render_pre_post_bar(r["Ticker"], r["Precio"], G, A, R, TXT_MUT, TXT_SOFT, BG_HEAD, BOR)+
-                render_nbis_panel(r.get('Prob_NBIS',0), r.get('Sim_NBIS',0), G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR)+
-                f'</div>', unsafe_allow_html=True)
-
-
-
+COLS_MAIN=["Ticker","Area","Decision","Fase","Trigger","Precio","Patron_Tipo","RSI_Dir","Prob_NBIS","Sim_NBIS","Motivo","Lectura","Arrastradas"]
+COLS_EXT =["Ticker","Area","Decision","Fase","Trigger","Precio","Score","RSI","RSI_Dir","Patron_Tipo","Pre_Move","Pre_Vol","Post_Vol","Short_Int","DD_pico","Cat_Fecha","Prob_NBIS","Sim_NBIS","Motivo","Lectura","Arrastradas"]
 
 # ─────────────────────────────────────────────────────────────
 #  HEADER
@@ -3080,11 +2503,98 @@ with col_signal:
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 st.markdown("---")
 
-tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8=st.tabs([
-    "📡 Detectadas M1","⚡ Swing Activo","🔥 Entrar hoy",
-    "🔗 Sympathy","🔎 Mi Watchlist","💼 Mis Posiciones","💜 Posiciones Amparito",
-    "💰 Estrategia ETF",
-])
+# ─────────────────────────────────────────────────────────────
+#  NOTICIAS AUTOMÁTICAS — yfinance + análisis de sentimiento
+# ─────────────────────────────────────────────────────────────
+
+# Keywords para análisis de sentimiento
+
+def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
+                    desc, rsi_max, dd_min, score_min, decisions,
+                    cols_show=None):
+    """Renderiza un tab con botón de escaneo y resultados."""
+    if cols_show is None:
+        cols_show = COLS_MAIN
+
+    st.markdown(
+        f'<div class="sec-header" style="background:{color_bg};border-color:{color_bor}">'+
+        f'<span style="font-size:20px">{emoji}</span>'+
+        f'<div><span style="font-size:16px;font-weight:700;color:{color}">{titulo}</span>'+
+        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">{desc}</span></div>'+
+        f'</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:10px;'+
+        f'padding:12px 16px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center">'+
+        f'<div style="font-size:11px;color:{TXT_MUT}">'+
+        f'<strong>Filtros automáticos:</strong> RSI ≤ {rsi_max} · DD ≤ {dd_min}% · Vol ≥ 200K/día'+
+        f'</div></div>', unsafe_allow_html=True)
+
+    col_btn, col_info = st.columns([2, 3])
+    with col_btn:
+        if st.button(f"🔍 Escanear {titulo}", use_container_width=True, key=f"btn_{tab_key}"):
+            with st.spinner(f"Escaneando ~{len(SCAN_UNIVERSE)} tickers..."):
+                resultado = scan_tab(rsi_max, dd_min, score_min, decisions)
+                st.session_state[tab_key] = resultado
+    with col_info:
+        if st.session_state.get(tab_key) is not None:
+            n = len(st.session_state[tab_key])
+            ts = st.session_state.get(f"{tab_key}_ts", "")
+            st.markdown(
+                f'<div style="font-size:11px;color:{G if n>0 else TXT_MUT};padding-top:8px">'+
+                f'● {n} candidatos encontrados {ts}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                f'<div style="font-size:11px;color:{TXT_SOFT};padding-top:8px">'+
+                f'Presiona el botón para escanear el mercado ahora</div>', unsafe_allow_html=True)
+
+    resultado_df = st.session_state.get(tab_key)
+    if resultado_df is None:
+        st.markdown(
+            f'<div style="background:{color_bg};border:1px solid {color_bor};border-radius:12px;'+
+            f'padding:32px;text-align:center">'+
+            f'<div style="font-size:36px;margin-bottom:10px">{emoji}</div>'+
+            f'<div style="font-size:14px;font-weight:700;color:{color};margin-bottom:6px">{titulo} — Sin escanear</div>'+
+            f'<div style="font-size:12px;color:{TXT_MUT}">Presiona el botón para buscar oportunidades en tiempo real</div>'+
+            f'</div>', unsafe_allow_html=True)
+        return
+
+    # Aplicar filtro de área si está seleccionado
+    if not resultado_df.empty and area_fil != "Todas":
+        resultado_df = resultado_df[resultado_df["Area"]==area_fil]
+
+    if resultado_df.empty:
+        st.markdown(
+            f'<div style="background:{A_BG};border:1px solid {A_BOR};border-radius:10px;'+
+            f'padding:20px;text-align:center;color:{A}">'+
+            f'🚀 Mercado en rally — ninguna acción cumple los filtros de {titulo} ahora.'+
+            f'<br><span style="font-size:11px;color:{TXT_MUT}">'+
+            f'RSI ≤ {rsi_max} + DD ≤ {dd_min}% + Score ≥ {score_min}. '+
+            f'Esto es información válida — el modelo dice que no hay oportunidades en este nivel hoy.</span></div>',
+            unsafe_allow_html=True)
+        return
+
+    df_show = resultado_df.sort_values("Score",ascending=False) if "Score" in resultado_df.columns else resultado_df
+    render_table(df_show, cols_show)
+
+    # Exportar señales del día
+    boton_exportar(resultado_df, titulo, f"exp_{tab_key}")
+
+    # Pre/Post Market por ticker
+    if not resultado_df.empty:
+        st.markdown(
+            f'<div style="font-size:11px;font-weight:700;color:{TXT};margin:14px 0 6px">'+
+            f'📡 Pre-Market · Post-Market · Volumen en tiempo real</div>',
+            unsafe_allow_html=True)
+        for _, r in resultado_df.iterrows():
+            st.markdown(
+                f'<div style="background:{BG_CARD};border:1px solid {BOR};border-radius:10px;'+
+                f'padding:10px 14px;margin-bottom:6px">'+
+                f'<div style="font-size:12px;font-weight:700;color:{B};margin-bottom:4px">'+
+                f'{r["Ticker"]} — {r.get("Nombre","")[:30]}</div>'+
+                render_pre_post_bar(r["Ticker"], r["Precio"], G, A, R, TXT_MUT, TXT_SOFT, BG_HEAD, BOR)+
+                render_nbis_panel(r.get('Prob_NBIS',0), r.get('Sim_NBIS',0), G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR)+
+                f'</div>', unsafe_allow_html=True)
 
 
 
@@ -3100,7 +2610,6 @@ with tab1:
         desc="Bajada activa · En corrección · Score ≥ 15 · Watchlist temprana",
         rsi_max=60, dd_min=-8, score_min=15,
         decisions=["SEGUIR","OBSERVAR","ANTICIPAR"],
-        default_sort="DD_pico",
     )
 
 
@@ -3132,7 +2641,7 @@ with tab2:
     with col_btn_sw:
         if st.button("⚡ Escanear Swing Activo", use_container_width=True, key="btn_swing"):
             with st.spinner("Detectando rebotes activos en ~{} tickers...".format(len(SCAN_UNIVERSE))):
-                resultado_sw = scan_swing(max_results=max_res)
+                resultado_sw = scan_swing()
                 st.session_state["scan_swing"] = resultado_sw
                 st.session_state["scan_swing_ts"] = datetime.datetime.now().strftime("%H:%M")
     with col_info_sw:
@@ -3168,8 +2677,6 @@ with tab2:
             f'Sin swings activos ahora — mercado sin momentum claro de rebote.'+
             f'</div>', unsafe_allow_html=True)
     else:
-        # Ordenar por Momentum 3d descendente (default Swing)
-
         # Render swing cards
         for _, r in sw_result.iterrows():
             dias_c = G if r["Dias_Alcistas"] >= 3 else A
@@ -3305,9 +2812,8 @@ with tab3:
         emoji="🔥",
         color=G, color_bg=G_BG, color_bor=G_BOR,
         desc="M3 confirmado · RSI capitulación · Catalizador activo · Score ≥ 75",
-        rsi_max=45, dd_min=-12, score_min=55,
+        rsi_max=38, dd_min=-20, score_min=70,
         decisions=["ENTRAR","ANTICIPAR"],
-        default_sort="Prob_NBIS",
     )
 
 
@@ -3323,143 +2829,50 @@ with tab4:
         f'</div>', unsafe_allow_html=True)
 
     st.markdown(
-        f'<div class="info-box">Lógica: si NBIS está en Swing Activo rebotando, '+
-        f'el modelo busca <strong>otras acciones del mismo sector que AÚN NO han subido</strong>. '+
-        f'Esas son las arrastradas — la oportunidad de entrar antes de que el sector complete el movimiento.<br>'+
-        f'<strong>Paso 1:</strong> Escanea Swing Activo o Entrar hoy. '+
-        f'<strong>Paso 2:</strong> Vuelve aquí para ver las arrastradas.</div>',
+        f'<div class="info-box">El screener detecta automáticamente acciones en el mismo sector '+
+        f'cuando encuentras un líder en "Entrar hoy" o "Radar". '+
+        f'Primero escanea uno de esos tabs, luego vuelve aquí para ver las arrastradas.</div>',
         unsafe_allow_html=True)
 
-    # ── Lógica Sympathy: Líder → Arrastradas ─────────────────
-    # 1. Obtener líderes = acciones en Swing Activo o Entrar Hoy
-    lideres_df = pd.DataFrame()
-    for key in ["scan_swing","scan_entrar"]:
+    # Combinar resultados de todos los tabs escaneados
+    all_results = []
+    for key in ["scan_entrar","scan_swing","scan_detectadas"]:
         df_tmp = st.session_state.get(key)
         if df_tmp is not None and not df_tmp.empty:
-            df_tmp = df_tmp.copy()
-            df_tmp["_tab_origen"] = "Swing Activo" if key=="scan_swing" else "Entrar hoy"
-            lideres_df = pd.concat([lideres_df, df_tmp], ignore_index=True)
+            # Asegurar columnas mínimas para render_table
+            for col, default in [
+                ("Decision","SEGUIR"),("Fase","Fase 2"),("Trigger","—"),
+                ("Patron_Tipo","GRADUAL"),("Patron_Emoji","📈"),
+                ("RSI_Dir","—"),("RSI_Dir_Desc","—"),
+                ("Prob_NBIS",0.0),("Sim_NBIS",0.0),
+                ("Motivo","—"),("Lectura","—"),("Arrastradas","—"),
+                ("Score",0),("Color","#64748B"),("Bg","#F8FAFC"),
+            ]:
+                if col not in df_tmp.columns:
+                    df_tmp = df_tmp.copy()
+                    df_tmp[col] = default
+            all_results.append(df_tmp)
 
-    # 2. Obtener candidatos = todas las acciones escaneadas (detectadas M1 + universo)
-    candidatos_df = pd.DataFrame()
-    for key in ["scan_detectadas","scan_swing","scan_entrar"]:
-        df_tmp = st.session_state.get(key)
-        if df_tmp is not None and not df_tmp.empty:
-            candidatos_df = pd.concat([candidatos_df, df_tmp], ignore_index=True)
-
-    all_results = []  # kept for compatibility
-
-    if lideres_df.empty:
+    if all_results:
+        df_combined = pd.concat(all_results).drop_duplicates(subset="Ticker")
+        # Group by area to find sector clusters
+        for area_name, group in df_combined.groupby("Area"):
+            if len(group) >= 2:
+                st.markdown(
+                    f'<div style="font-size:12px;font-weight:700;color:{B};margin:10px 0 6px">'+
+                    f'🔗 Sector {area_name} — {len(group)} acciones detectadas</div>',
+                    unsafe_allow_html=True)
+                render_table(group.sort_values("Score",ascending=False) if "Score" in group.columns else group, COLS_MAIN)
+    else:
         st.markdown(
             f'<div style="background:{P_BG};border:1px solid {P_BOR};border-radius:12px;'+
             f'padding:32px;text-align:center">'+
             f'<div style="font-size:36px;margin-bottom:10px">🔗</div>'+
-            f'<div style="font-size:14px;font-weight:700;color:{P};margin-bottom:6px">Sin líderes detectados</div>'+
-            f'<div style="font-size:12px;color:{TXT_MUT}">'+
-            f'Paso 1: Escanea ⚡ Swing Activo<br>'+
-            f'Paso 2: Escanea 📡 Detectadas M1 (opcional — para ver arrastradas)<br>'+
-            f'Paso 3: Vuelve aquí para ver líderes y arrastradas</div>'+
+            f'<div style="font-size:14px;font-weight:700;color:{P};margin-bottom:6px">Sin datos aún</div>'+
+            f'<div style="font-size:12px;color:{TXT_MUT}">Primero escanea "Entrar hoy", "Anticipadas" o "Radar" '+
+            f'para detectar sympathy plays automáticamente.</div>'+
             f'</div>', unsafe_allow_html=True)
-    else:
-        lideres_df["Area"] = lideres_df["Area"].fillna("—").astype(str)
-        tickers_lideres = set(lideres_df["Ticker"].str.upper().tolist())
 
-        # Agrupar líderes por sector
-        for area_name, grupo_lideres in lideres_df.groupby("Area"):
-            if area_name in ("—","","nan"):
-                continue
-
-            lideres_list = grupo_lideres["Ticker"].tolist()
-            tab_origen   = grupo_lideres["_tab_origen"].iloc[0]
-
-            # Buscar arrastradas en detectadas M1
-            arrastradas = pd.DataFrame()
-            df_detect = st.session_state.get("scan_detectadas")
-            if df_detect is not None and not df_detect.empty:
-                arrastradas = df_detect[
-                    (df_detect["Area"].fillna("—") == area_name) &
-                    (~df_detect["Ticker"].isin(tickers_lideres))
-                ]
-
-            n_lideres     = len(lideres_list)
-            n_arrastradas = len(arrastradas)
-
-            # Header del sector
-            st.markdown(
-                f'<div style="background:{P_BG};border:1px solid {P_BOR};'+
-                f'border-left:4px solid {P};border-radius:10px;'+
-                f'padding:12px 16px;margin:12px 0 6px">'+
-                f'<div style="display:flex;justify-content:space-between;align-items:center">'+
-                f'<div style="font-size:14px;font-weight:800;color:{P}">🔗 {area_name}</div>'+
-                f'<div style="font-size:11px;color:{TXT_MUT}">'+
-                f'{n_lideres} líder(es) · {n_arrastradas} arrastrada(s)</div>'+
-                f'</div></div>',
-                unsafe_allow_html=True)
-
-            # Mostrar líderes
-            st.markdown(
-                f'<div style="font-size:11px;font-weight:700;color:{G};margin:6px 0 4px">'+
-                f'🏆 Líderes — rebotando ({tab_origen})</div>',
-                unsafe_allow_html=True)
-
-            for _, lider_row in grupo_lideres.iterrows():
-                dias = int(lider_row.get("Dias_Alcistas",0)) if "Dias_Alcistas" in lider_row.index else 0
-                mom  = float(lider_row.get("Momentum_3d",0)) if "Momentum_3d" in lider_row.index else 0
-                vol  = float(lider_row.get("Volumen",0))
-                if dias >= 3 and mom >= 8 and vol >= 150:
-                    fase_l = "🔥 ENTRAR HOY"
-                elif dias >= 2 and mom >= 4:
-                    fase_l = "⚡ ENTRADA VÁLIDA"
-                else:
-                    fase_l = "👀 TEMPRANA"
-
-                st.markdown(
-                    f'<div style="background:{G_BG};border:1px solid {G_BOR};'+
-                    f'border-radius:8px;padding:8px 14px;margin-bottom:4px;'+
-                    f'display:flex;justify-content:space-between;align-items:center">'+
-                    f'<div style="display:flex;align-items:center;gap:10px">'+
-                    f'  <span style="font-size:14px;font-weight:800;color:{G}">{lider_row["Ticker"]}</span>'+
-                    f'  <span style="font-size:11px;color:{TXT_MUT}">{str(lider_row.get("Nombre",""))[:25]}</span>'+
-                    f'  <span style="font-size:11px;font-weight:700;color:{G}">{fase_l}</span>'+
-                    f'</div>'+
-                    f'<div style="display:flex;gap:16px;font-size:10px;color:{TXT_MUT}">'+
-                    f'  <span>RSI {lider_row.get("RSI","—")}</span>'+
-                    f'  <span>Vol {int(vol)}%</span>'+
-                    f'  <span>DD {lider_row.get("DD_pico","—")}%</span>'+
-                    f'  <span>${lider_row.get("Precio","—")}</span>'+
-                    f'</div></div>',
-                    unsafe_allow_html=True)
-
-            # Mostrar arrastradas
-            if not arrastradas.empty:
-                st.markdown(
-                    f'<div style="font-size:11px;font-weight:700;color:{C};margin:8px 0 4px">'+
-                    f'🔗 Arrastradas — aún no han subido (oportunidad)</div>',
-                    unsafe_allow_html=True)
-                for _, arr_row in arrastradas.iterrows():
-                    st.markdown(
-                        f'<div style="background:{C_BG};border:1px solid {C_BOR};'+
-                        f'border-radius:8px;padding:8px 14px;margin-bottom:4px;'+
-                        f'display:flex;justify-content:space-between;align-items:center">'+
-                        f'<div style="display:flex;align-items:center;gap:10px">'+
-                        f'  <span style="font-size:14px;font-weight:800;color:{C}">{arr_row["Ticker"]}</span>'+
-                        f'  <span style="font-size:11px;color:{TXT_MUT}">{str(arr_row.get("Nombre",""))[:25]}</span>'+
-                        f'  <span style="font-size:11px;color:{C};font-weight:700">'+
-                        f'⚡ Arrastrada por {", ".join(lideres_list[:2])}</span>'+
-                        f'</div>'+
-                        f'<div style="display:flex;gap:16px;font-size:10px;color:{TXT_MUT}">'+
-                        f'  <span>RSI {arr_row.get("RSI","—")}</span>'+
-                        f'  <span>DD {arr_row.get("DD_pico","—")}%</span>'+
-                        f'  <span>Score {arr_row.get("Score","—")}</span>'+
-                        f'  <span>${arr_row.get("Precio","—")}</span>'+
-                        f'</div></div>',
-                        unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    f'<div style="font-size:10px;color:{TXT_MUT};padding:6px 14px;'+
-                    f'background:{BG_HEAD};border-radius:6px;margin-bottom:6px">'+
-                    f'Sin arrastradas en Detectadas M1 — escanea 📡 Detectadas M1 para ver candidatas.</div>',
-                    unsafe_allow_html=True)
 
 
 # ══ TAB 5 — MI WATCHLIST ═══════════════════════════════════════
@@ -3849,28 +3262,6 @@ También puedes descargar la plantilla de abajo y completarla.
                     _tipo_pos = "ETF_Cripto"
                 elif tk in _index_etfs:
                     _tipo_pos = "ETF_Indice"
-            # Score de rebote v11
-            _tiene_cat = _cat_fecha_use not in ("—","","nan")
-            _dias_cat  = 999
-            try:
-                import datetime as _dtt
-                if _tiene_cat:
-                    _fc = pd.to_datetime(_cat_fecha_use, errors="coerce")
-                    if not pd.isna(_fc):
-                        _dias_cat = (_fc.date() - _dtt.date.today()).days
-            except Exception: pass
-            _score_rebote = calcular_score_rebote(
-                dd=float(r.get("DD_pico",0)),
-                rsi=float(r["RSI"]),
-                vol_ratio=float(r.get("Volumen",100)),
-                dias_alcistas=0,
-                momentum_3d=float(r.get("MACD",0)),
-                tiene_catalizador=_tiene_cat,
-                dias_para_cat=_dias_cat,
-                beta=float(r.get("Beta",1.5))
-            )
-            _vix_val = float(vix.get("valor",20)) if vix.get("_ok") else 20
-            _sizing  = clasificar_sizing(_score_rebote["score"], _vix_val)
             analisis = analizar_posicion(
                 pc,pa,r["RSI"],r["MACD"],
                 abs(r["EMA50"]) if r["EMA50"]>0 else 0,
@@ -3920,13 +3311,8 @@ También puedes descargar la plantilla de abajo y completarla.
             with ci3:
                 st.markdown(f'<div style="text-align:center"><div style="font-size:11px;color:{TXT_MUT};font-weight:600">P&L</div><div style="font-size:20px;font-weight:800;color:{pnl_color}">{pnl_pct:+.1f}%</div><div style="font-size:11px;color:{pnl_color};font-weight:600">${pnl_usd:+,.0f}</div></div>',unsafe_allow_html=True)
             with ci4:
-                sc_c=G if _score_rebote["score"]>=75 else A if _score_rebote["score"]>=55 else R
-                st.markdown(
-                    f'<div style="text-align:center">'
-                    f'<div style="font-size:11px;color:{TXT_MUT};font-weight:600">Score Rebote</div>'
-                    f'<div style="font-size:20px;font-weight:800;color:{sc_c}">{_score_rebote["score"]}</div>'
-                    f'<div style="font-size:10px;color:{sc_c}">{_score_rebote["nivel"]}</div>'
-                    f'</div>',unsafe_allow_html=True)
+                sc_c=G if r["Score"]>=75 else A if r["Score"]>=55 else R
+                st.markdown(f'<div style="text-align:center"><div style="font-size:11px;color:{TXT_MUT};font-weight:600">Score</div><div style="font-size:20px;font-weight:800;color:{sc_c}">{r["Score"]}</div></div>',unsafe_allow_html=True)
             with ci5:
                 # Barra visual de 3 tramos
                 tramo_html = ""
@@ -4088,8 +3474,8 @@ También puedes descargar la plantilla de abajo y completarla.
                     f'<div style="font-size:11px;font-weight:700;color:{TXT};margin-bottom:8px">Lectura del trader</div>'
                     f'<div style="font-size:12px;margin-bottom:8px">{tramos_resumen}</div>'
                     f'<div style="font-size:11px;color:{TXT_MUT};line-height:1.7">{razon}</div>'
-                    f'<div style="margin-top:10px;font-size:10px;color:{TXT_SOFT}">Catalizador: {"Earnings " + _cat_fecha_use if _cat_fecha_use not in ("—","","nan") else "Sin catalizador identificado"}</div>'
-                    f'<div style="font-size:10px;color:{"" + G if _cat_fecha_use not in ("—","","nan") else TXT_SOFT}">Próximo: {_cat_fecha_use}</div>'
+                    f'<div style="margin-top:10px;font-size:10px;color:{TXT_SOFT}">Catalizador: {str(r["Cat_Desc"])[:45]}</div>'
+                    f'<div style="font-size:10px;color:{TXT_SOFT}">Próximo: {r["Cat_Fecha"]}</div>'
                     f'</div>',unsafe_allow_html=True)
 
             # ── NBIS Panel + Pre/Post Market ─────────────────
@@ -4103,22 +3489,6 @@ También puedes descargar la plantilla de abajo y completarla.
                 ), unsafe_allow_html=True)
 
             st.markdown('</div>',unsafe_allow_html=True)  # cierra pos-card
-
-        # ── Alerta concentración sectorial ──────────────────
-        sectores_pos = {}
-        for _, _prow in posiciones_df.iterrows():
-            _ptk = str(_prow["Ticker"]).upper()
-        # Calcular concentración desde los datos ya cargados
-        if n_ok > 0:
-            _areas = {}
-            for _, _prow in posiciones_df.iterrows():
-                _tipo_c = str(_prow.get("Tipo","Accion"))
-                _areas[_tipo_c] = _areas.get(_tipo_c, 0) + 1
-            _concentradas = {k:v for k,v in _areas.items() if v >= 3}
-            if _concentradas:
-                for _sector_c, _cnt_c in _concentradas.items():
-                    st.warning(f"⚠️ Concentración: tienes {_cnt_c} posiciones en {_sector_c}. "
-                               f"Si el sector cae, caen todas juntas. Considera diversificar.")
 
         # ── Resumen portafolio ──────────────────────────────
         if n_ok>0:
@@ -4341,227 +3711,5 @@ with tab7:
             render_catalysts_section(amp_df, "amparito")
 
 
-# ══ TAB 8 — ESTRATEGIA ETF ══════════════════════════════════
-with tab8:
-    st.markdown(
-        f'<div class="sec-header" style="background:#FEF9C3;border-color:#FDE047">'+
-        f'<span style="font-size:20px">💰</span>'+
-        f'<div><span style="font-size:16px;font-weight:700;color:#854D0E">Estrategia ETF</span>'+
-        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'+
-        f'Monitor de ETFs · Estrategia de inversión personalizada · DCA automático</span></div>'+
-        f'</div>', unsafe_allow_html=True)
-
-    # ── Inputs de usuario ─────────────────────────────────────
-    st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">⚙️ Configuración</div>',unsafe_allow_html=True)
-    ei1, ei2, ei3, ei4 = st.columns(4)
-    with ei1:
-        capital_usd = st.number_input("Capital USD", min_value=100, max_value=1000000,
-                                       value=4000, step=100,
-                                       help="Capital a invertir en USD")
-    with ei2:
-        tipo_cambio = st.number_input("Tipo cambio CLP/USD", min_value=700, max_value=1100,
-                                       value=879, step=1,
-                                       help="Pesos chilenos por 1 dólar")
-    with ei3:
-        plazo_etf = st.selectbox("Horizonte", ["Corto (6-12m)","Mediano (2-5a)","Largo (5-10a)"],
-                                  index=1)
-    with ei4:
-        perfil_etf = st.selectbox("Perfil riesgo", ["Conservador","Moderado","Agresivo"],
-                                   index=1)
-
-    capital_clp = capital_usd * tipo_cambio
-    st.markdown(
-        f'<div style="background:#FEF9C3;border:1px solid #FDE047;border-radius:8px;'+
-        f'padding:8px 14px;margin-bottom:14px;font-size:12px;color:#854D0E">'+
-        f'💵 <strong>${capital_usd:,.0f} USD</strong> = '+
-        f'<strong>${capital_clp:,.0f} CLP</strong> · '+
-        f'Tipo cambio: ${tipo_cambio} CLP/USD</div>',
-        unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Estado actual de ETFs ─────────────────────────────────
-    st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">📊 Estado actual de los ETFs</div>',unsafe_allow_html=True)
-
-    if st.button("🔄 Cargar datos de ETFs", use_container_width=False, key="btn_etf"):
-        with st.spinner("Cargando datos de ETFs..."):
-            etf_results = {}
-            for tk in ETF_UNIVERSE.keys():
-                etf_results[tk] = fetch_etf_data(tk)
-            st.session_state["etf_data"] = etf_results
-
-    etf_data = st.session_state.get("etf_data", {})
-
-    if not etf_data:
-        st.markdown(
-            f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:10px;'+
-            f'padding:24px;text-align:center;color:{TXT_MUT}">'+
-            f'<div style="font-size:28px;margin-bottom:8px">📊</div>'+
-            f'<div>Presiona <strong>Cargar datos de ETFs</strong> para ver el estado actual</div>'+
-            f'</div>', unsafe_allow_html=True)
-    else:
-        # Tabla de ETFs por categoría
-        categorias = ["Indice","Parking","Sectorial","Cripto"]
-        cat_labels = {"Indice":"📈 Índices","Parking":"🅿️ Parking / Renta Fija",
-                      "Sectorial":"🏭 Sectoriales","Cripto":"₿ Cripto ETFs"}
-        cat_colors = {"Indice":"2563EB","Parking":"16A34A","Sectorial":"D97706","Cripto":"7C3AED"}
-
-        for cat in categorias:
-            tks_cat = [tk for tk,meta in ETF_UNIVERSE.items() if meta["categoria"]==cat]
-            st.markdown(
-                f'<div style="font-size:12px;font-weight:700;color:#{cat_colors[cat]};'+
-                f'margin:12px 0 6px">{cat_labels[cat]}</div>',
-                unsafe_allow_html=True)
-
-            for tk in tks_cat:
-                d = etf_data.get(tk)
-                if d is None:
-                    continue
-                meta   = ETF_UNIVERSE[tk]
-                dd_c   = G if d["dd"] > -5 else A if d["dd"] > -15 else R
-                rsi_c  = G if d["rsi"] < 45 else A if d["rsi"] < 60 else R
-                ytd_c  = G if d["ytd"] > 0 else R
-                tend_c = G if d["tend"]=="↑" else R if d["tend"]=="↓" else TXT_MUT
-
-                st.markdown(
-                    f'<div style="background:{BG_CARD};border:1px solid {BOR};'+
-                    f'border-left:4px solid #{cat_colors[cat]};'+
-                    f'border-radius:8px;padding:10px 14px;margin-bottom:6px;'+
-                    f'display:flex;justify-content:space-between;align-items:center">'+
-                    f'<div style="display:flex;align-items:center;gap:14px">'+
-                    f'  <div>'+
-                    f'    <div style="font-size:14px;font-weight:800;color:{B}">{tk}</div>'+
-                    f'    <div style="font-size:10px;color:{TXT_MUT}">{meta["nombre"]}</div>'+
-                    f'  </div>'+
-                    f'  <div style="font-size:12px;font-weight:700;color:{TXT}">${d["precio"]:.2f}</div>'+
-                    f'  <div style="text-align:center">'+
-                    f'    <div style="font-size:9px;color:{TXT_MUT}">RSI</div>'+
-                    f'    <div style="font-size:12px;font-weight:700;color:{rsi_c}">{d["rsi"]}</div>'+
-                    f'  </div>'+
-                    f'  <div style="text-align:center">'+
-                    f'    <div style="font-size:9px;color:{TXT_MUT}">DD pico</div>'+
-                    f'    <div style="font-size:12px;font-weight:700;color:{dd_c}">{d["dd"]}%</div>'+
-                    f'  </div>'+
-                    f'  <div style="text-align:center">'+
-                    f'    <div style="font-size:9px;color:{TXT_MUT}">Tendencia</div>'+
-                    f'    <div style="font-size:14px;font-weight:700;color:{tend_c}">{d["tend"]}</div>'+
-                    f'  </div>'+
-                    f'  <div style="text-align:center">'+
-                    f'    <div style="font-size:9px;color:{TXT_MUT}">YTD</div>'+
-                    f'    <div style="font-size:12px;font-weight:700;color:{ytd_c}">{d["ytd"]:+.1f}%</div>'+
-                    f'  </div>'+
-                    f'  <div style="font-size:11px;font-weight:700;color:#{d["senal_c"]}">{d["senal"]}</div>'+
-                    f'</div>'+
-                    f'<div style="font-size:10px;color:{TXT_MUT};text-align:right">'+
-                    f'Riesgo: {meta["riesgo"]}<br>Rend hist: +{meta["rend_hist"]}%/año</div>'+
-                    f'</div>', unsafe_allow_html=True)
-
-        st.markdown("---")
-
-        # ── Estrategia recomendada ─────────────────────────────
-        st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">🎯 Estrategia recomendada para ${capital_usd:,.0f} USD · {plazo_etf} · Perfil {perfil_etf}</div>',unsafe_allow_html=True)
-
-        estrategia = calcular_estrategia(capital_usd, plazo_etf, perfil_etf, etf_data)
-        allocs     = estrategia["allocations"]
-
-        # Tabla de asignación
-        for a in allocs:
-            if a["monto"] < 50:  # mínimo $50 para mostrar
-                continue
-            bar_w = int(a["peso"] * 2)
-            rsi_c2 = G if a["rsi"] < 45 else A if a["rsi"] < 60 else R
-            dd_c2  = G if a["dd"] > -5 else A if a["dd"] > -15 else R
-
-            st.markdown(
-                f'<div style="background:{BG_CARD};border:1px solid {BOR};'+
-                f'border-radius:8px;padding:10px 14px;margin-bottom:6px">'+
-                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'+
-                f'<div style="display:flex;align-items:center;gap:10px">'+
-                f'  <span style="font-size:14px;font-weight:800;color:{B}">{a["ticker"]}</span>'+
-                f'  <span style="font-size:11px;color:{TXT_MUT}">{a["nombre"]}</span>'+
-                f'  <span style="font-size:11px;font-weight:700;color:#{a["senal_c"]}">{a["senal"]}</span>'+
-                f'</div>'+
-                f'<div style="text-align:right">'+
-                f'  <div style="font-size:16px;font-weight:800;color:{G}">${a["monto"]:,.0f}</div>'+
-                f'  <div style="font-size:11px;color:{TXT_MUT}">{a["peso"]}% del capital</div>'+
-                f'</div></div>'+
-                f'<div style="background:{BOR};border-radius:4px;height:6px;margin-bottom:6px">'+
-                f'<div style="background:{G};height:6px;border-radius:4px;width:{min(bar_w,200)}px"></div></div>'+
-                f'<div style="display:flex;gap:16px;font-size:10px;color:{TXT_MUT}">'+
-                f'  <span>RSI <strong style="color:{rsi_c2}">{a["rsi"]}</strong></span>'+
-                f'  <span>DD <strong style="color:{dd_c2}">{a["dd"]}%</strong></span>'+
-                f'  <span>Tend <strong>{a["tend"]}</strong></span>'+
-                f'  <span>Rend hist <strong>+{a["rend_hist"]}%/año</strong></span>'+
-                f'  <span>Riesgo <strong>{a["riesgo"]}</strong></span>'+
-                f'</div></div>', unsafe_allow_html=True)
-
-        st.markdown("---")
-
-        # ── Plan DCA ──────────────────────────────────────────
-        st.markdown(
-            f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">'+
-            f'📅 Plan DCA — {estrategia["n_meses"]} meses · ${estrategia["monto_mes"]:,.0f} USD/mes</div>',
-            unsafe_allow_html=True)
-
-        import datetime as _dt
-        mes_actual = _dt.date.today().replace(day=1)
-        top3 = [a for a in allocs if a["monto"] >= 50][:4]
-
-        for i in range(estrategia["n_meses"]):
-            import calendar
-            mes = (mes_actual.replace(day=1) + _dt.timedelta(days=32*i)).replace(day=1)
-            mes_nom = mes.strftime("%B %Y").capitalize()
-            monto_m = estrategia["monto_mes"]
-            # Distribuir mes entre top ETFs
-            detalle = " + ".join([
-                f'<strong>{a["ticker"]}</strong> ${monto_m * a["peso"]/100:,.0f}'
-                for a in top3 if a["monto"] > 0
-            ])
-            st.markdown(
-                f'<div style="background:{"EFF6FF" if i%2==0 else "FFFFFF"};border:1px solid {BOR};'+
-                f'border-radius:8px;padding:8px 14px;margin-bottom:4px;'+
-                f'display:flex;justify-content:space-between;align-items:center">'+
-                f'<div style="font-size:12px;font-weight:700;color:{TXT}">'+
-                f'Mes {i+1} — {mes_nom}</div>'+
-                f'<div style="font-size:11px;color:{TXT_MUT}">{detalle}</div>'+
-                f'<div style="font-size:13px;font-weight:800;color:#2563EB">${monto_m:,.0f}</div>'+
-                f'</div>', unsafe_allow_html=True)
-
-        st.markdown("---")
-
-        # ── Proyección ────────────────────────────────────────
-        st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">📈 Proyección a {estrategia["n_años"]} años · Rend. ponderado estimado +{estrategia["rend_ponderado"]}%/año</div>',unsafe_allow_html=True)
-
-        pp1, pp2, pp3, pp4 = st.columns(4)
-        with pp1:
-            st.metric("Capital inicial", f"${capital_usd:,.0f}")
-        with pp2:
-            st.metric(f"Escenario base (+{estrategia['rend_ponderado']}%)",
-                      f"${estrategia['proy_base']:,.0f}",
-                      f"+${estrategia['proy_base']-capital_usd:,.0f}")
-        with pp3:
-            st.metric(f"Optimista (+{estrategia['rend_ponderado']+3:.0f}%)",
-                      f"${estrategia['proy_opt']:,.0f}",
-                      f"+${estrategia['proy_opt']-capital_usd:,.0f}")
-        with pp4:
-            st.metric(f"Pesimista (+{max(estrategia['rend_ponderado']-4,2):.0f}%)",
-                      f"${estrategia['proy_pes']:,.0f}",
-                      f"+${estrategia['proy_pes']-capital_usd:,.0f}")
-
-        st.markdown(
-            f'<div style="font-size:10px;color:{TXT_SOFT};margin-top:8px;font-style:italic">'+
-            f'⚠️ Proyecciones basadas en rendimientos históricos. No constituyen asesoría financiera. '+
-            f'Rendimientos pasados no garantizan resultados futuros.</div>',
-            unsafe_allow_html=True)
-
-
 st.markdown("---")
-st.markdown(
-    f'<div style="text-align:center;font-size:11px;color:{TXT_SOFT};padding:8px">'
-    f'🦅 <strong>GrekoTrader</strong> · '
-    f'Versión 11 · Creado el 21 Abr 2026 · '
-    f'Patrón NBIS · 3 Momentos · 100% Automático<br>'
-    f'<span style="font-size:10px">Datos educativos · No constituye asesoría financiera · '
-    f'Powered by yfinance + Streamlit</span>'
-    f'</div>',
-    unsafe_allow_html=True)
+st.markdown(f'<div style="text-align:center;font-size:11px;color:{TXT_SOFT}">Reversal Scanner v8 · Screener por Tab · 100% Automático · Datos educativos · No constituye asesoría financiera</div>',unsafe_allow_html=True)
