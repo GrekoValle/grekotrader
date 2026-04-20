@@ -393,7 +393,7 @@ def bonus_fundamentales(bpa: float, dividendo: float, margen_bruto: float,
 # ─────────────────────────────────────────────────────────────
 #  VIX — SEMÁFORO DE OPORTUNIDAD DEL MERCADO
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=1800, show_spinner=False)  # cache 30 min
+@st.cache_data(ttl=300, show_spinner=False)  # cache 5 min
 def fetch_vix() -> dict:
     """
     Descarga el VIX actual via yfinance.
@@ -2533,6 +2533,10 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 50) -> pd.DataFrame:
     try:
         import yfinance as yf
         for tk in SCAN_UNIVERSE:
+            # ETFs que no tienen fundamentals en yfinance — saltar
+            _ETF_SKIP = {"XLE","XLI","XLY","XLC","XLB","XLP","XLRE","GLD","SLV","USO","UNG"}
+            if tk in _ETF_SKIP:
+                continue
             try:
                 try:
                     hist = yf.Ticker(tk).history(period="3mo")
@@ -2713,6 +2717,15 @@ with st.sidebar:
     # Refresh market data
     if st.button("🔄 Actualizar indicadores de mercado", use_container_width=True):
         st.session_state["mkt_cache"] = {}
+        st.rerun()
+    if st.button("🗑️ Limpiar cache de precios", use_container_width=True,
+                  help="Fuerza descarga de precios frescos — usar si los datos parecen desactualizados"):
+        st.cache_data.clear()
+        for key in ["scan_swing","scan_entrar","scan_detectadas","scan_sympathy",
+                    "mkt_cache","etf_data","earnings_mis_pos","earnings_amparito"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.success("✅ Cache limpiado — datos frescos al escanear")
         st.rerun()
     st.markdown("---")
     # Guía rápida de fases
@@ -2918,7 +2931,18 @@ st.markdown(
 st.markdown(f'<div style="font-size:11px;color:{TXT_MUT};margin-bottom:10px">Modelo Rebote Técnico · Patrón NBIS · 3 Momentos · Pre/Post Market · {"RSI / MACD / EMA50 / Precio actualizados en tiempo real · cache 20min" if _n_live>0 else "pip install yfinance para indicadores en tiempo real"}</div>',unsafe_allow_html=True)
 
 # ── Semáforo VIX ──────────────────────────────────────────────
-if vix["_ok"]:
+if not vix["_ok"]:
+    st.markdown(
+        f'<div style="background:{BG_HEAD};border:1px solid {BOR};'
+        f'border-radius:12px;padding:10px 18px;margin-bottom:12px">'
+        f'<div style="display:flex;align-items:center;gap:16px">'
+        f'<div>'
+        f'  <span style="font-size:10px;color:{TXT_MUT};font-weight:600">VIX — Índice de Volatilidad</span><br>'
+        f'  <span style="font-size:22px;font-weight:800;color:{TXT_MUT}">—</span>'
+        f'  <span style="font-size:11px;color:{TXT_MUT};margin-left:8px">Sin datos · Mercado cerrado</span>'
+        f'</div></div></div>',
+        unsafe_allow_html=True)
+elif vix["_ok"]:
     cambio_sym = f'+{vix["cambio"]:.2f}' if vix["cambio"] >= 0 else f'{vix["cambio"]:.2f}'
     cambio_col = R if vix["cambio"] > 0 else G
     vix_v = vix["valor"]
