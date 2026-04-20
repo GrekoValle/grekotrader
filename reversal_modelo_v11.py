@@ -1319,62 +1319,86 @@ def clasificar_sizing(score: int, vix: float) -> dict:
 #  UNIVERSO DINÁMICO — S&P500 + Nasdaq100 + Portfolio personal
 #  Se descarga automáticamente desde Wikipedia al iniciar
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=86400)  # cache 24 horas — se refresca 1 vez al día
+@st.cache_data(ttl=86400)  # cache 24 horas
 def cargar_universo_dinamico() -> list:
     """
-    Descarga automáticamente:
-    - S&P500 (~503 tickers) desde Wikipedia
-    - Nasdaq100 (~100 tickers) desde Wikipedia
-    - Portfolio personal (siempre incluido)
-    Total: ~550 tickers únicos sin hardcodear ninguno
+    Descarga componentes S&P500 + Nasdaq100 via múltiples fuentes.
+    Fallback progresivo si alguna fuente falla.
     """
+    import yfinance as yf
+
     portfolio_personal = [
         "NBIS","MRNA","CROX","APLD","ASTS","NVDA","CNC","CLOV",
         "NKE","XBI","TAN","VOO","IBIT","ETHA","SPY","IBRX",
     ]
-
     tickers = set(portfolio_personal)
 
-    # S&P500
+    # Fuente 1: yfinance — componentes S&P500 via ETF holdings
     try:
         import pandas as pd
-        sp500 = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        # Descargar desde GitHub (fuente pública confiable)
+        url_sp500 = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        sp500 = pd.read_csv(url_sp500)
+        tickers.update(sp500["Symbol"].tolist())
+    except Exception:
+        pass
+
+    # Fuente 2: Wikipedia con timeout corto
+    try:
+        import pandas as pd
+        sp500_wiki = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            storage_options={"timeout": 5}
         )[0]
-        sp500_tickers = sp500["Symbol"].str.replace(".","-").tolist()
-        tickers.update(sp500_tickers)
+        tickers.update(sp500_wiki["Symbol"].str.replace(".","-").tolist())
     except Exception:
         pass
 
-    # Nasdaq100
+    # Fuente 3: yfinance screener — top 500 por market cap
     try:
-        import pandas as pd
-        nq100 = pd.read_html(
-            "https://en.wikipedia.org/wiki/Nasdaq-100"
-        )[4]
-        col = "Ticker" if "Ticker" in nq100.columns else nq100.columns[1]
-        nq100_tickers = nq100[col].tolist()
-        tickers.update([str(t) for t in nq100_tickers if isinstance(t,str) and t.isupper()])
+        screener = yf.screen("most_actives", count=500)
+        if screener and "quotes" in screener:
+            for q in screener["quotes"]:
+                if "symbol" in q:
+                    tickers.add(q["symbol"])
     except Exception:
         pass
 
-    # Si falló la descarga, usar lista base amplia
-    if len(tickers) <= len(portfolio_personal) + 5:
-        base = [
-            "MSFT","GOOGL","META","AMZN","AAPL","NVDA","TSLA","ORCL","CRM","SNOW",
-            "PLTR","ADBE","INTU","NOW","WDAY","DDOG","NET","CRWD","PANW","ZS",
-            "AMD","AVGO","MRVL","ANET","SMCI","APP","RDDT","DOMO","AI","HOOD",
-            "SOFI","COIN","AFRM","PYPL","V","MA","AXP","JPM","BAC","GS",
-            "IBRX","CELH","HIMS","RXRX","PCVX","PFE","ABBV","MRK","BIIB","GILD",
-            "AMGN","REGN","VRTX","ISRG","ZTS","MRNA","BNTX","ARWR","BEAM","CRSP",
-            "MARA","RIOT","CORZ","CLSK","HUT","IONQ","RGTI","QBTS","MSTR","BTDR",
-            "MELI","NU","BABA","PDD","SE","GRAB","GLOB","DESP","VTEX",
-            "LULU","SBUX","MCD","CMG","TGT","COST","BURL","CHWY","W","RH",
-            "OXY","DVN","XOM","CVX","ENPH","SEDG","RUN","TAN","FSLR","ARRY",
-            "BA","GE","HON","LMT","RTX","CAT","DE","AXON","KTOS","JOBY",
-            "OPEN","STAA","ACN","XBI","IBB","ARKK","SOXX","XLK","XLF","XLV",
-        ]
-        tickers.update(base)
+    # Siempre ampliar con universo curado de alta calidad
+    universo_curado = [
+        # Mega Cap
+        "MSFT","GOOGL","META","AMZN","AAPL","NVDA","TSLA","ORCL","CRM","SNOW",
+        "PLTR","ADBE","INTU","NOW","WDAY","DDOG","NET","CRWD","PANW","ZS","MDB",
+        "AMD","AVGO","MRVL","ANET","SMCI","APP","RDDT","DOMO","AI","HOOD","SOFI",
+        # Fintech
+        "COIN","AFRM","XYZ","PYPL","V","MA","AXP","JPM","BAC","GS","MS","C",
+        "WFC","BLK","SCHW","ICE","CME","MELI","NU","PAGS","UPST","LC","OPEN",
+        # Biotech
+        "IBRX","CELH","HIMS","RXRX","PCVX","PFE","ABBV","MRK","BMY","GILD",
+        "AMGN","REGN","VRTX","BIIB","ILMN","ZTS","ISRG","SYK","BSX","EW",
+        "DXCM","HOLX","AXSM","TVTX","MRNA","BNTX","ARWR","BEAM","CRSP","EDIT",
+        "NVCR","RCUS","MRUS","KROS","FOLD","VRNA","IMVT","XENE","PRAX","ACAD",
+        # Cripto/AI
+        "MARA","RIOT","CORZ","CLSK","HUT","BTBT","IONQ","RGTI","QBTS","MSTR",
+        "IREN","WULF","BITF","CIFR","BTDR","SMLR","HIVE","DMGI",
+        # LatAm/Global
+        "BABA","PDD","SE","GRAB","GLOB","ARCO","VTEX","DESP",
+        # Consumo
+        "LULU","SBUX","MCD","CMG","TGT","COST","HD","BURL","CHWY","W","RH",
+        "RVLV","ONON","DECK","SKX","CROX","BOOT","ANF","AEO","URBN",
+        # Energía/Solar
+        "OXY","DVN","XOM","CVX","COP","SLB","HAL","FCX","NEM","FANG",
+        "AR","EQT","RRC","ENPH","SEDG","RUN","ARRY","NOVA","FSLR","TAN",
+        # Industrial/Defensa
+        "BA","GE","HON","LMT","RTX","GD","DE","CAT","UPS","FDX",
+        "NOC","AXON","KTOS","RCAT","JOBY","ACHR",
+        # ETFs
+        "ARKK","ARKG","ARKF","SOXX","XBI","IBB","XLK","XLF","XLV",
+        "XLE","XLI","XLY","JETS","HACK","BOTZ",
+        # Small/Mid Alta Beta
+        "STAA","ACN","OPEN","RGTI","APLD","ASTS","CLOV","NKE",
+    ]
+    tickers.update(universo_curado)
 
     result = sorted(list(tickers))
     return result
