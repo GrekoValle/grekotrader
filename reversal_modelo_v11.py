@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  GREKOTRADER — 100% Automático · Sin datos en duro · v10               ║
+║  GREKOTRADER — 100% Automático · Sin datos en duro · v11               ║
 ║                                                                  ║
 ║  Instalar:  pip install streamlit plotly pandas numpy           ║
 ║  Ejecutar:  streamlit run reversal_modelo_v5.py                 ║
@@ -1315,31 +1315,73 @@ def clasificar_sizing(score: int, vix: float) -> dict:
     }
 
 
-SCAN_UNIVERSE = [
-    # ── Tu portfolio actual — siempre monitoreadas ──────────
-    "NBIS","MRNA","CROX","APLD","ASTS","NVDA","CNC","CLOV","NKE",
-    # ── AI / Tech ───────────────────────────────────────────
-    "MSFT","GOOGL","META","AMZN","AMD","CRM","ORCL","SNOW","PLTR",
-    "PANW","ZS","CRWD","NET","DDOG","MDB","SMCI","ANET","MRVL","AVGO",
-    "AAPL","NFLX","UBER","SHOP","NOW","WDAY","ADBE","INTU","TEAM","HUBS",
-    # ── Salud / Biotech ─────────────────────────────────────
-    "PFE","ABBV","MRK","BMY","GILD","AMGN","REGN","VRTX","BIIB",
-    "ILMN","ZTS","ISRG","SYK","BSX","EW","DXCM","HOLX","AXSM","TVTX",
-    # ── Fintech / Finanzas ──────────────────────────────────
-    "HOOD","SOFI","COIN","AFRM","XYZ","PYPL","V","MA","AXP","JPM","BAC",
-    "GS","MS","C","WFC","BLK","SCHW","ICE","CME","MELI","NU",
-    # ── Energía ─────────────────────────────────────────────
-    "OXY","DVN","XOM","CVX","COP","SLB","HAL","FCX","NEM","FANG",
-    # ── Consumo ─────────────────────────────────────────────
-    "LULU","SBUX","MCD","CMG","TGT","COST","HD","BURL",
-    # ── Industrial / Aero ───────────────────────────────────
-    "BA","GE","HON","LMT","RTX","GD","DE","CAT","UPS","FDX",
-    # ── Cripto / AI Infra ───────────────────────────────────
-    "MARA","CLSK","RIOT","IREN","CORZ","IONQ","RGTI","QBTS",
-    # ── Especiales / ETFs ───────────────────────────────────
-    "OPEN","ARKK","XBI","SOXX","XLF","XLV","XLK","XLI",
-    "ACN","STAA","TSLA","ENPH","SEDG","RUN","TEAM","ALB",
-]
+# ─────────────────────────────────────────────────────────────
+#  UNIVERSO DINÁMICO — S&P500 + Nasdaq100 + Portfolio personal
+#  Se descarga automáticamente desde Wikipedia al iniciar
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400)  # cache 24 horas — se refresca 1 vez al día
+def cargar_universo_dinamico() -> list:
+    """
+    Descarga automáticamente:
+    - S&P500 (~503 tickers) desde Wikipedia
+    - Nasdaq100 (~100 tickers) desde Wikipedia
+    - Portfolio personal (siempre incluido)
+    Total: ~550 tickers únicos sin hardcodear ninguno
+    """
+    portfolio_personal = [
+        "NBIS","MRNA","CROX","APLD","ASTS","NVDA","CNC","CLOV",
+        "NKE","XBI","TAN","VOO","IBIT","ETHA","SPY","IBRX",
+    ]
+
+    tickers = set(portfolio_personal)
+
+    # S&P500
+    try:
+        import pandas as pd
+        sp500 = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        )[0]
+        sp500_tickers = sp500["Symbol"].str.replace(".","-").tolist()
+        tickers.update(sp500_tickers)
+    except Exception:
+        pass
+
+    # Nasdaq100
+    try:
+        import pandas as pd
+        nq100 = pd.read_html(
+            "https://en.wikipedia.org/wiki/Nasdaq-100"
+        )[4]
+        col = "Ticker" if "Ticker" in nq100.columns else nq100.columns[1]
+        nq100_tickers = nq100[col].tolist()
+        tickers.update([str(t) for t in nq100_tickers if isinstance(t,str) and t.isupper()])
+    except Exception:
+        pass
+
+    # Si falló la descarga, usar lista base amplia
+    if len(tickers) <= len(portfolio_personal) + 5:
+        base = [
+            "MSFT","GOOGL","META","AMZN","AAPL","NVDA","TSLA","ORCL","CRM","SNOW",
+            "PLTR","ADBE","INTU","NOW","WDAY","DDOG","NET","CRWD","PANW","ZS",
+            "AMD","AVGO","MRVL","ANET","SMCI","APP","RDDT","DOMO","AI","HOOD",
+            "SOFI","COIN","AFRM","PYPL","V","MA","AXP","JPM","BAC","GS",
+            "IBRX","CELH","HIMS","RXRX","PCVX","PFE","ABBV","MRK","BIIB","GILD",
+            "AMGN","REGN","VRTX","ISRG","ZTS","MRNA","BNTX","ARWR","BEAM","CRSP",
+            "MARA","RIOT","CORZ","CLSK","HUT","IONQ","RGTI","QBTS","MSTR","BTDR",
+            "MELI","NU","BABA","PDD","SE","GRAB","GLOB","DESP","VTEX",
+            "LULU","SBUX","MCD","CMG","TGT","COST","BURL","CHWY","W","RH",
+            "OXY","DVN","XOM","CVX","ENPH","SEDG","RUN","TAN","FSLR","ARRY",
+            "BA","GE","HON","LMT","RTX","CAT","DE","AXON","KTOS","JOBY",
+            "OPEN","STAA","ACN","XBI","IBB","ARKK","SOXX","XLK","XLF","XLV",
+        ]
+        tickers.update(base)
+
+    result = sorted(list(tickers))
+    return result
+
+
+# Cargar universo al iniciar
+SCAN_UNIVERSE = cargar_universo_dinamico()
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def scan_tab(rsi_max: float, dd_min: float,
@@ -2236,10 +2278,11 @@ def render_table(df_sub, show_cols):
         row_html+="</tr>"
         rows_html+=row_html
     hdr={"Ticker":"Ticker","Area":"Área","Decision":"Decisión","Fase":"Fase","Trigger":"Trigger",
-         "Precio":"Precio","Prob_NBIS":"Prob NBIS","Sim_NBIS":"Sim. NBIS","Motivo":"Motivo",
-         "Lectura":"Lectura Trader","Arrastradas":"Acciones arrastradas","Patron_Tipo":"Tipo Patrón","RSI_Dir":"RSI Dirección","Lider":"Líder",
+         "Precio":"Precio","Score_Rebote":"Score Rebote","Nivel_Rebote":"Nivel","Detalle_Rebote":"Detalle Score",
+         "Prob_NBIS":"Score Rebote","Sim_NBIS":"Nivel","Motivo":"Motivo",
+         "Lectura":"Lectura Trader","Arrastradas":"Arrastradas","Patron_Tipo":"Tipo Patrón","RSI_Dir":"RSI Dir","Lider":"Líder",
          "Score":"Score","RSI":"RSI","Pre_Move":"Pre/Post %","Pre_Vol":"Vol Pre",
-         "Post_Vol":"Vol Post","Short_Int":"Short %","DD_pico":"DD pico","Cat_Fecha":"Catalizador"}
+         "Post_Vol":"Vol Post","Short_Int":"Short %","DD_pico":"DD Caída","Cat_Fecha":"Catalizador"}
     ths="".join([f"<th>{hdr.get(c,c)}</th>" for c in show_cols])
     st.markdown(f'<div class="tbl-wrap"><table class="dtbl"><thead><tr>{ths}</tr></thead><tbody>{rows_html}</tbody></table></div>',unsafe_allow_html=True)
 
@@ -2580,6 +2623,25 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 50) -> pd.DataFrame:
                     "Vol_Diario_K": round(vol_k, 0),
                     "Lectura": lectura,
                     "_source": "screener",
+                    # Score Rebote v11 para Swing
+                    "Score_Rebote": calcular_score_rebote(
+                        dd=dd, rsi=rsi, vol_ratio=vol_ratio,
+                        dias_alcistas=dias_alcistas, momentum_3d=momentum_3d,
+                        tiene_catalizador=False, dias_para_cat=999,
+                        beta=beta_v
+                    )["score"],
+                    "Nivel_Rebote": calcular_score_rebote(
+                        dd=dd, rsi=rsi, vol_ratio=vol_ratio,
+                        dias_alcistas=dias_alcistas, momentum_3d=momentum_3d,
+                        tiene_catalizador=False, dias_para_cat=999,
+                        beta=beta_v
+                    )["nivel"],
+                    "Detalle_Rebote": calcular_score_rebote(
+                        dd=dd, rsi=rsi, vol_ratio=vol_ratio,
+                        dias_alcistas=dias_alcistas, momentum_3d=momentum_3d,
+                        tiene_catalizador=False, dias_para_cat=999,
+                        beta=beta_v
+                    )["detalle"],
                 })
             except Exception:
                 continue
@@ -2597,8 +2659,11 @@ def import_np():
 
 
 with st.sidebar:
-    st.markdown(f'<div style="font-size:22px;font-weight:800;color:{B}">🦅 GrekoTrader</div>'+
-            f'<div style="font-size:10px;color:{TXT_MUT};margin-top:2px">v10 · 20 Apr 2026 · Patrón NBIS</div>',unsafe_allow_html=True)
+    st.markdown(f'<div style="font-size:22px;font-weight:800;color:{B}">🦅 GrekoTrader</div>'
+            f'<div style="font-size:10px;color:{TXT_MUT};margin-top:2px">'
+            f'v11 · 21 Abr 2026 · Score Rebote · '
+            f'{len(SCAN_UNIVERSE)} tickers</div>'+
+            f'</div>',unsafe_allow_html=True)
     st.markdown(f'<div style="font-size:11px;color:{TXT_MUT};margin-bottom:6px">{datetime.date.today():%d %b %Y} · Modelo 3 Momentos</div>',unsafe_allow_html=True)
 
     # Badge indicadores live
@@ -2683,8 +2748,8 @@ with st.sidebar:
 # v8: df se construye en cada tab al escanear
 df = pd.DataFrame()
 
-COLS_MAIN=["Ticker","Area","Decision","Fase","Trigger","Precio","Patron_Tipo","RSI_Dir","Prob_NBIS","Sim_NBIS","Motivo","Lectura","Arrastradas"]
-COLS_EXT =["Ticker","Area","Decision","Fase","Trigger","Precio","Score","RSI","RSI_Dir","Patron_Tipo","Pre_Move","Pre_Vol","Post_Vol","Short_Int","DD_pico","Cat_Fecha","Prob_NBIS","Sim_NBIS","Motivo","Lectura","Arrastradas"]
+COLS_MAIN=["Ticker","Score_Rebote","Area","Decision","Fase","Precio","RSI","DD_pico","Nivel_Rebote","Motivo","Lectura"]
+COLS_EXT =["Ticker","Score_Rebote","Nivel_Rebote","Area","Decision","Fase","Precio","Score","RSI","DD_pico","Cat_Fecha","Detalle_Rebote","Pre_Move","Pre_Vol","Motivo","Lectura"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2711,7 +2776,7 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
         f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:10px;'+
         f'padding:12px 16px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center">'+
         f'<div style="font-size:11px;color:{TXT_MUT}">'+
-        f'<strong>Filtros automáticos:</strong> RSI ≤ {rsi_max} · DD ≤ {dd_min}% · Vol ≥ 200K/día'+
+        f'<strong>Filtros automáticos:</strong> RSI ≤ {rsi_max} · DD ≤ {dd_min}% · Score ≥ {score_min} · Vol ≥ 200K/día'+
         f'</div></div>', unsafe_allow_html=True)
 
     col_btn, col_info = st.columns([2, 3])
@@ -2753,7 +2818,7 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
             f'padding:20px;text-align:center;color:{A}">'+
             f'🚀 Mercado en rally — ninguna acción cumple los filtros de {titulo} ahora.'+
             f'<br><span style="font-size:11px;color:{TXT_MUT}">'+
-            f'RSI ≤ {rsi_max} + DD ≤ {dd_min}% + Score ≥ {score_min}. '+
+            f'Filtros activos: RSI ≤ {rsi_max} · DD ≤ {dd_min}% · Score ≥ {score_min}. '+
             f'Esto es información válida — el modelo dice que no hay oportunidades en este nivel hoy.</span></div>',
             unsafe_allow_html=True)
         return
@@ -3855,8 +3920,13 @@ También puedes descargar la plantilla de abajo y completarla.
             with ci3:
                 st.markdown(f'<div style="text-align:center"><div style="font-size:11px;color:{TXT_MUT};font-weight:600">P&L</div><div style="font-size:20px;font-weight:800;color:{pnl_color}">{pnl_pct:+.1f}%</div><div style="font-size:11px;color:{pnl_color};font-weight:600">${pnl_usd:+,.0f}</div></div>',unsafe_allow_html=True)
             with ci4:
-                sc_c=G if r["Score"]>=75 else A if r["Score"]>=55 else R
-                st.markdown(f'<div style="text-align:center"><div style="font-size:11px;color:{TXT_MUT};font-weight:600">Score</div><div style="font-size:20px;font-weight:800;color:{sc_c}">{r["Score"]}</div></div>',unsafe_allow_html=True)
+                sc_c=G if _score_rebote["score"]>=75 else A if _score_rebote["score"]>=55 else R
+                st.markdown(
+                    f'<div style="text-align:center">'
+                    f'<div style="font-size:11px;color:{TXT_MUT};font-weight:600">Score Rebote</div>'
+                    f'<div style="font-size:20px;font-weight:800;color:{sc_c}">{_score_rebote["score"]}</div>'
+                    f'<div style="font-size:10px;color:{sc_c}">{_score_rebote["nivel"]}</div>'
+                    f'</div>',unsafe_allow_html=True)
             with ci5:
                 # Barra visual de 3 tramos
                 tramo_html = ""
@@ -4489,7 +4559,7 @@ st.markdown("---")
 st.markdown(
     f'<div style="text-align:center;font-size:11px;color:{TXT_SOFT};padding:8px">'
     f'🦅 <strong>GrekoTrader</strong> · '
-    f'Versión 10 · Creado el 20 Apr 2026 · '
+    f'Versión 11 · Creado el 21 Abr 2026 · '
     f'Patrón NBIS · 3 Momentos · 100% Automático<br>'
     f'<span style="font-size:10px">Datos educativos · No constituye asesoría financiera · '
     f'Powered by yfinance + Streamlit</span>'
