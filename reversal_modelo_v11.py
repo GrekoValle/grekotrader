@@ -2863,23 +2863,45 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
     # ── Orden automático por tab + columna Señal ────────────
     df_show = resultado_df.copy()
 
-    # Agregar columna "Señal" con interpretación clara
+    # Agregar columna "Señal" con interpretación correcta según tab
     def generar_senal(row):
         rsi  = float(row.get("RSI", 50))
         dd   = float(row.get("DD_pico", 0))
         vol  = float(row.get("Volumen", 100))
-        prob = float(row.get("Prob_NBIS", 0))
         dec  = str(row.get("Decision",""))
-        if dec == "ENTRAR" or (rsi < 35 and dd < -20 and vol > 150):
-            return "🔥 Entrar hoy"
-        elif dec == "ANTICIPAR" or (rsi < 45 and dd < -15 and vol > 100):
-            return "⚡ Entrada válida"
-        elif dd < -8 and rsi < 55:
-            return "👀 En corrección — vigilar"
-        elif rsi > 65:
-            return "⛔ RSI alto — esperar"
+
+        # Detectadas M1 — solo estados de corrección
+        if tab_key == "scan_detectadas":
+            if dd < -30 and rsi < 40:
+                return "🔴 Corrección profunda — watchlist prioritaria"
+            elif dd < -15 and rsi < 50:
+                return "👀 En corrección — vigilar"
+            elif dd < -8:
+                return "📡 Inicio corrección — agregar a watchlist"
+            else:
+                return "🔵 Corrección leve"
+
+        # Entrar hoy — solo señales fuertes
+        elif tab_key == "scan_entrar":
+            if dec == "ENTRAR" or (rsi < 35 and dd < -15 and vol > 150):
+                return "🔥 Entrar hoy — señal completa"
+            elif dec == "ANTICIPAR":
+                return "⚡ Anticipar — pre-señal"
+            else:
+                return "⚡ Candidata"
+
+        # Otros tabs — señal general
         else:
-            return "🔵 Neutral — observar"
+            if dec == "ENTRAR" or (rsi < 35 and dd < -20 and vol > 150):
+                return "🔥 Entrar hoy"
+            elif dec == "ANTICIPAR" or (rsi < 45 and dd < -15 and vol > 100):
+                return "⚡ Entrada válida"
+            elif dd < -8 and rsi < 55:
+                return "👀 En corrección — vigilar"
+            elif rsi > 65:
+                return "⛔ RSI alto — esperar"
+            else:
+                return "🔵 Neutral — observar"
 
     if not df_show.empty:
         df_show["Señal modelo"] = df_show.apply(generar_senal, axis=1)
