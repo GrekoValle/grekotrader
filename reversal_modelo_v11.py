@@ -517,7 +517,7 @@ def render_catalysts_section(posiciones_df, key_prefix):
                 f'</div>', unsafe_allow_html=True)
 
         import datetime as _dt
-        earn_csv = earn_result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        earn_csv = df_to_csv_chile(earn_result).encode("utf-8-sig")
         col_dl, col_tip = st.columns([2,3])
         with col_dl:
             st.download_button(
@@ -920,7 +920,7 @@ def exportar_senales_dia(df: pd.DataFrame, tab_nombre: str,
             "Notas": lectura.replace("→","->").replace("·","-").replace("↑","up").replace("↓","down").replace("¿","").replace("é","e").replace("í","i").replace("á","a").replace("ó","o").replace("ú","u"),
         })
 
-    return pd.DataFrame(filas).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    return df_to_csv_chile(pd.DataFrame(filas)).encode("utf-8-sig")
 
 def boton_exportar(df: pd.DataFrame, tab_nombre: str,
                    key: str, fase_col: str = None):
@@ -1159,6 +1159,11 @@ def calcular_estrategia(capital: float, plazo: str, perfil: str,
         "proy_pes":         proy_pes,
         "n_años":           n_años,
     }
+
+
+def df_to_csv_chile(df: pd.DataFrame) -> str:
+    """Exporta DataFrame en formato CSV Chile: separador ; y decimales con coma"""
+    return df.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1409,9 +1414,10 @@ SCAN_UNIVERSE = cargar_universo_dinamico()
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def scan_tab(rsi_max: float, dd_min: float,
-             score_min: int, decision_filter: list,
+             score_min: int = 20, decisions: list = None,
              vol_min_k: float = 200,
-             max_results: int = 50) -> pd.DataFrame:
+             max_results: int = 100,
+             universo: list = None) -> pd.DataFrame:
     """
     Escanea el universo y retorna candidatos para el tab específico.
     rsi_max, dd_min: filtros técnicos del tab
@@ -1421,10 +1427,15 @@ def scan_tab(rsi_max: float, dd_min: float,
     candidatos = []
     try:
         import yfinance as yf
-        for tk in SCAN_UNIVERSE:
+        _universo = universo if universo else SCAN_UNIVERSE
+        for tk in _universo:
             try:
                 stk  = yf.Ticker(tk)
-                hist = stk.history(period="6mo")
+                # Usar 3mo para velocidad — suficiente para DD y RSI
+                try:
+                    hist = stk.history(period="3mo")
+                except Exception:
+                    continue
                 if hist.empty or len(hist) < 20:
                     continue
 
@@ -1499,7 +1510,7 @@ def scan_tab(rsi_max: float, dd_min: float,
                     continue
 
                 dec, fase, trig, col, bg = get_decision(sc, 0, 1.0, macd_h, rsi, "—")
-                if decision_filter and dec not in decision_filter:
+                if decisions and dec not in decisions:
                     continue
 
                 pat = clasificar_patron(beta_v, si_v, 0, 3, dd)
@@ -1888,6 +1899,21 @@ def build_df():
             "RSI_Dir": rsi_direccion(rsi, rsi_t, dd, macd)[0],
             "RSI_Dir_Desc": rsi_direccion(rsi, rsi_t, dd, macd)[2],
             "_source":src, "_precio_live": src=="live",
+            # v11: Score Rebote
+            **{k: v for k, v in calcular_score_rebote(
+                dd=dd, rsi=rsi, vol_ratio=vol,
+                dias_alcistas=0, momentum_3d=float(macd),
+                tiene_catalizador=row["Cat_Fecha"] not in ("—","","nan"),
+                dias_para_cat=(
+                    max(0, (pd.to_datetime(row["Cat_Fecha"], errors="coerce").date()
+                    - __import__("datetime").date.today()).days)
+                    if row["Cat_Fecha"] not in ("—","","nan") else 999
+                ),
+                beta=beta
+            ).items() if k in ("score","nivel","detalle","pts_dd","pts_rsi","pts_vol","pts_cat")},
+            "Score_Rebote": calcular_score_rebote(dd=dd,rsi=rsi,vol_ratio=vol,dias_alcistas=0,momentum_3d=float(macd),tiene_catalizador=row["Cat_Fecha"] not in ("—","","nan"),dias_para_cat=999,beta=beta)["score"],
+            "Nivel_Rebote": calcular_score_rebote(dd=dd,rsi=rsi,vol_ratio=vol,dias_alcistas=0,momentum_3d=float(macd),tiene_catalizador=row["Cat_Fecha"] not in ("—","","nan"),dias_para_cat=999,beta=beta)["nivel"],
+            "Detalle_Rebote": calcular_score_rebote(dd=dd,rsi=rsi,vol_ratio=vol,dias_alcistas=0,momentum_3d=float(macd),tiene_catalizador=row["Cat_Fecha"] not in ("—","","nan"),dias_para_cat=999,beta=beta)["detalle"],
         })
 
     return pd.DataFrame(rows), n_live
@@ -2200,6 +2226,30 @@ def render_table(df_sub, show_cols):
     if df_sub.empty:
         st.markdown(f'<div style="padding:16px;color:{TXT_MUT};font-size:12px;text-align:center;background:{BG_HEAD};border-radius:10px;border:1px solid {BOR}">— sin resultados —</div>',unsafe_allow_html=True)
         return
+
+    # v11: calcular Score_Rebote si no existe en el DataFrame
+    df_sub = df_sub.copy()
+    if "Score_Rebote" not in df_sub.columns or df_sub["Score_Rebote"].isna().all() or (df_sub["Score_Rebote"] == "").all():
+        def _calc_sr(row):
+            try:
+                sr = calcular_score_rebote(
+                    dd=float(row.get("DD_pico", 0)),
+                    rsi=float(row.get("RSI", 50)),
+                    vol_ratio=float(row.get("Volumen", 100)),
+                    dias_alcistas=int(row.get("Dias_Alcistas", 0)),
+                    momentum_3d=float(row.get("MACD", 0)),
+                    tiene_catalizador=str(row.get("Cat_Fecha","—")) not in ("—","","nan"),
+                    dias_para_cat=999,
+                    beta=float(row.get("Beta", 1.5))
+                )
+                return sr["score"], sr["nivel"], sr["detalle"]
+            except Exception:
+                return 0, "🔵 DÉBIL", "—"
+        _scores = df_sub.apply(_calc_sr, axis=1)
+        df_sub["Score_Rebote"]   = [s[0] for s in _scores]
+        df_sub["Nivel_Rebote"]   = [s[1] for s in _scores]
+        df_sub["Detalle_Rebote"] = [s[2] for s in _scores]
+
     rows_html=""
     for _,r in df_sub.iterrows():
         row_html="<tr>"
@@ -2385,8 +2435,7 @@ def clasificar_tipo_noticia(titulo: str) -> str:
 def fetch_noticias_ticker(ticker: str) -> list:
     """
     Descarga y analiza las últimas noticias de un ticker via yfinance.
-    Retorna lista de dicts con los campos del modelo.
-    Compatible con yfinance antiguo y nuevo formato.
+    Compatible con todas las versiones de yfinance.
     """
     noticias = []
     try:
@@ -2397,24 +2446,31 @@ def fetch_noticias_ticker(ticker: str) -> list:
         except Exception:
             raw_news = []
 
-        for item in raw_news[:8]:  # máximo 8 noticias
+        for item in raw_news[:8]:
             try:
-                # Soporte para dict (formato antiguo) y objeto (formato nuevo)
+                titulo, link, ts, fuente = "", "", 0, "Yahoo Finance"
+
                 if isinstance(item, dict):
-                    titulo = item.get("title","") or item.get("headline","")
-                    link   = item.get("link","") or item.get("url","") or item.get("clickThroughUrl","")
-                    ts     = item.get("providerPublishTime",0) or item.get("pubDate",0)
-                    fuente = item.get("publisher","Yahoo Finance") or item.get("source","Yahoo Finance")
+                    # Formato nuevo: content anidado
+                    content = item.get("content", {})
+                    if isinstance(content, dict):
+                        titulo = content.get("title","") or content.get("headline","")
+                        cl = content.get("clickThroughUrl", {})
+                        link = cl.get("url","") if isinstance(cl, dict) else str(cl)
+                        prov = content.get("provider",{})
+                        fuente = prov.get("displayName","Yahoo Finance") if isinstance(prov,dict) else "Yahoo Finance"
+                        ts = content.get("pubDate", 0)
+                    # Formato antiguo: campos directos
+                    if not titulo:
+                        titulo = item.get("title","") or item.get("headline","")
+                        link   = item.get("link","") or item.get("url","")
+                        ts     = item.get("providerPublishTime",0)
+                        fuente = item.get("publisher","Yahoo Finance")
                 else:
-                    # Objeto con atributos
-                    titulo = getattr(item, "title", "") or getattr(item, "headline", "")
-                    link   = getattr(item, "link", "") or getattr(item, "url", "")
-                    ts     = getattr(item, "providerPublishTime", 0)
-                    fuente = getattr(item, "publisher", "Yahoo Finance")
-                    # Intentar como dict también
-                    if not titulo and hasattr(item, "get"):
-                        titulo = item.get("content",{}).get("title","") if isinstance(item.get("content"),dict) else ""
-                        link   = item.get("content",{}).get("clickThroughUrl",{}).get("url","") if isinstance(item.get("content"),dict) else ""
+                    titulo = getattr(item,"title","") or getattr(item,"headline","")
+                    link   = getattr(item,"link","") or getattr(item,"url","")
+                    ts     = getattr(item,"providerPublishTime",0)
+                    fuente = getattr(item,"publisher","Yahoo Finance")
 
                 if not titulo or not link:
                     continue
@@ -2519,7 +2575,7 @@ def render_noticias_panel(ticker: str, noticias: list, bonus: int):
 #  Filtros: precio subiendo 3 días + volumen creciente + RSI girando
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=1800, show_spinner=False)
-def scan_swing(vol_min_k: float = 200, max_results: int = 50) -> pd.DataFrame:
+def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = None) -> pd.DataFrame:
     """
     Detecta acciones en rebote de swing 5-10 días.
     Criterios:
@@ -2532,9 +2588,10 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 50) -> pd.DataFrame:
     candidatos = []
     try:
         import yfinance as yf
-        for tk in SCAN_UNIVERSE:
+        _universo_sw = universo if universo else SCAN_UNIVERSE
+        for tk in _universo_sw:
             # ETFs que no tienen fundamentals en yfinance — saltar
-            _ETF_SKIP = {"XLE","XLI","XLY","XLC","XLB","XLP","XLRE","GLD","SLV","USO","UNG"}
+            _ETF_SKIP = {"XLE","XLI","XLY","XLC","XLB","XLP","XLRE","GLD","SLV","USO","UNG","JETS","HACK","BOTZ","ROBO","COPX","ARKG","ARKF","ARKQ","SOXX","IBB","ARKK"}
             if tk in _ETF_SKIP:
                 continue
             try:
@@ -2711,7 +2768,7 @@ with st.sidebar:
     st.markdown("---")
     area_fil  = st.selectbox("Área",["Todas","AI Infra","Tech","Salud","Finanzas","Consumo","Energía","Industrial","Cripto/AI","Quantum"])
     st.markdown("---")
-    max_res = st.slider("📊 Máx. resultados por tab", min_value=10, max_value=100, value=50, step=10,
+    max_res = st.slider("📊 Máx. resultados por tab", min_value=10, max_value=200, value=100, step=10,
                         help="Cuántas acciones mostrar por tab. Más = escaneo más lento.")
     st.markdown("---")
     # Refresh market data
@@ -2785,7 +2842,7 @@ with st.sidebar:
 # v8: df se construye en cada tab al escanear
 df = pd.DataFrame()
 
-COLS_MAIN=["Ticker","Score_Rebote","Area","Decision","Fase","Precio","RSI","DD_pico","Nivel_Rebote","Motivo","Lectura"]
+COLS_MAIN=["Ticker","Score_Rebote","Nivel_Rebote","Area","Fase","Precio","RSI","DD_pico","Detalle_Rebote","Motivo","Lectura"]
 COLS_EXT =["Ticker","Score_Rebote","Nivel_Rebote","Area","Decision","Fase","Precio","Score","RSI","DD_pico","Cat_Fecha","Detalle_Rebote","Pre_Move","Pre_Vol","Motivo","Lectura"]
 
 
@@ -2820,7 +2877,7 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
     with col_btn:
         if st.button(f"🔍 Escanear {titulo}", use_container_width=True, key=f"btn_{tab_key}"):
             with st.spinner(f"Escaneando ~{len(SCAN_UNIVERSE)} tickers..."):
-                resultado = scan_tab(rsi_max, dd_min, score_min, decisions)
+                resultado = scan_tab(rsi_max, dd_min, score_min, decisions, universo=SCAN_UNIVERSE[:st.session_state.get("universo_size", 300)])
                 st.session_state[tab_key] = resultado
     with col_info:
         if st.session_state.get(tab_key) is not None:
@@ -3202,7 +3259,7 @@ with tab2:
     with col_btn_sw:
         if st.button("⚡ Escanear Swing Activo", use_container_width=True, key="btn_swing"):
             with st.spinner("Detectando rebotes activos en ~{} tickers...".format(len(SCAN_UNIVERSE))):
-                resultado_sw = scan_swing(max_results=max_res)
+                resultado_sw = scan_swing(max_results=max_res, universo=SCAN_UNIVERSE[:st.session_state.get("universo_size", 300)])
                 st.session_state["scan_swing"] = resultado_sw
                 st.session_state["scan_swing_ts"] = datetime.datetime.now().strftime("%H:%M")
     with col_info_sw:
@@ -3362,7 +3419,7 @@ with tab2:
         sw_export = sw_result[["Ticker","Area","Precio","RSI","Dias_Alcistas",
                                 "Momentum_3d","DD_pico","Stop_Swing","Target_1","Target_2","Beta","Lectura"]]
         st.download_button("⬇️ Exportar swings (CSV)",
-            sw_export.to_csv(index=False), "swing_activo.csv","text/csv", key="dl_sw")
+            df_to_csv_chile(sw_export), "swing_activo.csv","text/csv", key="dl_sw")
         boton_exportar(sw_result, "Swing Activo", "exp_swing", fase_col=None)
 
 
@@ -3763,7 +3820,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
         export_wl["Nota"] = wl_res_df.get("Nota","—")
         st.download_button(
             "⬇️ Exportar análisis de watchlist (CSV)",
-            export_wl.to_csv(index=False),
+            df_to_csv_chile(export_wl),
             "watchlist_analisis.csv","text/csv",
             key="dl_wl_export")
 
@@ -4209,9 +4266,19 @@ También puedes descargar la plantilla de abajo y completarla.
                 r=get_row_for_ticker(tk,pc); pa=r["Precio"]
                 pnl_e=(pa-pc)/pc*100
                 analisis2=analizar_posicion(pc,pa,r["RSI"],r["MACD"],abs(r["EMA50"]) if r["EMA50"]>0 else 0,r["Score"],pnl_e,r["Prob_NBIS"],r["Sim_NBIS"],r["Beta"])
-                export_rows.append({"Ticker":tk,"Precio_Compra":pc,"Precio_Actual":pa,"Cantidad":qty,"P&L_%":round(pnl_e,2),"P&L_USD":round((pa-pc)*qty,2),"Score":r["Score"],"Prob_NBIS":r["Prob_NBIS"],"Sim_NBIS":r["Sim_NBIS"],"Señal":analisis2["señal"],"Urgencia":analisis2["urgencia"],"Catalizador":str(r["Cat_Desc"])[:50],"Fecha_Cat":r["Cat_Fecha"]})
+                # Determinar etapa de la señal al momento del escaneo
+            _dias_pos_e = max(1, _dias_pos)
+            if _dias_pos_e <= 1:
+                _etapa_senal = "🔥 Entrar Hoy (M3)"
+            elif _dias_pos_e <= 3:
+                _etapa_senal = "⚡ Entrada Válida (M2)"
+            elif pnl_e < -3:
+                _etapa_senal = "📡 Detectadas M1"
+            else:
+                _etapa_senal = "⚡ Entrada Temprana (M2)"
+            export_rows.append({"Ticker":tk,"Etapa_Señal":_etapa_senal,"Precio_Compra":pc,"Precio_Actual":pa,"Cantidad":qty,"P&L_%":round(pnl_e,2),"P&L_USD":round((pa-pc)*qty,2),"Score_Rebote":r.get("Score_Rebote",0),"Nivel_Rebote":r.get("Nivel_Rebote","—"),"Señal":analisis2["señal"],"Urgencia":analisis2["urgencia"],"Catalizador":str(r["Cat_Desc"])[:50],"Fecha_Cat":r["Cat_Fecha"]})
             if export_rows:
-                export_csv=pd.DataFrame(export_rows).to_csv(index=False)
+                export_csv=df_to_csv_chile(pd.DataFrame(export_rows))
                 st.download_button("⬇️ Exportar análisis de posiciones (CSV)",export_csv,"analisis_posiciones.csv","text/csv")
 
         if posiciones_df is not None and len(posiciones_df) > 0:
