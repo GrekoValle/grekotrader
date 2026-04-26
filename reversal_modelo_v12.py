@@ -1259,29 +1259,33 @@ def calcular_prob_nbis(rsi: float, vol_ratio: float, dd: float,
 # ─────────────────────────────────────────────────────────────
 def clasificar_etapa_v12(rsi: float, vol_ratio: float, prob_nbis: float,
                           dias_alcistas: int, momentum_3d: float,
-                          score_rebote: int) -> dict:
+                          score_rebote: int, dd: float = 0.0) -> dict:
     """
     Nueva lógica de escalamiento v12:
-    M1 – Detectada:     RSI 40-60, Vol cualquiera, Prob ≥ 35%
-    M2 – Entrada válida: RSI 30-40, Vol ≥ 50%, Prob ≥ 40%
-    M3 – Entrar HOY:    RSI ≤ 35, Mom ≥ +5%, 3d alcistas, Prob ≥ 40%, Vol ≥ 60%
+    M1 – Detectada:      RSI 40-60 · DD ≤ -8%  · Prob ≥ 35%
+    M2 – Entrada válida: RSI 30-45 · DD ≤ -8%  · Vol ≥ 50% · Prob ≥ 40% · Mom ≥ 1%
+    M3 – Entrar HOY:     RSI ≤ 35  · DD ≤ -10% · Vol ≥ 60% · Prob ≥ 40% · Mom ≥ 5% · 3d↑
+    El DD confirma que hubo corrección real — no es ruido de mercado.
     """
     # M3 — señal completa
     if (rsi <= 35 and momentum_3d >= 5 and dias_alcistas >= 3
-            and prob_nbis >= 40 and vol_ratio >= 60):
+            and prob_nbis >= 40 and vol_ratio >= 60
+            and dd <= -10):  # v12: corrección profunda confirmada
         return {"etapa": "M3", "label": "🔥 ENTRAR HOY",
                 "color": "16A34A", "bg": "F0FDF4",
                 "accion": "Ejecutar en apertura — señal completa"}
 
     # M2 — preparar orden
     if (30 <= rsi <= 45 and vol_ratio >= 50
-            and prob_nbis >= 40 and dias_alcistas >= 1):
+            and prob_nbis >= 40 and dias_alcistas >= 1
+            and momentum_3d >= 1.0
+            and dd <= -8):  # v12: corrección mínima -8%
         return {"etapa": "M2", "label": "⚡ ENTRADA VÁLIDA",
                 "color": "D97706", "bg": "FFFBEB",
                 "accion": "Preparar orden · Definir stop y targets"}
 
     # M1 — radar
-    if 35 <= rsi <= 60 and prob_nbis >= 35:
+    if 35 <= rsi <= 60 and prob_nbis >= 35 and dd <= -8:
         return {"etapa": "M1", "label": "📡 DETECTADA",
                 "color": "2563EB", "bg": "EFF6FF",
                 "accion": "En el radar · NO entrar aún"}
@@ -1860,10 +1864,16 @@ def scan_tab(rsi_max: float, dd_min: float,
                     sc = min(100, int(sc * vix_mult))
                 if sc < score_min:
                     continue
-                # v12: calcular Prob NBIS real
-                _dias_alc_s = int(row.get("Dias_Alcistas", 0))
-                _mom_s      = float(row.get("MACD", 0))
-                _tiene_c_s  = str(row.get("Cat_Fecha","—")) not in ("—","","nan")
+                # v12: calcular Prob NBIS con datos reales del yfinance loop
+                _mom_s     = round((close[-1]/close[-4]-1)*100, 2) if len(close)>=4 else 0
+                _tiene_c_s = str(earn) not in ("—","","nan") if 'earn' in dir() else False
+                # Días alcistas consecutivos desde precio histórico
+                _dias_alc_s = 0
+                for _i in range(1, min(5, len(close))):
+                    if close[-_i] > close[-_i-1]:
+                        _dias_alc_s += 1
+                    else:
+                        break
                 _prob_nbis  = calcular_prob_nbis(
                     rsi=rsi, vol_ratio=vol, dd=dd,
                     dias_alcistas=_dias_alc_s,
@@ -3000,11 +3010,25 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = 
 
                 if dias_alcistas < 2:
                     continue  # necesita mínimo 2 días alcistas consecutivos
+
+                # Calcular variables necesarias para Prob NBIS antes de usarlas
+                avg_v_pre = float(import_np().mean(vol[-20:])) if len(vol) >= 20 else float(vol[-1])
+                vol_hoy_pre = float(vol[-1])
+                vol_ratio_pre = int(vol_hoy_pre / avg_v_pre * 100) if avg_v_pre > 0 else 100
+
+                import pandas as _pd_sw
+                s_pre = _pd_sw.Series(close)
+                delta_pre = s_pre.diff()
+                gain_pre = delta_pre.clip(lower=0).rolling(14).mean()
+                loss_pre = (-delta_pre.clip(upper=0)).rolling(14).mean()
+                rsi_pre = round(float(100-100/(1+gain_pre.iloc[-1]/(loss_pre.iloc[-1]+1e-9))), 1)
+                mom_pre = round((close[-1]/close[-4]-1)*100, 2) if len(close)>=4 else 0
+
                 # v12: Prob NBIS obligatorio en Swing
                 _prob_sw = calcular_prob_nbis(
-                    rsi=rsi_sw, vol_ratio=vol_sw, dd=dd_sw,
+                    rsi=rsi_pre, vol_ratio=vol_ratio_pre, dd=dd,
                     dias_alcistas=dias_alcistas,
-                    momentum_3d=mom_sw, tiene_catalizador=False
+                    momentum_3d=mom_pre, tiene_catalizador=False
                 )
                 if _prob_sw < 25:  # mínimo 25% para aparecer en Swing
                     continue
@@ -3115,9 +3139,28 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = 
         pass
 
     # Ordenar por momentum 3d descendente
-    return pd.DataFrame(
-        sorted(candidatos, key=lambda x: -x["Momentum_3d"])[:max_results]
-    )
+    if not candidatos:
+        return pd.DataFrame()
+    try:
+        sorted_c = sorted(candidatos, key=lambda x: float(x.get("Momentum_3d", 0)))[::-1][:max_results]
+        df_sw = pd.DataFrame(sorted_c)
+        # Asegurar columnas mínimas
+        for col, default in [
+            ("Prob_NBIS", 0.0), ("Sim_NBIS", 0.0),
+            ("Score_Rebote", 0), ("Nivel_Rebote", "—"),
+            ("Detalle_Rebote", "—"), ("Etapa_v12", "—"),
+            ("Decision", "SEGUIR"), ("Fase", "M2"),
+            ("Score", 0), ("Cat_Fecha", "—"),
+            ("Cat_Desc", "—"), ("Cat_Tipo", "—"),
+            ("Motivo", "—"), ("Lectura", "—"),
+            ("Arrastradas", "—"), ("Lider", "—"),
+            ("Color", "#64748B"), ("Bg", "#F8FAFC"),
+        ]:
+            if col not in df_sw.columns:
+                df_sw[col] = default
+        return df_sw
+    except Exception:
+        return pd.DataFrame()
 
 def import_np():
     import numpy as np
@@ -4657,38 +4700,133 @@ También puedes descargar la plantilla de abajo y completarla.
             with pr3: st.metric("P&L total",f"${total_pnl:+,.0f}",f"{pnl_total_pct:+.1f}%",delta_color="normal" if pnl_total_pct>0 else "inverse")
             with pr4: st.metric("Posiciones",n_ok)
 
-            # Exportar análisis
-            export_rows=[]
-            for _,pos in posiciones_df.iterrows():
-                tk=str(pos["Ticker"]).upper()
-                pc=float(pos["Precio_Compra"]); qty=int(pos["Cantidad"])
-                r=get_row_for_ticker(tk,pc); pa=r["Precio"]
-                pnl_e=(pa-pc)/pc*100
-                analisis2=analizar_posicion(pc,pa,r["RSI"],r["MACD"],abs(r["EMA50"]) if r["EMA50"]>0 else 0,r["Score"],pnl_e,r["Prob_NBIS"],r["Sim_NBIS"],r["Beta"])
-                # Determinar etapa de la señal al momento del escaneo
-            _dias_pos_e = max(1, _dias_pos)
-            if _dias_pos_e <= 1:
-                _etapa_senal = "🔥 Entrar Hoy (M3)"
-            elif _dias_pos_e <= 3:
-                _etapa_senal = "⚡ Entrada Válida (M2)"
-            elif pnl_e < -3:
-                _etapa_senal = "📡 Detectadas M1"
-            else:
-                _etapa_senal = "⚡ Entrada Temprana (M2)"
-            export_rows.append({"Ticker":tk,"Etapa_Señal":_etapa_senal,"FLUJO_VALIDADO":"SI" if _dias_pos>0 else "NO","Precio_Compra":pc,"Precio_Actual":pa,"Cantidad":qty,"P&L_%":round(pnl_e,2),"P&L_USD":round((pa-pc)*qty,2),"Score_Rebote":r.get("Score_Rebote",0),"Nivel_Rebote":r.get("Nivel_Rebote","—"),"Señal":analisis2["señal"],"Urgencia":analisis2["urgencia"],"Catalizador":str(r["Cat_Desc"])[:50],"Fecha_Cat":r["Cat_Fecha"]})
+            # ── Botón A: Exportar análisis completo (como v11) ──────
+            export_rows = []
+            for _, pos in posiciones_df.iterrows():
+                try:
+                    tk  = str(pos["Ticker"]).upper()
+                    pc  = float(pos["Precio_Compra"])
+                    qty = float(pos.get("Cantidad", 1))
+                    r   = get_row_for_ticker(tk, pc)
+                    pa  = float(r["Precio"])
+                    pnl_e = round((pa - pc) / pc * 100, 2) if pc > 0 else 0
+
+                    # Días en posición
+                    try:
+                        import datetime as _dte
+                        _fd = pd.to_datetime(pos.get("Fecha",""), errors="coerce")
+                        _dias_e = (_dte.date.today() - _fd.date()).days if not pd.isna(_fd) else 0
+                    except Exception:
+                        _dias_e = 0
+
+                    # Etapa de la señal
+                    if _dias_e <= 1:
+                        _etapa = "M3 - Entrar Hoy"
+                    elif _dias_e <= 3:
+                        _etapa = "M2 - Entrada Valida"
+                    elif pnl_e < -3:
+                        _etapa = "M1 - Detectadas"
+                    else:
+                        _etapa = "M2 - Entrada Temprana"
+
+                    # Señal v12
+                    _sr_e = calcular_señales_salida_v12(
+                        pnl_pct=pnl_e, precio_compra=pc,
+                        precio_actual=pa, precio_max=max(pa, pc*1.1),
+                        dias_posicion=_dias_e,
+                        estrategia=str(pos.get("Estrategia","Swing")),
+                        tipo=str(pos.get("Tipo","Accion"))
+                    )
+
+                    export_rows.append({
+                        "Ticker":         tk,
+                        "Fase_Origen":    str(pos.get("Fase_Origen","—")),
+                        "Etapa_Senal":    _etapa,
+                        "Fecha_Compra":   str(pos.get("Fecha","—")),
+                        "Precio_Compra":  round(pc, 2),
+                        "Precio_Actual":  round(pa, 2),
+                        "Cantidad":       round(qty, 4),
+                        "PnL_Pct":        pnl_e,
+                        "PnL_USD":        round((pa - pc) * qty, 2),
+                        "Dias_Posicion":  _dias_e,
+                        "Score_Rebote":   r.get("Score_Rebote", 0),
+                        "Nivel_Rebote":   str(r.get("Nivel_Rebote","—")).replace("🔥","").replace("⚡","").replace("🟡","").replace("🔵","").strip(),
+                        "Prob_NBIS":      r.get("Prob_NBIS", 0),
+                        "RSI":            r.get("RSI", 0),
+                        "DD_pico":        r.get("DD_pico", 0),
+                        "Senal_v12":      _sr_e["señal"].replace("✅","").replace("⚠️","").replace("🛑","").replace("💀","").replace("🔄","").strip(),
+                        "Urgencia":       _sr_e["urgencia"],
+                        "Tipo":           str(pos.get("Tipo","Accion")),
+                        "Estrategia":     str(pos.get("Estrategia","Swing")),
+                        "Cat_Fecha":      str(pos.get("Cat_Fecha","—")),
+                        "FLUJO_VALIDADO": "SI" if _dias_e > 0 else "NO",
+                    })
+                except Exception:
+                    continue
+
             if export_rows:
-                export_csv=df_to_csv_chile(pd.DataFrame(export_rows))
-                st.download_button("⬇️ Exportar análisis posiciones (CSV)",export_csv,
-                    f"analisis_posiciones_{pd.Timestamp.now().strftime('%Y-%m-%d_%H%M')}.csv","text/csv")
-                # v12: CSV actualizado con salidas aplicadas
-                _resultados_export = [{"ticker":r.get("Ticker",""),"pnl_pct":r.get("P&L_%",0),"analisis_v12":{"señal":r.get("Señal",""),"urgencia":r.get("Urgencia","")}} for r in export_rows]
-                _csv_actualizado = generar_csv_posiciones_actualizado(posiciones_df, _resultados_export, "Activos")
-                if _csv_actualizado:
-                    st.download_button("🔄 CSV posiciones actualizadas (con salidas aplicadas)",
-                        _csv_actualizado,
+                _df_exp = pd.DataFrame(export_rows)
+                _csv_a  = df_to_csv_chile(_df_exp)
+                st.download_button(
+                    "⬇️ Exportar análisis posiciones (CSV)",
+                    _csv_a,
+                    f"analisis_posiciones_{pd.Timestamp.now().strftime('%Y-%m-%d_%H%M')}.csv",
+                    "text/csv",
+                    help="Análisis completo con PnL · Señal v12 · Score · Urgencia"
+                )
+
+                # ── Botón B: CSV posiciones actualizadas con salidas ─
+                # Simula que aplicaste las salidas T1/T2/Stop
+                # Recalcula cantidades y genera nuevo CSV para re-subir
+                rows_actualizado = []
+                for row_e in export_rows:
+                    señal = row_e["Senal_v12"].lower()
+                    qty_orig = float(row_e["Cantidad"])
+
+                    if "stop" in señal or "stop activado" in señal:
+                        continue  # posición cerrada — no incluir
+
+                    elif "t2 +12%" in señal or "t2" in señal:
+                        qty_nueva = round(qty_orig * 0.20, 6)
+                        nota = f"Vendido 80% (T1:40% + T2:40%). Queda 20% runner con trailing stop -5%"
+
+                    elif "t1 +8%" in señal or "t1" in señal:
+                        qty_nueva = round(qty_orig * 0.60, 6)
+                        nota = f"Vendido 40% en T1 (+8%). Queda 60% con stop en breakeven (precio compra)"
+
+                    elif "muerta" in señal or "reasignar" in señal:
+                        qty_nueva = qty_orig
+                        nota = f"Posicion muerta +5 dias en +-1%. Salir y reasignar a señal M3 activa"
+
+                    else:
+                        qty_nueva = qty_orig
+                        nota = ""
+
+                    qty_vender = round(qty_orig - qty_nueva, 6)
+                    rows_actualizado.append({
+                        "Ticker":           row_e["Ticker"],
+                        "Fecha":            row_e["Fecha_Compra"],
+                        "Precio_Compra":    row_e["Precio_Compra"],
+                        "Cantidad_Original": round(qty_orig, 4),
+                        "Cantidad_Vender":  qty_vender,
+                        "Cantidad_Mantener":qty_nueva,
+                        "Cat_Fecha":        row_e["Cat_Fecha"],
+                        "Tipo":             row_e["Tipo"],
+                        "Estrategia":       row_e["Estrategia"],
+                        "Fase_Origen":      row_e["Fase_Origen"],
+                        "Notas_Salida":     nota,
+                    })
+
+                if rows_actualizado:
+                    _df_act = pd.DataFrame(rows_actualizado)
+                    _csv_act = df_to_csv_chile(_df_act)
+                    st.download_button(
+                        "🔄 CSV posiciones actualizadas (re-subir para ver ganancia futura)",
+                        _csv_act,
                         f"Activos_actualizado_{pd.Timestamp.now().strftime('%Y-%m-%d')}.csv",
                         "text/csv",
-                        help="Descarga el CSV con cantidades reducidas según T1/T2 ejecutados")
+                        help="CSV listo para re-subir. T1 ejecutado → 60% de cantidad. T2 ejecutado → 20%. Stop → posición eliminada."
+                    )
 
         if posiciones_df is not None and len(posiciones_df) > 0:
             render_catalysts_section(posiciones_df, "mis_pos")
@@ -4886,8 +5024,102 @@ with tab7:
         if amp_df is not None and len(amp_df) > 0:
             render_catalysts_section(amp_df, "amparito")
 
+            # ── Botones export Amparito ──────────────────────────
+            export_rows_amp = []
+            for _, pos_a in amp_df.iterrows():
+                try:
+                    tk_a  = str(pos_a["Ticker"]).upper()
+                    pc_a  = float(pos_a["Precio_Compra"])
+                    qty_a = float(pos_a.get("Cantidad", 1))
+                    r_a   = get_row_for_ticker(tk_a, pc_a)
+                    pa_a  = float(r_a["Precio"])
+                    pnl_a = round((pa_a - pc_a) / pc_a * 100, 2) if pc_a > 0 else 0
 
-# ══ TAB 8 — ESTRATEGIA ETF ══════════════════════════════════
+                    try:
+                        import datetime as _dte_a
+                        _fd_a  = pd.to_datetime(pos_a.get("Fecha",""), errors="coerce")
+                        _dias_a = (_dte_a.date.today() - _fd_a.date()).days if not pd.isna(_fd_a) else 0
+                    except Exception:
+                        _dias_a = 0
+
+                    _sr_a = calcular_señales_salida_v12(
+                        pnl_pct=pnl_a, precio_compra=pc_a,
+                        precio_actual=pa_a, precio_max=max(pa_a, pc_a*1.1),
+                        dias_posicion=_dias_a,
+                        estrategia=str(pos_a.get("Estrategia","Swing")),
+                        tipo=str(pos_a.get("Tipo","Accion"))
+                    )
+
+                    export_rows_amp.append({
+                        "Ticker":        tk_a,
+                        "Fase_Origen":   str(pos_a.get("Fase_Origen","—")),
+                        "Fecha_Compra":  str(pos_a.get("Fecha","—")),
+                        "Precio_Compra": round(pc_a, 2),
+                        "Precio_Actual": round(pa_a, 2),
+                        "Cantidad":      round(qty_a, 4),
+                        "PnL_Pct":       pnl_a,
+                        "PnL_USD":       round((pa_a - pc_a) * qty_a, 2),
+                        "Dias_Posicion": _dias_a,
+                        "Score_Rebote":  r_a.get("Score_Rebote", 0),
+                        "RSI":           r_a.get("RSI", 0),
+                        "DD_pico":       r_a.get("DD_pico", 0),
+                        "Senal_v12":     _sr_a["señal"].replace("✅","").replace("⚠️","").replace("🛑","").replace("💀","").replace("🔄","").strip(),
+                        "Urgencia":      _sr_a["urgencia"],
+                        "Tipo":          str(pos_a.get("Tipo","Accion")),
+                        "Estrategia":    str(pos_a.get("Estrategia","Swing")),
+                        "Cat_Fecha":     str(pos_a.get("Cat_Fecha","—")),
+                    })
+                except Exception:
+                    continue
+
+            if export_rows_amp:
+                _df_exp_a = pd.DataFrame(export_rows_amp)
+                st.download_button(
+                    "⬇️ Exportar análisis Amparito (CSV)",
+                    df_to_csv_chile(_df_exp_a),
+                    f"analisis_amparito_{pd.Timestamp.now().strftime('%Y-%m-%d_%H%M')}.csv",
+                    "text/csv",
+                    help="Análisis completo con PnL · Señal v12 · Score · Urgencia"
+                )
+
+                # CSV actualizado con salidas aplicadas
+                rows_act_amp = []
+                for row_a in export_rows_amp:
+                    señal_a = row_a["Senal_v12"].lower()
+                    qty_orig_a = float(row_a["Cantidad"])
+                    if "stop" in señal_a:
+                        continue
+                    elif "t2" in señal_a:
+                        qty_n = round(qty_orig_a * 0.20, 6)
+                        nota_a = f"Vendido 80% (T1:40% + T2:40%). Queda {round(qty_orig_a*0.20,4)} acciones runner con trailing -5%"
+                    elif "t1" in señal_a:
+                        qty_n = round(qty_orig_a * 0.60, 6)
+                        nota_a = f"Vendido 40% en T1 (+8%). Queda {round(qty_orig_a*0.60,4)} acciones con stop en breakeven"
+                    else:
+                        qty_n = qty_orig_a
+                        nota_a = ""
+                    qty_vender_a = round(qty_orig_a - qty_n, 6)
+                    rows_act_amp.append({
+                        "Ticker":           row_a["Ticker"],
+                        "Fecha":            row_a["Fecha_Compra"],
+                        "Precio_Compra":    row_a["Precio_Compra"],
+                        "Cantidad_Original": round(qty_orig_a, 4),
+                        "Cantidad_Vender":  qty_vender_a,
+                        "Cantidad_Mantener":qty_n,
+                        "Cat_Fecha":        row_a["Cat_Fecha"],
+                        "Tipo":             row_a["Tipo"],
+                        "Estrategia":       row_a["Estrategia"],
+                        "Fase_Origen":      row_a["Fase_Origen"],
+                        "Notas_Salida":     nota_a,
+                    })
+                if rows_act_amp:
+                    st.download_button(
+                        "🔄 CSV Amparito actualizado (re-subir para ver ganancia futura)",
+                        df_to_csv_chile(pd.DataFrame(rows_act_amp)),
+                        f"Activos_Amparito_actualizado_{pd.Timestamp.now().strftime('%Y-%m-%d')}.csv",
+                        "text/csv",
+                        help="CSV listo para re-subir. T1→60% cantidad. T2→20%. Stop→eliminada."
+                    )
 with tab8:
     st.markdown(
         f'<div class="sec-header" style="background:#FEF9C3;border-color:#FDE047">'+
