@@ -1675,6 +1675,140 @@ def calcular_score_gestion(pnl_pct: float, dias_posicion: int,
         return {"score": score, "accion": "Salir", "color": "DC2626"}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def scan_detectadas(rsi_min: float = 35, rsi_max: float = 60,
+                    dd_min: float = -8, score_min: int = 15,
+                    max_results: int = 100, universo: list = None) -> pd.DataFrame:
+    """
+    Scanner de Detectadas M1 usando yfinance directo.
+    Busca acciones EN CORRECCIÓN (aún bajando) con Prob NBIS ≥ 20%.
+    M1: RSI 35-60 · DD ≤ -8% · corrección activa
+    """
+    import yfinance as yf
+    candidatos = []
+    _universo = universo if universo else SCAN_UNIVERSE
+
+    try:
+        for tk in _universo:
+            try:
+                _ETF_SKIP = {"XLE","XLI","XLY","XLC","XLB","XLP","XLRE","GLD",
+                             "SLV","USO","UNG","JETS","HACK","BOTZ","ROBO",
+                             "COPX","ARKG","ARKF","ARKQ","SOXX","IBB","ARKK"}
+                if tk in _ETF_SKIP:
+                    continue
+
+                hist = yf.Ticker(tk).history(period="3mo")
+                if hist.empty or len(hist) < 20:
+                    continue
+
+                close = hist["Close"].values
+                vol   = hist["Volume"].values
+                precio = float(close[-1])
+                pico   = float(close.max())
+                dd     = round((precio - pico) / pico * 100, 1)
+
+                # Filtro DD — corrección real
+                if dd > dd_min:
+                    continue
+
+                # RSI
+                import pandas as _pd_d
+                s = _pd_d.Series(close)
+                delta = s.diff()
+                gain = delta.clip(lower=0).rolling(14).mean()
+                loss = (-delta.clip(upper=0)).rolling(14).mean()
+                rsi = round(float(100-100/(1+gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
+
+                if not (rsi_min <= rsi <= rsi_max):
+                    continue
+
+                # Volumen
+                avg_v = float(import_np().mean(vol[-20:]))
+                vol_ratio = int(vol[-1] / avg_v * 100) if avg_v > 0 else 100
+                if avg_v < 200_000:
+                    continue
+
+                # Momentum 3d
+                mom_3d = round((close[-1]/close[-4]-1)*100, 2) if len(close)>=4 else 0
+
+                # Días bajistas (para M1 — aún cayendo)
+                dias_bajistas = 0
+                for _i in range(1, min(5, len(close))):
+                    if close[-_i] < close[-_i-1]:
+                        dias_bajistas += 1
+                    else:
+                        break
+
+                # Score Rebote
+                sr = calcular_score_rebote(
+                    dd=dd, rsi=rsi, vol_ratio=vol_ratio,
+                    dias_alcistas=0, momentum_3d=mom_3d,
+                    tiene_catalizador=False, dias_para_cat=999,
+                    beta=1.5
+                )
+                if sr["score"] < score_min:
+                    continue
+
+                # Prob NBIS
+                prob = calcular_prob_nbis(
+                    rsi=rsi, vol_ratio=vol_ratio, dd=dd,
+                    dias_alcistas=0, momentum_3d=mom_3d,
+                    tiene_catalizador=False
+                )
+                if prob < 20:
+                    continue
+
+                # Etapa v12
+                etapa = clasificar_etapa_v12(
+                    rsi=rsi, vol_ratio=vol_ratio, prob_nbis=prob,
+                    dias_alcistas=0, momentum_3d=mom_3d,
+                    score_rebote=sr["score"], dd=dd
+                )
+
+                candidatos.append({
+                    "Ticker":        tk,
+                    "Precio":        round(precio, 2),
+                    "DD_pico":       dd,
+                    "RSI":           rsi,
+                    "Volumen":       vol_ratio,
+                    "Momentum_3d":   mom_3d,
+                    "Dias_Bajistas": dias_bajistas,
+                    "Score_Rebote":  sr["score"],
+                    "Nivel_Rebote":  sr["nivel"],
+                    "Detalle_Rebote":sr["detalle"],
+                    "Prob_NBIS":     prob,
+                    "Etapa_v12":     etapa["label"],
+                    "Decision":      "SEGUIR",
+                    "Fase":          "M1",
+                    "Area":          "—",
+                    "Motivo":        f"Correccion {dd}% · RSI {rsi} · Prob {prob}%",
+                    "Lectura":       etapa["accion"],
+                    "Score":         sr["score"],
+                    "Cat_Fecha":     "—",
+                    "Cat_Desc":      "—",
+                    "Cat_Tipo":      "—",
+                    "Arrastradas":   "—",
+                    "Lider":         "—",
+                    "Color":         "#" + etapa["color"],
+                    "Bg":            "#" + etapa["bg"],
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if not candidatos:
+        return pd.DataFrame()
+
+    try:
+        df_d = pd.DataFrame(candidatos)
+        # Ordenar por DD más profundo primero
+        df_d = df_d.sort_values("DD_pico", ascending=True)
+        return df_d.head(max_results)
+    except Exception:
+        return pd.DataFrame()
+
+
 # ─────────────────────────────────────────────────────────────
 #  UNIVERSO DINÁMICO — S&P500 + Nasdaq100 + Portfolio personal
 #  Se descarga automáticamente desde Wikipedia al iniciar
@@ -2605,7 +2739,7 @@ def c_vol(v):
     if v>=1.5: return A
     return TXT_MUT
 
-def render_table(df_sub, show_cols):
+def render_table(df_sub, show_cols, tab_key="tabla"):
     if df_sub.empty:
         st.markdown(f'<div style="padding:16px;color:{TXT_MUT};font-size:12px;text-align:center;background:{BG_HEAD};border-radius:10px;border:1px solid {BOR}">— sin resultados —</div>',unsafe_allow_html=True)
         return
@@ -2633,7 +2767,41 @@ def render_table(df_sub, show_cols):
         df_sub["Nivel_Rebote"]   = [s[1] for s in _scores]
         df_sub["Detalle_Rebote"] = [s[2] for s in _scores]
 
-    rows_html=""
+    # ── Paginación ────────────────────────────────────────────
+    PAGE_SIZE = 25
+    total     = len(df_sub)
+    n_pages   = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    _pk       = f"_page_{tab_key}"
+
+    if n_pages > 1:
+        pc1, pc2, pc3 = st.columns([1, 3, 1])
+        with pc1:
+            if st.button("◀ Anterior", key=f"prev_{tab_key}",
+                         disabled=st.session_state.get(_pk, 0) == 0):
+                st.session_state[_pk] = max(0, st.session_state.get(_pk, 0) - 1)
+                st.rerun()
+        with pc2:
+            _pg = st.session_state.get(_pk, 0)
+            _ini = _pg * PAGE_SIZE + 1
+            _fin = min((_pg + 1) * PAGE_SIZE, total)
+            st.markdown(
+                f'<div style="text-align:center;font-size:11px;color:{TXT_MUT};padding-top:6px">'
+                f'Página {_pg+1} de {n_pages} · '
+                f'Mostrando {_ini}-{_fin} de {total} acciones</div>',
+                unsafe_allow_html=True)
+        with pc3:
+            if st.button("Siguiente ▶", key=f"next_{tab_key}",
+                         disabled=st.session_state.get(_pk, 0) >= n_pages - 1):
+                st.session_state[_pk] = min(n_pages - 1, st.session_state.get(_pk, 0) + 1)
+                st.rerun()
+
+        page = st.session_state.get(_pk, 0)
+        df_sub = df_sub.iloc[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    else:
+        st.markdown(
+            f'<div style="font-size:10px;color:{TXT_MUT};margin-bottom:6px">'
+            f'{total} acciones encontradas</div>',
+            unsafe_allow_html=True)
     for _,r in df_sub.iterrows():
         row_html="<tr>"
         for col in show_cols:
@@ -3397,7 +3565,7 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
     if "Señal modelo" not in cols_con_senal:
         cols_con_senal = ["Ticker","Señal modelo"] + [c for c in cols_con_senal if c not in ("Ticker","Señal modelo")]
 
-    render_table(df_show, cols_con_senal)
+    render_table(df_show, cols_con_senal, tab_key=tab_key)
 
     # Exportar señales del día
     boton_exportar(resultado_df, titulo, f"exp_{tab_key}")
@@ -3643,16 +3811,52 @@ tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8=st.tabs([
 # ══ TAB 1 — DETECTADAS M1 (M1 del patrón NBIS) ════════════════
 # ══ TAB 5 — DETECTADAS M1 ════════════════════════════════════════
 with tab1:
-    render_scan_tab(
-        tab_key="scan_detectadas",
-        titulo="Detectadas M1",
-        emoji="📡",
-        color=R, color_bg=R_BG, color_bor=R_BOR,
-        desc="Bajada activa · En corrección · Score ≥ 15 · Watchlist temprana",
-        rsi_max=60, dd_min=-8, score_min=15,
-        decisions=["SEGUIR","OBSERVAR","ANTICIPAR"],
-        default_sort="DD_pico",
-    )
+    st.markdown(
+        f'<div class="sec-header" style="background:{R_BG};border-color:{R_BOR}">'+
+        f'<span style="font-size:20px">📡</span>'+
+        f'<div><span style="font-size:16px;font-weight:700;color:{R}">Detectadas M1</span>'+
+        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'+
+        f'Bajada activa · En correccion · DD <= -8% · RSI 35-60 · Prob NBIS >= 20%'+
+        f'</span></div></div>', unsafe_allow_html=True)
+
+    if st.button("📡 Escanear Detectadas M1", use_container_width=True, key="btn_detectadas"):
+        with st.spinner(f"Escaneando correcciones en {st.session_state.get('universo_size',300)} tickers..."):
+            resultado_m1 = scan_detectadas(
+                rsi_min=35, rsi_max=60,
+                dd_min=-8, score_min=15,
+                max_results=max_res,
+                universo=SCAN_UNIVERSE[:st.session_state.get("universo_size", 300)]
+            )
+            st.session_state["scan_detectadas"] = resultado_m1
+            st.session_state["scan_detectadas_ts"] = datetime.datetime.now().strftime("%H:%M")
+
+    resultado_m1 = st.session_state.get("scan_detectadas")
+    ts_m1 = st.session_state.get("scan_detectadas_ts","")
+
+    if resultado_m1 is not None and not resultado_m1.empty:
+        n_m1 = len(resultado_m1)
+        st.markdown(
+            f'<div style="font-size:11px;color:{TXT_MUT};margin-bottom:8px">'+
+            f'📡 {n_m1} acciones en correccion detectadas · {ts_m1}'+
+            f' · Filtros: RSI 35-60 · DD <= -8% · Score >= 15 · Prob NBIS >= 20%'+
+            f'</div>', unsafe_allow_html=True)
+        render_table(resultado_m1, COLS_MAIN, tab_key="scan_detectadas")
+    elif resultado_m1 is not None and resultado_m1.empty:
+        st.markdown(
+            f'<div style="background:{G_BG};border:1px solid {G_BOR};border-radius:10px;'+
+            f'padding:20px;text-align:center;color:{G}">'+
+            f'Mercado en rally — ninguna accion cumple los filtros de Detectadas M1 ahora.<br>'+
+            f'<span style="font-size:11px;color:{TXT_MUT}">'+
+            f'Filtros activos: RSI 35-60 · DD <= -8% · Score >= 15 · Prob NBIS >= 20%.<br>'+
+            f'Esto es informacion valida — el modelo dice que no hay correcciones reales hoy.'+
+            f'</span></div>', unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:10px;'+
+            f'padding:24px;text-align:center;color:{TXT_MUT}">'+
+            f'<div style="font-size:28px;margin-bottom:8px">📡</div>'+
+            f'Presiona Escanear para detectar acciones en correccion</div>',
+            unsafe_allow_html=True)
 
 
 # ══ TAB 2 — SWING ACTIVO (M2 — rebote confirmado) ══════════════
