@@ -946,7 +946,7 @@ def boton_exportar(df: pd.DataFrame, tab_nombre: str,
     # Cache CSV en session_state para evitar MediaFileStorageError
     cache_key = f"csv_cache_{key}"
     if cache_key not in st.session_state or st.session_state.get(f"{cache_key}_tab") != tab_nombre:
-        st.session_state[cache_key] = exportar_senales_dia(df, tab_nombre, fase_col)
+        st.session_state[cache_key] = exportar_senales_dia(df, tab_nombre, fase_col, es_swing=es_swing)
         st.session_state[f"{cache_key}_tab"] = tab_nombre
 
     csv_bytes = st.session_state[cache_key]
@@ -4531,7 +4531,7 @@ with tab2:
         # Exportar
         sw_export = sw_result[["Ticker","Area","Precio","RSI","Dias_Alcistas",
                                 "Momentum_3d","DD_pico","Stop_Swing","Target_1","Target_2","Beta","Lectura"]]
-        boton_exportar(sw_result, "Swing Activo", "exp_swing", fase_col=None)
+        boton_exportar(sw_result, "Swing Activo", "exp_swing", fase_col=None, es_swing=True)
         # Noticias Swing Activo
         st.markdown("---")
         render_noticias_mini(sw_result["Ticker"].tolist(), "Noticias Swing Activo")
