@@ -847,7 +847,8 @@ def render_nbis_panel(prob: float, sim: float,
 #  EXPORTAR SEÑALES DEL DÍA — genera CSV para el tracker
 # ─────────────────────────────────────────────────────────────
 def exportar_senales_dia(df: pd.DataFrame, tab_nombre: str,
-                         fase_col: str = None) -> bytes:
+                         fase_col: str = None,
+                         es_swing: bool = False) -> bytes:
     """
     Genera CSV en formato del tracker paper trading.
     Listo para pegar en hoja ⚡ Paper Trading del Excel.
@@ -930,7 +931,8 @@ def exportar_senales_dia(df: pd.DataFrame, tab_nombre: str,
     return df_to_csv_chile(pd.DataFrame(filas))
 
 def boton_exportar(df: pd.DataFrame, tab_nombre: str,
-                   key: str, fase_col: str = None):
+                   key: str, fase_col: str = None,
+                   es_swing: bool = False):
     """Renderiza botón de exportar + instrucción."""
     import datetime
     if df is None or df.empty:
