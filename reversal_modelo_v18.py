@@ -4234,6 +4234,47 @@ def analizar_posicion(precio_compra, precio_actual, rsi, macd,
         pass
     tiene_cat_proximo = 0 <= dias_para_cat <= 15  # earnings en próximos 15 días
 
+    # ── v18: PIRAMIDACIÓN — agregar a posiciones ganadoras ───────
+    # Detecta 3 zonas donde tiene sentido agregar más acciones:
+    # Zona 1: primer pullback desde ganancia +8-20%
+    # Zona 2: antes de catalizador próximo con ganancia positiva
+    # Zona 3: ruptura de nuevos máximos con volumen institucional
+    piramidar = None
+
+    # Zona 2 — Catalizador próximo con posición ganadora (NBIS 13 Mayo, caso exacto)
+    if pnl_pct > 3 and tiene_cat_proximo and 1 <= dias_para_cat <= 15:
+        piramidar = {
+            "accion":  f"🎯 AGREGAR {min(30, max(20, int(pnl_pct))):.0f}% antes del catalizador",
+            "razon":   (f"Tienes ganancia +{pnl_pct:.0f}% Y earnings en {dias_para_cat}d. "
+                        f"Zona óptima NBIS — agregar 20-30% antes del reporte. "
+                        f"Si el catalizador es positivo, maximizas. "
+                        f"Stop del agregado en precio actual −ATR×1.5."),
+            "urgencia": "⚡ ANTES DEL CATALIZADOR",
+            "color":    "#16A34A",
+        }
+    # Zona 1 — Primer pullback sano (+5-20% ganancia + 2-3 días bajistas = oportunidad de agregar)
+    elif 5 < pnl_pct < 20 and dias_posicion >= 5 and macd > 0:
+        piramidar = {
+            "accion":  "📈 AGREGAR 25% en próximo pullback de -5%",
+            "razon":   (f"Ganancia +{pnl_pct:.0f}% con tendencia activa (MACD positivo). "
+                        f"Si el precio retrocede -5% desde el máximo sin romper la tendencia, "
+                        f"es oportunidad de agregar 25% más. "
+                        f"Stop del agregado = tu precio de entrada original ${precio_compra:.2f}."),
+            "urgencia": "📡 MONITOREAR",
+            "color":    "#0891B2",
+        }
+    # Zona 3 — Ganancia fuerte >20% con momentum (no agregar, mantener y ajustar stop)
+    elif pnl_pct >= 20 and macd > 0:
+        piramidar = {
+            "accion":  "🚀 MANTENER — stop a breakeven garantizado",
+            "razon":   (f"Ganancia excelente +{pnl_pct:.0f}%. "
+                        f"Subir stop al precio de compra ${precio_compra:.2f} (breakeven). "
+                        f"Con stop en breakeven, el trade no puede terminar en pérdida. "
+                        f"Dejar correr el runner."),
+            "urgencia": "✅ AJUSTAR STOP",
+            "color":    "#7C3AED",
+        }
+
     # ── Escenarios basados en PnL real (no RSI) ──────────────
     # El RSI alto en posición abierta no es señal de salida
     # La señal de salida la determina el PnL vs los 3 tramos NBIS
@@ -4294,7 +4335,8 @@ def analizar_posicion(precio_compra, precio_actual, rsi, macd,
     if pnl_pct < 5:
         tramos = [(0,"VENDER",TXT_SOFT),(70,"MANTENER",B),(30,"RUNNER",G)]
         return {"tramos":tramos,"señal":"Mantener - esperar movimiento",
-                "razon":f"{cat_label}. Break even ({pnl_pct:+.0f}%). Confirmar catalizador activo. Stop en ${stop:.2f}.","color":B,"urgencia":"MONITOR"}
+                "razon":f"{cat_label}. Break even ({pnl_pct:+.0f}%). Confirmar catalizador activo. Stop en ${stop:.2f}.",
+                "color":B,"urgencia":"MONITOR","piramidar":piramidar}
 
     # 3. En camino - no llegó al Tramo 1 aún
     if pnl_pct < t1_pct * 100:
@@ -4306,13 +4348,15 @@ def analizar_posicion(precio_compra, precio_actual, rsi, macd,
             urgencia_cat = "AJUSTAR STOP"
         tramos = [(0,"VENDER",TXT_SOFT),(65,"MANTENER",A),(35,"RUNNER",G)]
         return {"tramos":tramos,"señal":"Mantener - en camino al Tramo 1",
-                "razon":f"Ganancia {pnl_pct:+.0f}% - falta {20-pnl_pct:.0f}% para Tramo 1 (+20%). {razon_cat}","color":A,"urgencia":urgencia_cat}
+                "razon":f"Ganancia {pnl_pct:+.0f}% - falta {20-pnl_pct:.0f}% para Tramo 1 (+20%). {razon_cat}",
+                "color":A,"urgencia":urgencia_cat,"piramidar":piramidar}
 
     # 4. Tramo 1 alcanzado con catalizador próximo
     if pnl_pct >= t1_pct*100 and tiene_cat_proximo:
         tramos = [(30,"VENDER",OR),(45,"MANTENER",A),(25,"RUNNER",G)]
         return {"tramos":tramos,"señal":f"Vender 30%  - Mantener 70%",
-                "razon":f"{cat_label}. Tramo 1 alcanzado (+{pnl_pct:.0f}%). Vender 30%. Earnings en {dias_para_cat}d - mantener 70%.","color":A,"urgencia":"ESTA SEMANA"}
+                "razon":f"{cat_label}. Tramo 1 alcanzado (+{pnl_pct:.0f}%). Vender 30%. Earnings en {dias_para_cat}d - mantener 70%.",
+                "color":A,"urgencia":"ESTA SEMANA","piramidar":piramidar}
 
     # 5. Tramo 1 alcanzado sin catalizador
     if pnl_pct >= t1_pct*100 and pnl_pct < t2_pct*100:
@@ -5755,23 +5799,42 @@ with col_ndx:
 with col_spy:
     if "spy" in mkt:
         spy_d = mkt["spy"]
-        rc = G if spy_d["rsi"] < 40 else R if spy_d["rsi"] > 65 else A
-        ec = R if "bajo" in spy_d["ema_status"] else G
-        # Descripción RSI SPY
-        if spy_d["rsi"] < 35:
-            spy_desc = "Sobreventa - oportunidad"
-        elif spy_d["rsi"] < 50:
-            spy_desc = "Zona baja - vigilar"
-        elif spy_d["rsi"] < 65:
-            spy_desc = "Zona media - neutral"
+        _rsi_spy = spy_d["rsi"]
+        # v18 fix: umbrales calibrados al comportamiento real del S&P500
+        # RSI 65-75 es NORMAL en bull market — no es señal de precaución
+        if _rsi_spy < 35:
+            rc       = R
+            spy_desc = "🔥 Pánico — oportunidad ETF"
+            spy_tip  = "Crash o corrección severa. Momento ideal para entrar a ETF índice."
+        elif _rsi_spy < 45:
+            rc       = A
+            spy_desc = "⚡ Corrección — considerar ETF"
+            spy_tip  = "Pull-back de mercado. Buen momento para acumular SPY/VOO."
+        elif _rsi_spy < 55:
+            rc       = A
+            spy_desc = "📡 Neutral — acciones OK"
+            spy_tip  = "Mercado lateral. Seguir señales por ticker individual."
+        elif _rsi_spy < 68:
+            rc       = G
+            spy_desc = "📈 Bull normal — acciones OK"
+            spy_tip  = "Estado normal de un bull market. Acciones individuales con señal M2/M3: entrar. ETF índice: esperar pullback."
+        elif _rsi_spy < 76:
+            rc       = A
+            spy_desc = "⚡ Bull fuerte — ETF esperar"
+            spy_tip  = "Mercado fuerte pero extendido. Para ETF SPY/QQQ esperar pullback. Para acciones con señal M2/M3: OK con cautela."
         else:
-            spy_desc = "Sobrecompra - precaución"
+            rc       = R
+            spy_desc = "🔴 Sobrecompra extrema"
+            spy_tip  = "RSI >76 ocurre solo el 5% del tiempo. Reducir exposición nueva en ETF. Acciones individuales: stops ajustados."
+        ec = R if "bajo" in spy_d["ema_status"] else G
         st.markdown(
-            f'<div style="background:{BG_CARD};border:1px solid {BOR};border-radius:10px;padding:10px 14px">'
-            f'<div style="font-size:10px;color:{TXT_MUT};font-weight:600">SPY - S&P500 ETF</div>'
-            f'<div style="font-size:18px;font-weight:800;color:{rc}">{spy_d["rsi"]}</div>'
+            f'<div style="background:{BG_CARD};border:1px solid {BOR};border-radius:10px;'
+            f'padding:10px 14px" title="{spy_tip}">'
+            f'<div style="font-size:10px;color:{TXT_MUT};font-weight:600">SPY — S&P500 ETF</div>'
+            f'<div style="font-size:18px;font-weight:800;color:{rc}">{_rsi_spy}</div>'
             f'<div style="font-size:10px;color:{rc};font-weight:600">{spy_desc}</div>'
             f'<div style="font-size:9px;color:{ec};margin-top:3px">{spy_d["ema_status"]}</div>'
+            f'<div style="font-size:8px;color:{TXT_SOFT};margin-top:2px;line-height:1.4">{spy_tip}</div>'
             f'</div>', unsafe_allow_html=True)
     else:
         st.metric("SPY RSI", "-")
@@ -6990,6 +7053,51 @@ También puedes descargar la plantilla de abajo y completarla.
 
             st.markdown(f'<hr style="border:none;border-top:1px solid {BOR};margin:12px 0">',unsafe_allow_html=True)
 
+            # ── TREN DE ARRASTRE v18 — vital para decidir qué comprar ──
+            _symp_pos = get_sympathy(tk)
+            _arr_pos  = _symp_pos["arrastradas"]
+            _lid_pos  = _symp_pos["lider"]
+            if _arr_pos not in ("-","","nan") or _lid_pos not in ("-","","nan"):
+                _arr_chips = " ".join([
+                    f'<a style="background:#0891B2;color:white;border-radius:6px;'
+                    f'padding:3px 10px;font-weight:700;font-size:11px;margin:2px;'
+                    f'display:inline-block;text-decoration:none">'
+                    f'🔗 {a.strip()}</a>'
+                    for a in _arr_pos.split(",") if a.strip() and a.strip() != "-"
+                ]) if _arr_pos not in ("-","","nan") else ""
+                _lid_chip = (
+                    f'<span style="background:#7C3AED;color:white;border-radius:6px;'
+                    f'padding:3px 10px;font-weight:700;font-size:11px">🏆 {_lid_pos}</span>'
+                    if _lid_pos not in ("-","","nan") else ""
+                )
+                # Descripción de la oportunidad
+                if _arr_pos not in ("-","","nan"):
+                    _tren_desc = (
+                        f"<strong>{tk}</strong> arrastra a {_arr_pos}. "
+                        f"Si {tk} sube con fuerza, busca estas acciones en M1/M2 — "
+                        f"suelen seguir 3-7 días después. Candidatas para piramidación escalonada."
+                    )
+                else:
+                    _tren_desc = (
+                        f"<strong>{tk}</strong> es arrastrada por {_lid_pos}. "
+                        f"Verificar que {_lid_pos} sigue subiendo para confirmar la tendencia."
+                    )
+                st.markdown(
+                    f'<div style="background:linear-gradient(135deg,#EFF6FF,#F0FDF4);'
+                    f'border:1px solid #BFDBFE;border-radius:10px;'
+                    f'padding:10px 14px;margin-bottom:8px">'
+                    f'<div style="font-size:11px;font-weight:800;color:#1D4ED8;margin-bottom:6px">'
+                    f'🚂 Tren de Arrastre</div>'
+                    f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
+                    + (_lid_chip + ' <span style="color:#9CA3AF;font-size:11px">→ líder</span> · ' if _lid_chip else "")
+                    + f'<span style="background:#16A34A;color:white;border-radius:6px;'
+                    f'padding:3px 10px;font-weight:800;font-size:12px">{tk}</span>'
+                    + (f' <span style="color:#9CA3AF;font-size:11px">arrastra →</span> {_arr_chips}' if _arr_chips else "")
+                    + f'</div>'
+                    f'<div style="font-size:10px;color:#374151;line-height:1.5">{_tren_desc}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+
             # Fila 2: indicadores + NBIS + objetivos + lectura
             cd1,cd2,cd3,cd4 = st.columns(4)
             with cd1:
@@ -7198,6 +7306,23 @@ También puedes descargar la plantilla de abajo y completarla.
                     str(r.get("Ticker", tk)), r.get("Precio", pa),
                     G, A, R, TXT_MUT, TXT_SOFT, BG_HEAD, BOR
                 ), unsafe_allow_html=True)
+
+            # ── PIRAMIDACIÓN v18 — agregar a posición ganadora ──
+            _pir = analisis.get("piramidar") if analisis else None
+            if _pir:
+                _pir_bg  = {"#16A34A":"#F0FDF4","#0891B2":"#ECFEFF","#7C3AED":"#F5F3FF"}.get(_pir["color"],"#F8FAFC")
+                _pir_bor = {"#16A34A":"#86EFAC","#0891B2":"#A5F3FC","#7C3AED":"#C4B5FD"}.get(_pir["color"],"#E2E8F0")
+                st.markdown(
+                    f'<div style="background:{_pir_bg};border:2px solid {_pir_bor};'
+                    f'border-radius:10px;padding:12px 16px;margin-top:8px">'
+                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+                    f'  <span style="font-size:14px;font-weight:800;color:{_pir["color"]}">'
+                    f'  {_pir["accion"]}</span>'
+                    f'  <span style="background:{_pir["color"]};color:white;border-radius:5px;'
+                    f'  padding:2px 8px;font-size:10px;font-weight:700">{_pir["urgencia"]}</span>'
+                    f'</div>'
+                    f'<div style="font-size:11px;color:#374151;line-height:1.6">{_pir["razon"]}</div>'
+                    f'</div>', unsafe_allow_html=True)
 
             st.markdown('</div>',unsafe_allow_html=True)  # cierra pos-card
 
@@ -7640,11 +7765,62 @@ with tab7:
                     f'{"<div style=margin-top:8px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:7px;padding:8px><div style=font-size:10px;font-weight:700;color:#EA580C>🎯 SETUP RECOMPRA NBIS ACTIVO</div><div style=font-size:11px;color:#7C2D12>Caída post-earning = mercado sobrereaccionó. Monitorear RSI + Volumen + Soporte 3 días.</div></div>" if _peg_a["recompra_activa"] else ""}'
                     f'</div>', unsafe_allow_html=True)
 
+            # ── TREN DE ARRASTRE v18 (Amparito) ──────────────
+            _symp_pos_a = get_sympathy(tk)
+            _arr_pos_a  = _symp_pos_a["arrastradas"]
+            _lid_pos_a  = _symp_pos_a["lider"]
+            if _arr_pos_a not in ("-","","nan") or _lid_pos_a not in ("-","","nan"):
+                _arr_ch_a = " ".join([
+                    f'<span style="background:#0891B2;color:white;border-radius:6px;'
+                    f'padding:3px 10px;font-weight:700;font-size:11px;margin:2px;display:inline-block">'
+                    f'🔗 {a.strip()}</span>'
+                    for a in _arr_pos_a.split(",") if a.strip() and a.strip() != "-"
+                ]) if _arr_pos_a not in ("-","","nan") else ""
+                _lid_ch_a = (
+                    f'<span style="background:#7C3AED;color:white;border-radius:6px;'
+                    f'padding:3px 10px;font-weight:700;font-size:11px">🏆 {_lid_pos_a}</span>'
+                    if _lid_pos_a not in ("-","","nan") else ""
+                )
+                _tren_desc_a = (
+                    f"<strong>{tk}</strong> arrastra a {_arr_pos_a}. Candidatas para entrada escalonada 3-7d después."
+                    if _arr_pos_a not in ("-","","nan")
+                    else f"Arrastrada por {_lid_pos_a} — verificar que el líder sigue subiendo."
+                )
+                st.markdown(
+                    f'<div style="background:linear-gradient(135deg,#EFF6FF,#F0FDF4);'
+                    f'border:1px solid #BFDBFE;border-radius:10px;padding:10px 14px;margin-bottom:8px">'
+                    f'<div style="font-size:11px;font-weight:800;color:#1D4ED8;margin-bottom:6px">🚂 Tren de Arrastre</div>'
+                    f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
+                    + (_lid_ch_a + ' <span style="color:#9CA3AF;font-size:10px">→ líder</span> · ' if _lid_ch_a else "")
+                    + f'<span style="background:#16A34A;color:white;border-radius:6px;padding:3px 10px;font-weight:800;font-size:12px">{tk}</span>'
+                    + (f' <span style="color:#9CA3AF;font-size:10px">arrastra →</span> {_arr_ch_a}' if _arr_ch_a else "")
+                    + f'</div>'
+                    f'<div style="font-size:10px;color:#374151">{_tren_desc_a}</div>'
+                    f'</div>', unsafe_allow_html=True)
+
             st.markdown(
                 render_nbis_panel(r.get("Prob_NBIS",0), r.get("Sim_NBIS",0),
                     G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR) +
                 render_pre_post_bar(tk, pa, G, A, R, TXT_MUT, TXT_SOFT, BG_HEAD, BOR),
                 unsafe_allow_html=True)
+
+            # ── PIRAMIDACIÓN v18 (Amparito) ──────────────────
+            _pir_a = analisis.get("piramidar") if analisis else None
+            if _pir_a:
+                _pir_bg_a  = {"#16A34A":"#F0FDF4","#0891B2":"#ECFEFF","#7C3AED":"#F5F3FF"}.get(_pir_a["color"],"#F8FAFC")
+                _pir_bor_a = {"#16A34A":"#86EFAC","#0891B2":"#A5F3FC","#7C3AED":"#C4B5FD"}.get(_pir_a["color"],"#E2E8F0")
+                st.markdown(
+                    f'<div style="background:{_pir_bg_a};border:2px solid {_pir_bor_a};'
+                    f'border-radius:10px;padding:12px 16px;margin-top:8px">'
+                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+                    f'  <span style="font-size:14px;font-weight:800;color:{_pir_a["color"]}">'
+                    f'  {_pir_a["accion"]}</span>'
+                    f'  <span style="background:{_pir_a["color"]};color:white;border-radius:5px;'
+                    f'  padding:2px 8px;font-size:10px;font-weight:700">{_pir_a["urgencia"]}</span>'
+                    f'</div>'
+                    f'<div style="font-size:11px;color:#374151;line-height:1.6">{_pir_a["razon"]}</div>'
+                    f'</div>', unsafe_allow_html=True)
+
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
         # Resumen Amparito
@@ -7977,258 +8153,293 @@ with tab8:
 
 # ══ TAB 9 - BACKTESTING REAL + DASHBOARD RENDIMIENTO v16 ══════
 with tab9:
-    st.markdown(
-        f'<div class="sec-header" style="background:#F0FDF4;border-color:#86EFAC">'+
-        f'<span style="font-size:20px">📊</span>'+
-        f'<div><span style="font-size:16px;font-weight:700;color:#16A34A">Backtesting Real v16</span>'+
-        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'+
-        f'Win Rate real  - ATR Sizing  - Expectativa por trade</span></div>'+
-        f'</div>', unsafe_allow_html=True)
+    # ══ TAB 9 — BACKTESTING Y ATR SIZING v18 ══════════════════
+    # Explicación clara de para qué sirve cada sección
 
     st.markdown(
-        f'<div class="info-box">'
-        f'<strong>v16:</strong> Backtesting con precios reales de entrada y salida. '
-        f'Stop = ATR x 1.5. Targets T1 +8% y T2 +15%. '
-        f'Win rate calculado sobre señales M2/M3 históricas reales - no simuladas.</div>',
-        unsafe_allow_html=True)
+        f'<div style="background:#F0FDF4;border:2px solid #86EFAC;border-radius:14px;'
+        f'padding:16px 20px;margin-bottom:16px">'
+        f'<div style="font-size:16px;font-weight:800;color:#16A34A;margin-bottom:8px">'
+        f'📊 ¿Para qué sirve este Tab?</div>'
+        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:12px;color:{TXT}">'
+        f'  <div style="background:white;border-radius:8px;padding:10px">'
+        f'    <div style="font-weight:700;color:#16A34A;margin-bottom:4px">🔬 Backtesting Real</div>'
+        f'    Prueba el modelo con datos históricos reales. Responde: si hubieras seguido las señales M2/M3 '
+        f'    del modelo en los últimos 6 meses, ¿cuánto hubieras ganado o perdido? '
+        f'    Calcula win rate real, promedio de ganancia y pérdida.'
+        f'  </div>'
+        f'  <div style="background:white;border-radius:8px;padding:10px">'
+        f'    <div style="font-weight:700;color:#2563EB;margin-bottom:4px">📐 ATR Sizing</div>'
+        f'    Calcula cuántas acciones comprar para que si el trade sale mal, '
+        f'    pierdas exactamente lo que decidiste arriesgar (ej: $500). '
+        f'    Usa el ATR (volatilidad real) del ticker para calcular el stop loss.'
+        f'  </div>'
+        f'</div></div>', unsafe_allow_html=True)
 
-    # ── Configuración ──────────────────────────────────────────
-    bc1, bc2, bc3, bc4 = st.columns(4)
-    with bc1:
-        bt_tickers_input = st.text_input(
-            "Tickers (separados por coma)",
-            value="NBIS, AMD, IONQ, NVDA, ANF, APTV",
-            help="Ingresa los tickers que quieres analizar"
-        )
-    with bc2:
-        bt_meses = st.selectbox("Período histórico",
-            ["3 meses","6 meses","9 meses","12 meses"], index=1)
-        bt_meses_n = int(bt_meses.split()[0])
-    with bc3:
-        bt_riesgo = st.number_input("Riesgo por trade ($USD)",
-            min_value=100, max_value=10000, value=500, step=100)
-        st.session_state["riesgo_usd_mauri"]    = bt_riesgo
-        st.session_state["riesgo_usd_amparito"] = int(bt_riesgo * 0.6)
-    with bc4:
-        bt_dias = st.selectbox("Días máx por trade",
-            [10, 15, 20], index=1)
+    # ── Selector de herramienta ─────────────────────────────
+    _tool = st.radio("",
+        ["🔬 Backtesting — ¿funcionó el modelo?",
+         "📐 ATR Sizing — ¿cuántas acciones comprar?"],
+        horizontal=True, label_visibility="collapsed")
 
-    if st.button("🔍 Ejecutar Backtesting Real", use_container_width=True,
-                 key="btn_backtest_v16"):
-        tickers_bt = [t.strip().upper() for t in bt_tickers_input.split(",") if t.strip()]
-        with st.spinner(f"Analizando {len(tickers_bt)} tickers x {bt_meses}..."):
-            resultados_bt = []
-            all_trades    = []
-            for tk_bt in tickers_bt:
-                r = backtest_real_v16(tk_bt, meses=bt_meses_n,
-                                      dias_max=bt_dias)
-                if r["_ok"]:
-                    resultados_bt.append(r)
-                    all_trades.extend(r["trades"])
-            st.session_state["backtest_v16_resultados"] = resultados_bt
-            st.session_state["backtest_v16_trades"]     = all_trades
-            st.session_state["backtest_v16_ts"]         = datetime.datetime.now().strftime("%H:%M")
-
-    bt_resultados = st.session_state.get("backtest_v16_resultados", [])
-    bt_trades_all = st.session_state.get("backtest_v16_trades", [])
-    bt_ts         = st.session_state.get("backtest_v16_ts", "")
-
-    if not bt_resultados:
+    # ════════════════════════════════════════════════════════
+    # SECCIÓN 1 — BACKTESTING
+    # ════════════════════════════════════════════════════════
+    if "Backtesting" in _tool:
         st.markdown(
-            f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:12px;'
-            f'padding:32px;text-align:center;color:{TXT_MUT}">'
-            f'<div style="font-size:36px;margin-bottom:10px">📊</div>'
-            f'<div style="font-size:14px;font-weight:700;color:{TXT}">Backtesting Real v16</div>'
-            f'<div style="font-size:12px;margin-top:6px">'
-            f'Presiona Ejecutar para analizar señales M2/M3 históricas con precios reales.</div>'
-            f'</div>', unsafe_allow_html=True)
-    else:
-        # ── MÉTRICAS GLOBALES ─────────────────────────────────
-        import numpy as _np
-        n_total   = sum(r["n_señales"]   for r in bt_resultados)
-        n_win     = sum(r["n_ganadoras"] for r in bt_resultados)
-        n_lose    = sum(r["n_perdedoras"] for r in bt_resultados)
-        wr_global = round(n_win / n_total * 100, 1) if n_total > 0 else 0
-        all_g     = [t["PnL_pct"] for t in bt_trades_all if t["Ganadora"]]
-        all_p     = [t["PnL_pct"] for t in bt_trades_all if not t["Ganadora"]]
-        avg_g_all = round(float(_np.mean(all_g)), 2) if all_g else 0
-        avg_p_all = round(float(_np.mean(all_p)), 2) if all_p else 0
-        ratio_all = round(abs(avg_g_all / avg_p_all), 2) if avg_p_all != 0 else 0
-        expect    = round((n_win/n_total)*avg_g_all + (n_lose/n_total)*avg_p_all, 2) if n_total > 0 else 0
-        wr_color  = G if wr_global >= 60 else A if wr_global >= 50 else R
+            f'<div class="info-box">'
+            f'<strong>Cómo funciona:</strong> El sistema descarga precios históricos de cada ticker, '
+            f'busca los momentos donde el modelo habría generado señal M2/M3, '
+            f'simula la entrada al precio de cierre de ese día, y calcula si '
+            f'el precio llegó a Target +8% antes de tocar el Stop Loss (ATR x 1.5). '
+            f'⏱️ Puede tardar 30-60 segundos dependiendo de cuántos tickers analices.</div>',
+            unsafe_allow_html=True)
 
-        st.markdown(f'<div style="font-size:12px;color:{TXT_MUT};margin-bottom:8px">'
-                    f'📊 {bt_ts}  - {n_total} señales analizadas  - {bt_meses}</div>',
-                    unsafe_allow_html=True)
-
-        m1, m2, m3, m4, m5 = st.columns(5)
-        for col, lbl, val, color, sub in [
-            (m1, "WIN RATE",    f"{wr_global}%",       wr_color,  f"{n_win}W  - {n_lose}L"),
-            (m2, "AVG GANANCIA",f"+{avg_g_all}%",      "#16A34A", "por trade ganador"),
-            (m3, "AVG PÉRDIDA", f"{avg_p_all}%",       "#DC2626", "por trade perdedor"),
-            (m4, "RATIO R/R",   f"{ratio_all}x",
-                 "#16A34A" if ratio_all >= 1.5 else "#D97706", "ganancia/pérdida"),
-            (m5, "EXPECTATIVA", f"{expect:+.2f}%",
-                 "#16A34A" if expect > 0 else "#DC2626", "por trade promedio"),
-        ]:
-            with col:
-                st.markdown(
-                    f'<div style="background:{BG_CARD};border:1px solid {BOR};'
-                    f'border-radius:10px;padding:12px;text-align:center">'
-                    f'<div style="font-size:10px;color:{TXT_MUT};font-weight:700">{lbl}</div>'
-                    f'<div style="font-size:24px;font-weight:800;color:{color}">{val}</div>'
-                    f'<div style="font-size:10px;color:{TXT_SOFT}">{sub}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-        # ── TABLA POR TICKER ──────────────────────────────────
-        st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">'
-                    f'📋 Rendimiento por Ticker</div>', unsafe_allow_html=True)
-
-        rows_bt = ""
-        for r in sorted(bt_resultados, key=lambda x: x["win_rate"], reverse=True):
-            wr_c  = "#16A34A" if r["win_rate"] >= 60 else "#D97706" if r["win_rate"] >= 50 else "#DC2626"
-            ex_c  = "#16A34A" if r["expectativa"] > 0 else "#DC2626"
-            rr_c  = "#16A34A" if r["ratio_rr"] >= 1.5 else "#D97706"
-            rows_bt += (
-                f'<tr>'
-                f'<td><strong style="color:{B};font-size:13px">{r["ticker"]}</strong></td>'
-                f'<td><span style="color:{TXT_MUT}">{r["n_señales"]}</span></td>'
-                f'<td><span style="color:{wr_c};font-weight:800;font-size:14px">{r["win_rate"]}%</span></td>'
-                f'<td><span style="color:#16A34A;font-weight:700">+{r["avg_ganancia"]}%</span></td>'
-                f'<td><span style="color:#DC2626;font-weight:700">{r["avg_perdida"]}%</span></td>'
-                f'<td><span style="color:{rr_c};font-weight:700">{r["ratio_rr"]}x</span></td>'
-                f'<td><span style="color:{ex_c};font-weight:800">{r["expectativa"]:+.2f}%</span></td>'
-                f'<td><span style="color:#16A34A">{r["max_ganancia"]}%</span></td>'
-                f'<td><span style="color:#DC2626">{r["max_perdida"]}%</span></td>'
-                f'</tr>'
+        _bc1, _bc2, _bc3, _bc4 = st.columns(4)
+        with _bc1:
+            _bt_tickers = st.text_input(
+                "Tickers a testear",
+                value="NBIS,AMD,IONQ,NVDA,VRDN",
+                help="Pon los tickers de acciones que quieres analizar, separados por coma"
             )
+        with _bc2:
+            _bt_meses = st.selectbox("¿Cuántos meses atrás?",
+                ["3 meses","6 meses","9 meses","12 meses"], index=1,
+                help="Período histórico a analizar. Más meses = más señales = más confiable")
+            _bt_meses_n = int(_bt_meses.split()[0])
+        with _bc3:
+            _bt_riesgo = st.number_input("Riesgo por trade ($USD)",
+                min_value=100, max_value=10000, value=500, step=100,
+                help="¿Cuánto estás dispuesto a perder si el trade sale mal?")
+        with _bc4:
+            _bt_dias = st.selectbox("Días máx por trade",
+                [10,15,20], index=1,
+                help="Cuántos días esperar antes de cerrar el trade")
 
         st.markdown(
-            f'<div class="tbl-wrap"><table class="dtbl">'
-            f'<thead><tr>'
-            f'<th>Ticker</th><th>Señales</th><th>Win Rate</th>'
-            f'<th>Avg Ganancia</th><th>Avg Pérdida</th>'
-            f'<th>Ratio R/R</th><th>Expectativa</th>'
-            f'<th>Mejor Trade</th><th>Peor Trade</th>'
-            f'</tr></thead>'
-            f'<tbody>{rows_bt}</tbody>'
-            f'</table></div>', unsafe_allow_html=True)
+            f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;'
+            f'padding:10px 14px;margin:8px 0;font-size:11px;color:#1D4ED8">'
+            f'📋 <strong>Lo que verás al ejecutar:</strong> Win Rate % real · '
+            f'Promedio ganancia vs pérdida · Expectativa matemática por trade · '
+            f'Tabla de cada señal con precio entrada, salida y resultado</div>',
+            unsafe_allow_html=True)
 
-        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-        # ── ATR SIZING WIDGET ─────────────────────────────────
-        st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">'
-                    f'📐 ATR Sizing - Cuántas acciones comprar</div>', unsafe_allow_html=True)
-
-        sa1, sa2 = st.columns(2)
-        with sa1:
-            tk_sizing = st.selectbox("Ticker para calcular sizing",
-                options=[r["ticker"] for r in bt_resultados])
-        with sa2:
-            riesgo_sizing = st.number_input("Riesgo máximo ($USD)",
-                min_value=100, max_value=50000, value=bt_riesgo, step=100,
-                key="riesgo_sizing_widget")
-
-        if tk_sizing:
-            # Obtener precio actual
-            try:
-                import yfinance as _yf
-                _px = float(_yf.Ticker(tk_sizing).fast_info.last_price or 0)
-            except Exception:
-                _px = 100.0
-
-            sz = sizing_por_atr(tk_sizing, _px, riesgo_sizing)
-            if sz["_ok"]:
-                sa_c1, sa_c2, sa_c3, sa_c4, sa_c5 = st.columns(5)
-                for col, lbl, val, color, sub in [
-                    (sa_c1, "PRECIO",    f"${_px:.2f}",              B,        tk_sizing),
-                    (sa_c2, "ATR/DÍA",   f"${sz['atr']:.2f}",       TXT_MUT,  f"{sz['atr_pct']:.1f}% diario"),
-                    (sa_c3, "ACCIONES",  f"{sz['shares']}",          "#0369A1",f"${sz['monto_total']:,.0f} total"),
-                    (sa_c4, "STOP",      f"${sz['stop_precio']:.2f}",R,        f"−${sz['stop_distancia']:.2f}"),
-                    (sa_c5, "RATIO R/R", f"{sz['ratio_rr']:.1f}x",
-                     "#16A34A" if sz["ratio_rr"] >= 2 else "#D97706",
-                     f"T1 ${sz['t1_precio']:.2f}"),
-                ]:
-                    with col:
-                        st.markdown(
-                            f'<div style="background:{BG_CARD};border:1px solid {BOR};'
-                            f'border-radius:10px;padding:12px;text-align:center">'
-                            f'<div style="font-size:10px;color:{TXT_MUT};font-weight:700">{lbl}</div>'
-                            f'<div style="font-size:20px;font-weight:800;color:{color}">{val}</div>'
-                            f'<div style="font-size:10px;color:{TXT_SOFT}">{sub}</div>'
-                            f'</div>', unsafe_allow_html=True)
-
-                st.markdown(
-                    f'<div style="background:#F0F9FF;border:1px solid #BAE6FD;border-radius:10px;'
-                    f'padding:10px 16px;margin-top:8px">'
-                    f'<span style="font-size:12px;color:#0369A1">'
-                    f'<strong>Instrucción:</strong> Comprar <strong>{sz["shares"]} acciones</strong> de {tk_sizing} '
-                    f'a ${_px:.2f}. Stop en ${sz["stop_precio"]:.2f} '
-                    f'(máx pérdida ${riesgo_sizing:,}). '
-                    f'Target 1: ${sz["t1_precio"]:.2f} (+8%). '
-                    f'Target 2: ${sz["t2_precio"]:.2f} (+15%). '
-                    f'Ratio R/R: {sz["ratio_rr"]:.1f}x</span>'
-                    f'</div>', unsafe_allow_html=True)
-            else:
-                st.warning(f"No se pudo calcular ATR para {tk_sizing}")
-
-        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-        # ── HISTORIAL DE TRADES ───────────────────────────────
-        if bt_trades_all:
-            st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">'
-                        f'📋 Historial completo de trades ({len(bt_trades_all)} señales)</div>',
-                        unsafe_allow_html=True)
-
-            # Exportar
-            df_trades_export = pd.DataFrame(bt_trades_all)
-            csv_bt = df_trades_export.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Descargar historial CSV", csv_bt,
-                               f"backtest_v16_{datetime.date.today()}.csv",
-                               "text/csv", key="dwn_backtest_v16")
-
-            # Mostrar tabla
-            rows_trades = ""
-            for t in sorted(bt_trades_all, key=lambda x: x["Fecha"], reverse=True)[:50]:
-                pnl_c = "#16A34A" if t["PnL_pct"] > 0 else "#DC2626"
-                icon  = "✅" if t["Ganadora"] else "❌"
-                rows_trades += (
-                    f'<tr>'
-                    f'<td><strong style="color:{B}">{t["Ticker"]}</strong></td>'
-                    f'<td><span style="color:{TXT_MUT};font-size:10px">{t["Fecha"]}</span></td>'
-                    f'<td>{badge(t["Fase"],"bg-g" if t["Fase"]=="M3" else "bg-c")}</td>'
-                    f'<td>${t["Precio_Entrada"]:.2f}</td>'
-                    f'<td>${t["Precio_Salida"]:.2f}</td>'
-                    f'<td><span style="color:{pnl_c};font-weight:800">{t["PnL_pct"]:+.2f}%</span></td>'
-                    f'<td><span style="color:{TXT_MUT};font-size:10px">{t["Razon_Salida"]}</span></td>'
-                    f'<td>{icon}</td>'
-                    f'<td><span style="color:{TXT_MUT};font-size:10px">ATR ${t["ATR"]:.2f}</span></td>'
-                    f'</tr>'
+        if st.button("🔬 Ejecutar Backtesting — analizar señales históricas",
+                     use_container_width=True, type="primary", key="btn_bt_v18"):
+            _tickers_list = [t.strip().upper() for t in _bt_tickers.split(",") if t.strip()]
+            _progress = st.progress(0, text=f"Iniciando análisis de {len(_tickers_list)} tickers...")
+            _resultados_bt = []
+            _all_trades    = []
+            for _idx, _tk_bt in enumerate(_tickers_list):
+                _progress.progress(
+                    (_idx) / len(_tickers_list),
+                    text=f"Analizando {_tk_bt} ({_idx+1}/{len(_tickers_list)})... puede tardar 10-15s por ticker"
                 )
+                _r = backtest_real_v16(_tk_bt, meses=_bt_meses_n, dias_max=_bt_dias)
+                if _r["_ok"]:
+                    _resultados_bt.append(_r)
+                    _all_trades.extend(_r["trades"])
+            _progress.progress(1.0, text="✅ Análisis completado")
+            st.session_state["bt_v18_resultados"] = _resultados_bt
+            st.session_state["bt_v18_trades"]     = _all_trades
+            st.session_state["bt_v18_ts"]         = datetime.datetime.now().strftime("%H:%M")
 
-            st.markdown(
-                f'<div class="tbl-wrap"><table class="dtbl">'
-                f'<thead><tr>'
-                f'<th>Ticker</th><th>Fecha</th><th>Fase</th>'
-                f'<th>Entrada</th><th>Salida</th><th>PnL %</th>'
-                f'<th>Razón salida</th><th>Resultado</th><th>ATR</th>'
-                f'</tr></thead>'
-                f'<tbody>{rows_trades}</tbody>'
-                f'</table></div>', unsafe_allow_html=True)
+        _bt_res  = st.session_state.get("bt_v18_resultados", [])
+        _bt_trds = st.session_state.get("bt_v18_trades", [])
+        _bt_ts   = st.session_state.get("bt_v18_ts", "")
 
+        if not _bt_res:
             st.markdown(
-                f'<div style="font-size:10px;color:{TXT_SOFT};margin-top:6px">'
-                f'Mostrando últimos 50 trades. Descarga CSV para historial completo.</div>',
+                f'<div style="background:{BG_HEAD};border:2px dashed {BOR};border-radius:12px;'
+                f'padding:40px;text-align:center">'
+                f'<div style="font-size:40px;margin-bottom:12px">🔬</div>'
+                f'<div style="font-size:15px;font-weight:700;color:{TXT};margin-bottom:6px">'
+                f'Aún no has ejecutado el backtesting</div>'
+                f'<div style="font-size:12px;color:{TXT_MUT}">'
+                f'1. Escribe los tickers que quieres analizar (ej: NBIS,AMD,IONQ)<br>'
+                f'2. Elige el período (recomendado: 6 meses)<br>'
+                f'3. Haz click en el botón verde <strong>"Ejecutar Backtesting"</strong><br>'
+                f'4. Espera 30-60 segundos mientras descarga datos históricos</div>'
+                f'</div>', unsafe_allow_html=True)
+        else:
+            # ── RESUMEN GLOBAL ───────────────────────────────
+            import numpy as _np
+            _n_tot  = sum(r["n_señales"]   for r in _bt_res)
+            _n_win  = sum(r["n_ganadoras"] for r in _bt_res)
+            _n_los  = sum(r["n_perdedoras"] for r in _bt_res)
+            _wr_g   = round(_n_win / _n_tot * 100, 1) if _n_tot > 0 else 0
+            _avg_g  = round(_np.mean([t["resultado"] for t in _bt_trds if t.get("ganadora")]), 2) if any(t.get("ganadora") for t in _bt_trds) else 0
+            _avg_p  = round(_np.mean([t["resultado"] for t in _bt_trds if not t.get("ganadora")]), 2) if any(not t.get("ganadora") for t in _bt_trds) else 0
+            _ratio  = round(abs(_avg_g / _avg_p), 2) if _avg_p != 0 else 0
+            _expect = round(_wr_g/100 * _avg_g + (1-_wr_g/100) * _avg_p, 2)
+            _wr_col = "#16A34A" if _wr_g >= 60 else "#D97706" if _wr_g >= 50 else "#DC2626"
+
+            st.markdown(f'<div style="font-size:11px;color:{TXT_MUT};margin:6px 0">Ejecutado {_bt_ts} · {_n_tot} señales analizadas</div>', unsafe_allow_html=True)
+
+            # KPIs
+            _k1,_k2,_k3,_k4,_k5 = st.columns(5)
+            for _kc, _kv, _kl, _kco, _khelp in [
+                (_k1, f"{_wr_g}%",        "Win Rate",             _wr_col,   "De cada 100 señales, cuántas terminaron en ganancia"),
+                (_k2, f"+{_avg_g}%",      "Promedio ganadora",    "#16A34A", "Cuando el modelo acierta, ¿cuánto gana en promedio?"),
+                (_k3, f"{_avg_p}%",       "Promedio perdedora",   "#DC2626", "Cuando el modelo falla, ¿cuánto pierde en promedio?"),
+                (_k4, f"{_ratio}x",       "Ratio ganancia/pérdida","#7C3AED","Si el ratio > 1 el sistema es rentable a largo plazo"),
+                (_k5, f"{_expect:+.1f}%", "Expectativa/trade",    "#16A34A" if _expect>0 else "#DC2626",
+                                                                              "Resultado esperado promedio por cada señal tomada"),
+            ]:
+                with _kc:
+                    st.markdown(
+                        f'<div style="background:{BG_CARD};border:1px solid {BOR};'
+                        f'border-radius:10px;padding:12px;text-align:center" title="{_khelp}">'
+                        f'<div style="font-size:10px;color:{TXT_MUT};font-weight:600">{_kl}</div>'
+                        f'<div style="font-size:24px;font-weight:800;color:{_kco}">{_kv}</div>'
+                        f'</div>', unsafe_allow_html=True)
+
+            # Interpretación
+            _msg = ("✅ El modelo es rentable — gana más de lo que pierde" if _expect > 0 and _wr_g >= 50
+                    else "⚠️ Revisar — win rate o ratio necesitan mejorar" if _expect > -2
+                    else "❌ Modelo necesita ajuste — pérdida esperada por trade")
+            st.markdown(
+                f'<div style="background:{"#F0FDF4" if _expect>0 else "#FEF2F2"};'
+                f'border:1px solid {"#86EFAC" if _expect>0 else "#FCA5A5"};'
+                f'border-radius:8px;padding:10px 14px;margin:10px 0;font-size:12px">'
+                f'<strong>{_msg}</strong><br>'
+                f'Win Rate {_wr_g}% · Ganancia avg +{_avg_g}% · Pérdida avg {_avg_p}% · '
+                f'Cada señal tomada tiene expectativa de {_expect:+.1f}%</div>',
                 unsafe_allow_html=True)
 
+            # Tabla de trades
+            if _bt_trds:
+                st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin:10px 0 4px">📋 Detalle de señales históricas</div>', unsafe_allow_html=True)
+                _rows = ""
+                for _t in sorted(_bt_trds, key=lambda x: x.get("fecha",""), reverse=True)[:40]:
+                    _rc = "#16A34A" if _t.get("ganadora") else "#DC2626"
+                    _res = float(_t.get("resultado",0))
+                    _rows += (
+                        f"<tr style='background:{'#F0FDF420' if _t.get('ganadora') else '#FEF2F220'}'>"
+                        f"<td><strong style='color:{B}'>{_t.get('ticker','')}</strong></td>"
+                        f"<td style='font-size:11px;color:{TXT_MUT}'>{_t.get('fecha','')}</td>"
+                        f"<td><strong>${_t.get('entrada',0):.2f}</strong></td>"
+                        f"<td>${_t.get('salida',0):.2f}</td>"
+                        f"<td style='color:{TXT_MUT};font-size:10px'>${_t.get('stop',0):.2f}</td>"
+                        f"<td><span style='color:{_rc};font-weight:800'>{_res:+.1f}%</span></td>"
+                        f"<td>{'✅' if _t.get('ganadora') else '❌'}</td>"
+                        f"<td style='font-size:10px;color:{TXT_MUT}'>{_t.get('dias_trade',0)}d</td>"
+                        f"</tr>"
+                    )
+                _hdr = "<tr>" + "".join(f"<th>{h}</th>" for h in ["Ticker","Fecha","Entrada","Salida","Stop","Resultado","✓","Días"]) + "</tr>"
+                st.markdown(
+                    f'<div class="tbl-wrap"><table class="dtbl"><thead>{_hdr}</thead><tbody>{_rows}</tbody></table></div>',
+                    unsafe_allow_html=True)
+
+                _csv_bt = "\n".join([",".join(str(v) for v in [
+                    t.get("ticker",""),t.get("fecha",""),t.get("entrada",0),
+                    t.get("salida",0),t.get("stop",0),t.get("resultado",0),
+                    "SI" if t.get("ganadora") else "NO",t.get("dias_trade",0)
+                ]) for t in _bt_trds])
+                st.download_button("⬇️ Descargar CSV de señales",
+                    ("Ticker,Fecha,Entrada,Salida,Stop,Resultado%,Ganadora,Dias\n" + _csv_bt).encode(),
+                    f"backtesting_v18_{datetime.date.today()}.csv", "text/csv",
+                    use_container_width=True)
+
+    # ════════════════════════════════════════════════════════
+    # SECCIÓN 2 — ATR SIZING
+    # ════════════════════════════════════════════════════════
+    else:
+        st.markdown(
+            f'<div class="info-box">'
+            f'<strong>¿Qué es el ATR Sizing?</strong> El ATR (Average True Range) mide '
+            f'cuánto se mueve una acción en un día normal. Usamos eso para calcular '
+            f'el stop loss y de ahí cuántas acciones comprar. '
+            f'Ejemplo: Si arriesgas $500 y el stop está a $12 de distancia → compras 41 acciones.</div>',
+            unsafe_allow_html=True)
+
+        _as1, _as2, _as3 = st.columns(3)
+        with _as1:
+            _atr_tk = st.text_input("Ticker", value="NBIS", key="atr_tk_v18").upper()
+        with _as2:
+            _atr_capital = st.number_input("¿Cuánto puedes perder si sale mal? ($)",
+                min_value=50, max_value=50000, value=500, step=50,
+                help="Capital máximo en riesgo por este trade")
+        with _as3:
+            _atr_precio = st.number_input("Precio actual ($)",
+                min_value=0.5, max_value=10000.0, value=100.0, step=0.5)
+
+        if st.button("📐 Calcular — ¿cuántas acciones comprar?",
+                     use_container_width=True, type="primary", key="btn_atr_v18"):
+            with st.spinner(f"Calculando ATR real de {_atr_tk}..."):
+                _sz = sizing_por_atr(
+                    ticker=_atr_tk, precio_actual=_atr_precio,
+                    capital_riesgo_usd=_atr_capital, atr_mult=1.5,
+                    score=60, vix_val=float(vix.get("valor",20))
+                )
+                st.session_state["atr_v18"] = _sz
+
+        _sz_r = st.session_state.get("atr_v18")
+        if not _sz_r:
+            st.markdown(
+                f'<div style="background:{BG_HEAD};border:2px dashed {BOR};border-radius:12px;'
+                f'padding:40px;text-align:center">'
+                f'<div style="font-size:40px;margin-bottom:12px">📐</div>'
+                f'<div style="font-size:15px;font-weight:700;color:{TXT};margin-bottom:6px">'
+                f'Ingresa el ticker y el capital en riesgo</div>'
+                f'<div style="font-size:12px;color:{TXT_MUT}">'
+                f'El sistema descargará el ATR real de los últimos 14 días<br>'
+                f'y calculará exactamente cuántas acciones comprar</div>'
+                f'</div>', unsafe_allow_html=True)
+        else:
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                st.markdown(
+                    f'<div style="background:{G_BG};border:2px solid {G_BOR};border-radius:14px;padding:20px">'
+                    f'<div style="font-size:14px;font-weight:800;color:{G};margin-bottom:14px">'
+                    f'📐 Resultado para {_atr_tk}</div>'
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">'
+                    f'  <div style="background:white;border-radius:8px;padding:10px;text-align:center">'
+                    f'    <div style="font-size:10px;color:{TXT_MUT};font-weight:600">ATR REAL (14d)</div>'
+                    f'    <div style="font-size:22px;font-weight:800;color:#7C3AED">${_sz_r["atr"]}</div>'
+                    f'    <div style="font-size:9px;color:{TXT_SOFT}">volatilidad diaria promedio</div>'
+                    f'  </div>'
+                    f'  <div style="background:#FEF2F2;border-radius:8px;padding:10px;text-align:center">'
+                    f'    <div style="font-size:10px;color:{R};font-weight:600">STOP LOSS</div>'
+                    f'    <div style="font-size:22px;font-weight:800;color:{R}">${_sz_r["stop_precio"]}</div>'
+                    f'    <div style="font-size:9px;color:{TXT_SOFT}">{_sz_r["detalle"]}</div>'
+                    f'  </div>'
+                    f'  <div style="background:#DBEAFE;border-radius:8px;padding:12px;text-align:center;grid-column:span 2">'
+                    f'    <div style="font-size:10px;color:#1D4ED8;font-weight:700">COMPRAR</div>'
+                    f'    <div style="font-size:36px;font-weight:900;color:#1D4ED8">{_sz_r["acciones"]} acciones</div>'
+                    f'    <div style="font-size:11px;color:#3B82F6">'
+                    f'      ${_sz_r["capital_total"]:,.0f} USD total · '
+                    f'      si el stop se activa pierdes exactamente ${_sz_r["riesgo_real"]:,.0f}</div>'
+                    f'  </div>'
+                    f'</div></div>', unsafe_allow_html=True)
+            with _c2:
+                st.markdown(
+                    f'<div style="background:{BG_CARD};border:1px solid {BOR};border-radius:14px;padding:20px">'
+                    f'<div style="font-size:14px;font-weight:800;color:{TXT};margin-bottom:14px">'
+                    f'🎯 Cuándo vender</div>'
+                    f'<div style="display:flex;flex-direction:column;gap:8px">'
+                    f'  <div style="background:{A_BG};border:1px solid {A_BOR};border-radius:8px;padding:10px">'
+                    f'    <div style="font-size:11px;font-weight:700;color:{A}">T1 — Vender 60% aquí</div>'
+                    f'    <div style="font-size:20px;font-weight:800;color:{A}">${_sz_r["t1"]} (+{_sz_r["t1_pct"]}%)</div>'
+                    f'    <div style="font-size:9px;color:{TXT_SOFT}">ATR x 2 desde tu entrada</div>'
+                    f'  </div>'
+                    f'  <div style="background:{G_BG};border:1px solid {G_BOR};border-radius:8px;padding:10px">'
+                    f'    <div style="font-size:11px;font-weight:700;color:{G}">T2 — Vender 30% aquí</div>'
+                    f'    <div style="font-size:20px;font-weight:800;color:{G}">${_sz_r["t2"]} (+{_sz_r["t2_pct"]}%)</div>'
+                    f'    <div style="font-size:9px;color:{TXT_SOFT}">ATR x 4 desde tu entrada</div>'
+                    f'  </div>'
+                    f'  <div style="background:{C_BG};border:1px solid {C_BOR};border-radius:8px;padding:10px">'
+                    f'    <div style="font-size:11px;font-weight:700;color:{C}">T3 — Runner 10%</div>'
+                    f'    <div style="font-size:20px;font-weight:800;color:{C}">${_sz_r["t3"]} (+{_sz_r["t3_pct"]}%)</div>'
+                    f'    <div style="font-size:9px;color:{TXT_SOFT}">dejar correr sin stop</div>'
+                    f'  </div>'
+                    f'</div></div>', unsafe_allow_html=True)
 
 st.markdown("---")
 st.markdown(
     f'<div style="text-align:center;font-size:11px;color:{TXT_SOFT};padding:8px">'
     f'🦅 <strong>GrekoTrader</strong>  - '
-    f'Versión 16  - Mayo 2026  - '
+    f'v18  - Mayo 2026  - '
     f'Patrón NBIS  - 3 Momentos  - 100% Automático<br>'
     f'<span style="font-size:10px">Datos educativos  - No constituye asesoría financiera  - '
     f'Powered by yfinance + Streamlit</span>'
