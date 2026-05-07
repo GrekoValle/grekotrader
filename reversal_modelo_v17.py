@@ -334,7 +334,7 @@ def fetch_guidance_flag(ticker: str) -> dict:
     o el ratio estimado/real < 0.95, marca como guidance negativo.
     """
     resultado = {"guidance_negativo": False, "razon": "", "score_penalty": 0}
-    _BAD_TICKERS = {"MSTU","CRWN","SDNK","SNDK","VIX","ENTX"}
+    _BAD_TICKERS = {"MSTU","CRWN","SDNK","VIX","ENTX"}  # v17: SNDK removido — era confusión con typo SDNK
     if ticker.upper() in _BAD_TICKERS:
         return resultado
     try:
@@ -389,7 +389,7 @@ def fetch_guidance_flag(ticker: str) -> dict:
 def get_precio_live_batch(tickers: tuple) -> dict:
     """Obtiene precios actuales para una lista de tickers. Cache 1h."""
     result = {}
-    _BAD = {"MSTU","CRWN","SDNK","SNDK","VIX","ENTX"}
+    _BAD = {"MSTU","CRWN","SDNK","VIX","ENTX"}  # v17: SNDK removido — era confusión con typo SDNK
     try:
         import yfinance as yf
         tks_valid = [t for t in tickers if t not in _BAD]
@@ -629,7 +629,7 @@ def fetch_earnings_dates(tickers):
     import yfinance as yf, datetime
     ETF_SIN_EARNINGS = ["VOO","SPY","IVV","QQQ","VTI","SCHB","IBIT","ETHA","GBTC","FBTC","TAN","XBI","IBB","XLF","XLE","XLK","XLV","ARKK","SOXX"]
     # v15: tickers que generan 404 en yfinance - skip silencioso
-    TICKERS_MALOS = {"MSTU","CRWN","SDNK","SNDK","VIX","ENTX"}
+    TICKERS_MALOS = {"MSTU","CRWN","SDNK","VIX","ENTX"}  # v17: SNDK removido — era confusión con typo SDNK
     rows = []
     for tk in tickers:
         if tk.upper() in TICKERS_MALOS:
@@ -675,7 +675,7 @@ def get_earnings_single(ticker: str) -> str:
     ETF_SKIP = {"VOO","SPY","IVV","QQQ","VTI","SCHB","IBIT","ETHA","GBTC","FBTC",
                 "TAN","XBI","IBB","XLF","XLE","XLK","XLV","ARKK","SOXX"}
     # v15: misma blacklist que fetch_ticker_data - evita 404 spam
-    _BAD = {"MSTU","CRWN","SDNK","SNDK","VIX","ENTX"}
+    _BAD = {"MSTU","CRWN","SDNK","VIX","ENTX"}  # v17: SNDK removido — era confusión con typo SDNK
     if ticker in ETF_SKIP or ticker.upper() in _BAD:
         return "-"
     try:
@@ -3831,7 +3831,7 @@ def fetch_ticker_data(ticker: str, precio_compra: float) -> dict:
     _TICKER_BLACKLIST = {
         "MSTU",   # ETF apalancado sin fundamentals en Yahoo
         "CRWN",   # Ilíquida / sin datos
-        "SDNK",   # Ticker incorrecto (correcto es SNDK)
+        "SDNK",   # Typo — el ticker correcto es SNDK (SanDisk, válido en yfinance)
         "VIX",    # Debe ser ^VIX - sin ^ falla
         "ENTX",   # Delisted
     }
@@ -4273,6 +4273,144 @@ def c_vol(v):
     if v>=1.5: return A
     return TXT_MUT
 
+
+# ─────────────────────────────────────────────────────────────
+#  OPINIÓN DEL TRADER — v17
+#  Sintetiza todos los indicadores en una frase accionable
+#  Aparece en Tab1 Detectadas, Tab2 Swing, Tab3 Entrar Hoy, Tab5 Watchlist
+# ─────────────────────────────────────────────────────────────
+def generar_opinion_trader(
+    ticker: str,
+    etapa: str,       # "M1","M2","M3","🔥 ENTRAR HOY", etc.
+    rsi: float,
+    dd: float,        # DD desde pico (negativo)
+    vol_ratio: float, # % vs promedio
+    macd: float,
+    dias_alcistas: int,
+    momentum_3d: float,
+    prob_nbis: float,
+    cat_fecha: str,
+    arrastradas: str,
+    lider: str,
+    nivel_rebote: str,  # "🟢 Fuerte","🟡 Bueno","🔴 Débil", etc.
+    score: int,
+) -> str:
+    """
+    Genera la opinión del trader en 2-3 líneas.
+    Explica POR QUÉ está en ese estado y QUÉ hacer.
+    """
+    import datetime as _dt
+    partes = []
+
+    # ── 1. Estado y razón principal ─────────────────────────
+    if "M3" in etapa or "ENTRAR HOY" in etapa:
+        partes.append(f"Señal M3 completa — patrón NBIS confirmado.")
+    elif "SWING HOY" in etapa or "SWING" in etapa:
+        partes.append(f"Momentum de swing fuerte — {dias_alcistas} días alcistas consecutivos.")
+    elif "ANTICIPAR" in etapa or "PRE" in etapa:
+        partes.append(f"Pre-señal activa — falta confirmación de volumen o MACD.")
+    elif "M2" in etapa or "ENTRADA VÁLIDA" in etapa:
+        partes.append(f"En zona de preparación M2 — corrección absorbida, rebote iniciando.")
+    elif "M1" in etapa or "DETECTADA" in etapa:
+        partes.append(f"Corrección activa detectada — aún no es entrada, vigilar el rebote.")
+    elif "CORRECCIÓN" in etapa:
+        partes.append(f"Caída en curso — monitorear para entrada cuando gire.")
+    else:
+        partes.append(f"En radar — sin señal clara aún.")
+
+    # ── 2. RSI ──────────────────────────────────────────────
+    if rsi <= 30:
+        partes.append(f"RSI {rsi:.0f} en sobreventa extrema — mercado exageró la caída.")
+    elif rsi <= 42:
+        partes.append(f"RSI {rsi:.0f} en zona de rebote — históricamente punto de entrada NBIS.")
+    elif rsi <= 55:
+        partes.append(f"RSI {rsi:.0f} neutral — saliendo de zona baja.")
+    elif rsi <= 68:
+        partes.append(f"RSI {rsi:.0f} en fuerza — momentum activo pero no sobrecomprado.")
+    else:
+        partes.append(f"RSI {rsi:.0f} elevado — precaución con nuevas entradas.")
+
+    # ── 3. DD y corrección ──────────────────────────────────
+    if dd <= -30:
+        partes.append(f"Corrección {dd:.0f}% desde pico — severa, potencial rebote fuerte.")
+    elif dd <= -15:
+        partes.append(f"Corrección {dd:.0f}% — zona clásica del patrón NBIS.")
+    elif dd <= -8:
+        partes.append(f"Caída {dd:.0f}% — corrección válida para swing.")
+    elif dd < 0:
+        partes.append(f"Caída leve {dd:.0f}% — poca corrección, señal más débil.")
+
+    # ── 4. Volumen ──────────────────────────────────────────
+    if vol_ratio >= 200:
+        partes.append(f"Volumen {vol_ratio:.0f}% del promedio — acumulación institucional fuerte.")
+    elif vol_ratio >= 150:
+        partes.append(f"Volumen {vol_ratio:.0f}% — interés institucional confirmado.")
+    elif vol_ratio >= 100:
+        partes.append(f"Volumen normal — sin señal de acumulación excepcional.")
+    elif vol_ratio >= 80:
+        partes.append(f"Volumen bajo {vol_ratio:.0f}% — señal más débil sin confirmación.")
+    else:
+        partes.append(f"Volumen muy bajo — esperar aumento antes de entrar.")
+
+    # ── 5. MACD ─────────────────────────────────────────────
+    if macd > 1.0:
+        partes.append("MACD positivo y fuerte — momentum confirmado.")
+    elif macd > 0:
+        partes.append("MACD recién cruzó a positivo — giro alcista temprano.")
+    elif macd > -1:
+        partes.append("MACD levemente negativo — aún no confirma, vigilar cruce.")
+    else:
+        partes.append("MACD negativo — señal en corrección, esperar giro.")
+
+    # ── 6. Catalizador ──────────────────────────────────────
+    if cat_fecha and cat_fecha not in ("-","","nan","—"):
+        try:
+            dias_cat = (_dt.date.fromisoformat(cat_fecha[:10]) - _dt.date.today()).days
+            if 1 <= dias_cat <= 7:
+                partes.append(f"Earnings en {dias_cat}d — zona óptima NBIS: catalizador activo.")
+            elif 1 <= dias_cat <= 15:
+                partes.append(f"Earnings en {dias_cat}d — convicción extra para el setup.")
+            elif dias_cat > 15:
+                partes.append(f"Earnings en {dias_cat}d — monitorear acercamiento.")
+            elif dias_cat == 0:
+                partes.append("Reporta HOY — esperar resultado antes de entrar.")
+        except Exception:
+            pass
+
+    # ── 7. Arrastradas / Líder (el tren) ────────────────────
+    arr_clean = str(arrastradas) if arrastradas not in ("-","","nan") else ""
+    lid_clean = str(lider) if lider not in ("-","","nan") else ""
+    if arr_clean and arr_clean != "-":
+        partes.append(f"Arrastra a {arr_clean} — si entra, buscar esas en M1/M2.")
+    elif lid_clean and lid_clean != "-":
+        partes.append(f"Arrastrada por {lid_clean} — verificar si el líder sigue subiendo.")
+
+    # ── 8. Probabilidad NBIS ────────────────────────────────
+    if prob_nbis >= 70:
+        partes.append(f"Prob NBIS {prob_nbis:.0f}% — alta similitud con el patrón ganador.")
+    elif prob_nbis >= 50:
+        partes.append(f"Prob NBIS {prob_nbis:.0f}% — similitud moderada con el patrón.")
+    elif prob_nbis >= 35:
+        partes.append(f"Prob NBIS {prob_nbis:.0f}% — similitud baja, mayor cautela.")
+
+    # Unir todo — máximo 3 frases para no saturar
+    # Prioridad: estado + RSI + catalizador/arrastradas
+    frases_clave = [partes[0]]  # siempre el estado
+    if len(partes) > 1: frases_clave.append(partes[1])  # RSI
+    # Catalizador o arrastradas si existen (más relevante que DD/vol)
+    for p in partes:
+        if "Earnings" in p or "Arrastra" in p or "líder" in p.lower():
+            if p not in frases_clave:
+                frases_clave.append(p)
+                break
+    if len(frases_clave) < 3 and len(partes) > 2:
+        for p in partes[2:]:
+            if p not in frases_clave:
+                frases_clave.append(p)
+                break
+
+    return " · ".join(frases_clave[:3])
+
 def render_table(df_sub, show_cols, tab_key="tabla"):
     if df_sub.empty:
         st.markdown(f'<div style="padding:16px;color:{TXT_MUT};font-size:12px;text-align:center;background:{BG_HEAD};border-radius:10px;border:1px solid {BOR}">- sin resultados -</div>',unsafe_allow_html=True)
@@ -4280,6 +4418,29 @@ def render_table(df_sub, show_cols, tab_key="tabla"):
 
     # v11: calcular Score_Rebote si no existe en el DataFrame
     df_sub = df_sub.copy()
+
+    # v17: calcular Opinion_Trader si no está en el DataFrame
+    if "Opinion_Trader" not in df_sub.columns:
+        def _make_opinion(r):
+            try:
+                return generar_opinion_trader(
+                    ticker=str(r.get("Ticker","")),
+                    etapa=str(r.get("Etapa_v12", r.get("Fase",""))),
+                    rsi=float(r.get("RSI",50)), dd=float(r.get("DD_pico",0)),
+                    vol_ratio=float(r.get("Volumen",100)),
+                    macd=float(r.get("MACD",0)),
+                    dias_alcistas=int(r.get("Dias_Alcistas",0)),
+                    momentum_3d=float(r.get("Momentum_3d",0)),
+                    prob_nbis=float(r.get("Prob_NBIS",0)),
+                    cat_fecha=str(r.get("Cat_Fecha","-")),
+                    arrastradas=str(r.get("Arrastradas","-")),
+                    lider=str(r.get("Lider","-")),
+                    nivel_rebote=str(r.get("Nivel_Rebote","-")),
+                    score=int(r.get("Score", r.get("Score_Rebote",0))),
+                )
+            except Exception:
+                return "-"
+        df_sub["Opinion_Trader"] = df_sub.apply(_make_opinion, axis=1)
     if "Score_Rebote" not in df_sub.columns or df_sub["Score_Rebote"].isna().all() or (df_sub["Score_Rebote"] == "").all():
         def _calc_sr(row):
             try:
@@ -4389,6 +4550,18 @@ def render_table(df_sub, show_cols, tab_key="tabla"):
                 cell=f'<span style="color:{c2};font-weight:700">{val:.1f}</span>'
             elif col=="Motivo":
                 cell=f'<span style="color:{TXT_MUT};font-size:11px">{val}</span>'
+            elif col=="Opinion_Trader":
+                v2 = str(val) if val and str(val) not in ("-","","nan") else ""
+                if v2:
+                    # Color según contenido
+                    _oc = G if any(x in v2 for x in ["M3","ENTRAR","confirmado","institucional"]) else \
+                          C if any(x in v2 for x in ["Pre-señal","preparación","recién"]) else \
+                          A if any(x in v2 for x in ["M2","M1","vigilar","esperar"]) else TXT_MUT
+                    cell = (f'<div style="background:{BG_HEAD};border-left:3px solid {_oc};'
+                            f'border-radius:0 6px 6px 0;padding:4px 8px;min-width:180px;max-width:280px">'
+                            f'<span style="color:{_oc};font-size:10px;line-height:1.5">🦅 {v2}</span></div>')
+                else:
+                    cell = f'<span style="color:{TXT_SOFT};font-size:10px">—</span>'
             elif col=="Lectura":
                 v2=str(val); cell=f'<span style="color:{TXT_MUT};font-size:11px">{v2[:70]}{"…" if len(v2)>70 else ""}</span>'
             elif col=="Arrastradas":
@@ -4489,7 +4662,7 @@ def render_table(df_sub, show_cols, tab_key="tabla"):
     hdr={"Ticker":"Ticker","Area":"Área","Decision":"Decisión","Fase":"Fase","Trigger":"Trigger",
          "Precio":"Precio","Score_Rebote":"Score Rebote","Nivel_Rebote":"Nivel","Detalle_Rebote":"Detalle Score",
          "Prob_NBIS":"Score Rebote","Sim_NBIS":"Nivel","Motivo":"Motivo",
-         "Lectura":"Lectura Trader","Arrastradas":"Arrastradas","Patron_Tipo":"Tipo Patrón","RSI_Dir":"RSI Dir","Lider":"Líder",
+         "Opinion_Trader":"🦅 Opinión Trader","Lectura":"Lectura Trader","Arrastradas":"Arrastradas","Patron_Tipo":"Tipo Patrón","RSI_Dir":"RSI Dir","Lider":"Líder",
          "Score":"Score","RSI":"RSI","Pre_Move":"Pre/Post %","Pre_Vol":"Vol Pre",
          "Post_Vol":"Vol Post","Short_Int":"Short %","DD_pico":"DD Caída","Cat_Fecha":"Catalizador"}
     ths="".join([f"<th>{hdr.get(c,c)}</th>" for c in show_cols])
@@ -5083,8 +5256,8 @@ with st.sidebar:
 df = pd.DataFrame()
 
 # v15 fix: Arrastradas y Lider ahora visibles en todas las tablas
-COLS_MAIN=["Ticker","Score_Rebote","Nivel_Rebote","Etapa_v12","Area","Precio","RSI","DD_pico","Cat_Fecha","Arrastradas","Lider","Prob_NBIS","Motivo","Lectura"]
-COLS_EXT =["Ticker","Score_Rebote","Nivel_Rebote","Etapa_v12","Area","Decision","Precio","Score","RSI","DD_pico","Cat_Fecha","Arrastradas","Lider","Prob_NBIS","Detalle_Rebote","Motivo","Lectura"]
+COLS_MAIN=["Ticker","Score_Rebote","Nivel_Rebote","Etapa_v12","Area","Precio","RSI","DD_pico","Cat_Fecha","Arrastradas","Lider","Prob_NBIS","Opinion_Trader","Lectura"]
+COLS_EXT =["Ticker","Score_Rebote","Nivel_Rebote","Etapa_v12","Area","Decision","Precio","Score","RSI","DD_pico","Cat_Fecha","Arrastradas","Lider","Prob_NBIS","Detalle_Rebote","Opinion_Trader","Lectura"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -6214,14 +6387,14 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
         rows_html = ""
         cols_wl = ["Ticker","Area","Decision","Fase","Trigger","Precio",
                    "RSI","Volumen","EMA50","MACD","Score","Cat_Fecha",
-                   "Arrastradas","Lider",
+                   "Arrastradas","Lider","Opinion_Trader",
                    "Prob_NBIS","Sim_NBIS","Motivo","Nota","Fuente"]
 
         hdr_names = {
             "Ticker":"Ticker","Area":"Área","Decision":"Decisión","Fase":"Fase",
             "Trigger":"Trigger","Precio":"Precio","RSI":"RSI","Volumen":"Vol %",
             "EMA50":"vs EMA50","MACD":"MACD","Score":"Score","Cat_Fecha":"Earnings",
-            "Arrastradas":"🔗 Arrastra a","Lider":"🏆 Líder",
+            "Arrastradas":"🔗 Arrastra a","Lider":"🏆 Líder","Opinion_Trader":"🦅 Opinión Trader",
             "Prob_NBIS":"Prob NBIS","Sim_NBIS":"Sim. NBIS",
             "Motivo":"Motivo","Nota":"Tu nota","Fuente":"Fuente",
         }
