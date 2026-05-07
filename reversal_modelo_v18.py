@@ -4564,6 +4564,194 @@ def generar_opinion_trader(
 
     return " · ".join(frases_clave[:3])
 
+
+# ─────────────────────────────────────────────────────────────
+#  MEMORIA DE TRADES — Google Sheets v18
+#  Registra entradas/salidas/candidatos automáticamente
+#  Sheet: "GrekoTrader_Memoria_Trades"
+# ─────────────────────────────────────────────────────────────
+
+# ID del Google Sheet de memoria (se crea automáticamente la primera vez)
+_SHEET_NAME = "GrekoTrader_Memoria_Trades"
+_SHEET_HEADERS = [
+    "Fecha_Señal","Ticker","Tipo_Registro","Fase","Precio_Entrada",
+    "Cantidad","Score","Prob_NBIS","Cat_Fecha","Arrastradas","Lider",
+    "Opinion_Trader","Version_Modelo","SPY_RSI",
+    "Fecha_Salida","Precio_Salida","Resultado_Pct","Razon_Salida",
+    "Fue_Correcto","Error_Modelo","Notas"
+]
+
+def _get_sheets_service():
+    """Obtiene el servicio de Google Sheets via MCP."""
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2 import service_account
+        import json, os
+        # Intenta leer credenciales desde secrets de Streamlit
+        if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=["https://www.googleapis.com/auth/spreadsheets",
+                        "https://www.googleapis.com/auth/drive"]
+            )
+            return build("sheets", "v4", credentials=creds)
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _buscar_sheet_id(nombre: str) -> str:
+    """Busca el ID del Google Sheet por nombre."""
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2 import service_account
+        if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=["https://www.googleapis.com/auth/drive.readonly"]
+            )
+            drive = build("drive", "v3", credentials=creds)
+            res = drive.files().list(
+                q=f"name='{nombre}' and mimeType='application/vnd.google-apps.spreadsheet'",
+                fields="files(id,name)"
+            ).execute()
+            files = res.get("files", [])
+            return files[0]["id"] if files else ""
+    except Exception:
+        return ""
+
+def escribir_trade_sheets(
+    tipo: str,          # "ENTRADA","SALIDA","CANDIDATO","T1","STOP"
+    ticker: str,
+    fase: str,
+    precio_entrada: float,
+    cantidad: int = 0,
+    score: int = 0,
+    prob_nbis: float = 0,
+    cat_fecha: str = "-",
+    arrastradas: str = "-",
+    lider: str = "-",
+    opinion: str = "-",
+    precio_salida: float = 0,
+    razon_salida: str = "-",
+    fue_correcto: str = "-",
+    error_modelo: str = "-",
+    notas: str = "",
+) -> tuple:
+    """
+    Escribe una fila en Google Sheets GrekoTrader_Memoria_Trades.
+    Retorna (ok: bool, mensaje: str)
+    """
+    import datetime as _dt
+    hoy = _dt.date.today().isoformat()
+    
+    resultado_pct = ""
+    if precio_salida > 0 and precio_entrada > 0:
+        resultado_pct = round((precio_salida - precio_entrada) / precio_entrada * 100, 2)
+    
+    # SPY RSI del día
+    spy_rsi = ""
+    try:
+        _mkt2 = st.session_state.get("mercado_data", {})
+        spy_rsi = round(float(_mkt2.get("spy", {}).get("rsi", 0)), 1)
+    except Exception:
+        pass
+
+    fila = [
+        hoy, ticker, tipo, fase, precio_entrada,
+        cantidad, score, prob_nbis, cat_fecha, arrastradas, lider,
+        opinion[:100] if opinion else "-",
+        "v18", spy_rsi,
+        hoy if precio_salida > 0 else "-",
+        precio_salida if precio_salida > 0 else "-",
+        resultado_pct,
+        razon_salida, fue_correcto, error_modelo, notas
+    ]
+
+    # Intentar escribir en Google Sheets
+    try:
+        svc = _get_sheets_service()
+        if svc:
+            sheet_id = _buscar_sheet_id(_SHEET_NAME)
+            if not sheet_id:
+                return False, f"Sheet '{_SHEET_NAME}' no encontrado. Créalo en Google Drive."
+            svc.spreadsheets().values().append(
+                spreadsheetId=sheet_id,
+                range="Sheet1!A1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [fila]}
+            ).execute()
+            return True, f"✅ {tipo} de {ticker} registrado en Google Sheets"
+        else:
+            # Fallback: guardar en session_state (local, se pierde al cerrar)
+            if "memoria_trades_local" not in st.session_state:
+                st.session_state["memoria_trades_local"] = []
+            st.session_state["memoria_trades_local"].append(dict(zip(_SHEET_HEADERS, fila)))
+            return True, f"✅ {tipo} de {ticker} guardado localmente (configura Google Sheets para persistir)"
+    except Exception as e:
+        return False, f"❌ Error al guardar: {str(e)[:60]}"
+
+
+def render_boton_registro(
+    ticker: str, fase: str, precio: float, score: int,
+    prob_nbis: float, cat_fecha: str, arrastradas: str,
+    lider: str, opinion: str, key_prefix: str,
+    tipo: str = "ENTRADA"
+):
+    """
+    Renderiza el botón de registro + formulario rápido.
+    Se usa en Tab3 (entrada), Tab2 (candidato), Tab5 (watchlist).
+    """
+    _icon = {"ENTRADA":"💾","CANDIDATO":"📌","SALIDA":"🏁","T1":"✂️","STOP":"🛑"}.get(tipo,"💾")
+    _label = {"ENTRADA":f"💾 Registrar entrada {ticker}",
+              "CANDIDATO":f"📌 Guardar como candidato",
+              "SALIDA":f"🏁 Registrar salida",
+              "T1":f"✂️ Registrar T1 (venta parcial)",
+              "STOP":f"🛑 Registrar stop loss"}.get(tipo, "💾 Registrar")
+
+    with st.expander(f"{_icon} {_label}", expanded=False):
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            _qty = st.number_input("Cantidad acciones", min_value=0,
+                                    value=0, key=f"qty_{key_prefix}_{ticker}")
+            _notas = st.text_input("Notas (opcional)", key=f"notas_{key_prefix}_{ticker}",
+                                    placeholder="ej: entré por earnings próximos")
+        with _c2:
+            if tipo in ("SALIDA","T1","STOP"):
+                _p_sal = st.number_input("Precio salida",
+                    min_value=0.0, value=float(precio), step=0.01,
+                    key=f"psal_{key_prefix}_{ticker}")
+                _razon = st.selectbox("Razón salida",
+                    ["T1 alcanzado","T2 alcanzado","Stop loss","Decisión propia","Earnings","Otro"],
+                    key=f"razon_{key_prefix}_{ticker}")
+                _correcto = st.selectbox("¿Fue correcto?", ["SÍ","NO","PARCIAL"],
+                    key=f"correcto_{key_prefix}_{ticker}")
+                _error = st.text_input("Error del modelo (si aplica)",
+                    key=f"error_{key_prefix}_{ticker}",
+                    placeholder="ej: no detectó dilución")
+            else:
+                _p_sal = 0.0; _razon = "-"; _correcto = "-"; _error = "-"
+
+        if st.button(f"{_icon} Confirmar registro", key=f"btn_reg_{key_prefix}_{ticker}",
+                     use_container_width=True, type="primary"):
+            ok, msg = escribir_trade_sheets(
+                tipo=tipo, ticker=ticker, fase=fase,
+                precio_entrada=float(precio), cantidad=int(_qty),
+                score=score, prob_nbis=prob_nbis,
+                cat_fecha=cat_fecha, arrastradas=arrastradas,
+                lider=lider, opinion=opinion,
+                precio_salida=_p_sal, razon_salida=_razon,
+                fue_correcto=_correcto, error_modelo=_error,
+                notas=_notas,
+            )
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
 def render_table(df_sub, show_cols, tab_key="tabla"):
     if df_sub.empty:
         st.markdown(f'<div style="padding:16px;color:{TXT_MUT};font-size:12px;text-align:center;background:{BG_HEAD};border-radius:10px;border:1px solid {BOR}">- sin resultados -</div>',unsafe_allow_html=True)
@@ -5054,12 +5242,28 @@ def get_spy_filtro() -> dict:
         spy_ayer   = float(close[-1])
         spy_antes  = float(close[-2])
         cambio_pct = round((spy_ayer - spy_antes) / spy_antes * 100, 2)
-        mercado_positivo = spy_ayer >= spy_antes  # >= para días flat (no bloquear)
+        # v18 fix: umbral -0.5% en lugar de 0%
+        # Un -0.31% es ruido normal — no debe bloquear señales
+        # El filtro original era demasiado sensible: -0.01% bloqueaba igual que -2%
+        # Nuevo criterio:
+        #   > -0.5%  → mercado OK (ruido normal, no bloquear)
+        #   -0.5% a -1.5% → advertencia + bloqueo parcial (solo M3 pasa)
+        #   < -1.5%  → bloqueo total (día realmente negativo como 21-25 Abr)
+        if cambio_pct >= -0.5:
+            mercado_positivo = True   # ruido normal — no bloquear
+            nivel = "ok"
+        elif cambio_pct >= -1.5:
+            mercado_positivo = False  # debilidad moderada — bloquear M2
+            nivel = "moderado"
+        else:
+            mercado_positivo = False  # día negativo real — bloqueo total
+            nivel = "negativo"
         return {
             "mercado_positivo": mercado_positivo,
             "spy_ayer":  round(spy_ayer, 2),
             "spy_antes": round(spy_antes, 2),
             "cambio_pct": cambio_pct,
+            "nivel": nivel,   # v18: ok / moderado / negativo
             "fuente": "yfinance"
         }
     except Exception:
@@ -5540,6 +5744,31 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
     cols_con_senal = cols_show.copy() if cols_show else list(df_show.columns)
     if "Señal modelo" not in cols_con_senal:
         cols_con_senal = ["Ticker","Señal modelo"] + [c for c in cols_con_senal if c not in ("Ticker","Señal modelo")]
+
+    # ── BOTÓN REGISTRO v18 — guardar señal como candidato ──────────
+    if not df_show.empty:
+        _reg_col1, _reg_col2 = st.columns([2,3])
+        with _reg_col1:
+            _reg_tk = st.selectbox(
+                "💾 Registrar señal",
+                ["— seleccionar ticker —"] + list(df_show["Ticker"].unique()),
+                key=f"reg_sel_{tab_key}",
+                help="Guarda esta señal en tu memoria de trades (Google Sheets)"
+            )
+        if _reg_tk != "— seleccionar ticker —":
+            _rr = df_show[df_show["Ticker"]==_reg_tk].iloc[0]
+            render_boton_registro(
+                ticker=_reg_tk,
+                fase=str(_rr.get("Etapa_v12",_rr.get("Fase",""))),
+                precio=float(_rr.get("Precio",0)),
+                score=int(_rr.get("Score",_rr.get("Score_Rebote",0))),
+                prob_nbis=float(_rr.get("Prob_NBIS",0)),
+                cat_fecha=str(_rr.get("Cat_Fecha","-")),
+                arrastradas=str(_rr.get("Arrastradas","-")),
+                lider=str(_rr.get("Lider","-")),
+                opinion=str(_rr.get("Opinion_Trader","-")),
+                key_prefix=tab_key, tipo="CANDIDATO",
+            )
 
     render_table(df_show, cols_con_senal, tab_key=tab_key)
 
@@ -6042,31 +6271,55 @@ with tab2:
     _spy_src  = _spy["fuente"]
 
     if _spy_src not in ("sin_datos", "error"):
-        if not _mkt_ok:
+        _spy_nivel = _spy.get("nivel", "ok")
+        if _spy_nivel == "negativo":
+            # SPY < -1.5% — bloqueo total justificado (como 21-25 Abr)
             st.markdown(
                 f'<div style="background:#FEF2F2;border:2px solid #EF4444;border-radius:12px;'
                 f'padding:16px 20px;margin-bottom:12px">'
                 f'<div style="font-size:14px;font-weight:800;color:#DC2626">'
-                f'🚫 FILTRO SPY - Mercado Negativo</div>'
+                f'🚫 FILTRO SPY — Mercado Negativo ({_spy_chg:+.2f}%)</div>'
                 f'<div style="font-size:12px;color:#7F1D1D;margin-top:4px">'
-                f'SPY cerró {_spy_chg:+.2f}% ayer -> Señales M2 bloqueadas. '
-                f'Solo se muestran M3 confirmadas si las hay.</div>'
+                f'SPY cayó {_spy_chg:.1f}% ayer — caída real. Señales M2 bloqueadas. '
+                f'Solo M3 confirmadas pasan. Espera un día verde antes de entrar.</div>'
                 f'<div style="font-size:11px;color:#991B1B;margin-top:4px">'
-                f'Este filtro habría bloqueado las entradas de la semana del 21-25 Abr. '
-                f'Espera un día verde en SPY antes de entrar.</div>'
+                f'Este nivel (-1.5%) es comparable al 21-25 Abr. Bloqueo justificado.</div>'
+                f'</div>', unsafe_allow_html=True)
+        elif _spy_nivel == "moderado":
+            # SPY -0.5% a -1.5% — advertencia pero no catastrófico
+            st.markdown(
+                f'<div style="background:#FFFBEB;border:2px solid #FCD34D;border-radius:12px;'
+                f'padding:14px 18px;margin-bottom:12px">'
+                f'<div style="font-size:13px;font-weight:800;color:#D97706">'
+                f'⚠️ SPY débil ayer ({_spy_chg:+.2f}%) — señales M2 con precaución</div>'
+                f'<div style="font-size:12px;color:#92400E;margin-top:4px">'
+                f'Debilidad moderada. Las señales M2 se muestran pero considera '
+                f'reducir el tamaño de posición al 50%. M3 confirmadas: sin restricción.</div>'
                 f'</div>', unsafe_allow_html=True)
         else:
+            # SPY > -0.5% — OK (incluye -0.31% de hoy)
+            _color_ok = "#16A34A" if _spy_chg >= 0 else "#D97706"
+            _icon_ok  = "✅" if _spy_chg >= 0 else "🟡"
             st.markdown(
                 f'<div style="background:#F0FDF4;border:1px solid #86EFAC;border-radius:8px;'
                 f'padding:10px 16px;margin-bottom:10px">'
-                f'<span style="font-size:12px;font-weight:700;color:#16A34A">'
-                f'✅ Mercado positivo - SPY {_spy_chg:+.2f}% ayer  - Señales M2 habilitadas</span>'
+                f'<span style="font-size:12px;font-weight:700;color:{_color_ok}">'
+                f'{_icon_ok} SPY {_spy_chg:+.2f}% ayer — mercado OK · Señales M2 habilitadas</span>'
+                f'<span style="font-size:10px;color:#6B7280;margin-left:8px">'
+                f'(variaciones entre -0.5% y +∞ son ruido normal, no bloquean)</span>'
                 f'</div>', unsafe_allow_html=True)
 
-    # Filtrar M2 si mercado negativo (dejar solo M3)
-    if sw_result is not None and not _mkt_ok and not sw_result.empty:
+    # v18 fix: filtrar M2 solo si mercado REALMENTE negativo (<-1.5%)
+    # Antes: -0.31% bloqueaba igual que -2% → demasiado sensible
+    _spy_nivel_sw = _spy.get("nivel","ok")
+    if sw_result is not None and _spy_nivel_sw == "negativo" and not sw_result.empty:
+        # Bloqueo total: solo M3 (4+ días alcistas)
         sw_result_display = sw_result[sw_result["Dias_Alcistas"] >= 4].copy()
+    elif sw_result is not None and _spy_nivel_sw == "moderado" and not sw_result.empty:
+        # Bloqueo parcial: M2 débiles se filtran (score > 50 pasa)
+        sw_result_display = sw_result[sw_result.get("Score_Rebote", 0) >= 45].copy()                             if "Score_Rebote" in sw_result.columns else sw_result
     else:
+        # OK o ruido normal: sin filtro
         sw_result_display = sw_result
 
     if sw_result is None:
@@ -6331,6 +6584,27 @@ with tab2:
                 f'{r["Lectura"]}</div>'
                 f'</div>', unsafe_allow_html=True)
 
+        # ── v18: Registro candidato Swing ────────────────────
+        _sw_res2 = st.session_state.get("scan_swing")
+        if _sw_res2 is not None and not _sw_res2.empty:
+            with st.expander("📌 Registrar candidato swing en Google Sheets", expanded=False):
+                _tk_sw = st.selectbox("Ticker candidato",
+                    ["— seleccionar —"] + list(_sw_res2["Ticker"].unique()),
+                    key="sel_swing_tab2")
+                if _tk_sw and _tk_sw != "— seleccionar —":
+                    _rw = _sw_res2[_sw_res2["Ticker"]==_tk_sw].iloc[0]
+                    render_boton_registro(
+                        ticker=_tk_sw, fase="Swing",
+                        precio=float(_rw.get("Precio",0)),
+                        score=int(_rw.get("Score_Rebote",0)),
+                        prob_nbis=float(_rw.get("Prob_NBIS",0)),
+                        cat_fecha=str(_rw.get("Cat_Fecha","-")),
+                        arrastradas=str(_rw.get("Arrastradas","-")),
+                        lider=str(_rw.get("Lider","-")),
+                        opinion=str(_rw.get("Lectura","-")),
+                        key_prefix="tab2", tipo="CANDIDATO"
+                    )
+
         # Exportar
         sw_export = sw_result[["Ticker","Area","Precio","RSI","Dias_Alcistas",
                                 "Momentum_3d","DD_pico","Stop_Swing","Target_1","Target_2","Beta","Lectura"]]
@@ -6386,6 +6660,36 @@ with tab3:
         prob_nbis_min=35,
         default_sort="Prob_NBIS",
     )
+
+    # ── v18: Registro rápido de entrada en Sheets ───────────
+    _scan_e = st.session_state.get("scan_entrar")
+    if _scan_e is not None and not _scan_e.empty:
+        st.markdown(
+            f'<div style="background:{G_BG};border:1px solid {G_BOR};border-radius:10px;'
+            f'padding:12px 16px;margin-top:10px">'
+            f'<div style="font-size:12px;font-weight:700;color:{G};margin-bottom:8px">'
+            f'💾 Registrar entrada en Google Sheets</div>',
+            unsafe_allow_html=True)
+        _tk_sel_e = st.selectbox(
+            "Ticker a registrar",
+            options=["— seleccionar —"] + list(_scan_e["Ticker"].unique()),
+            key="sel_entrada_tab3"
+        )
+        if _tk_sel_e and _tk_sel_e != "— seleccionar —":
+            _row_e = _scan_e[_scan_e["Ticker"]==_tk_sel_e].iloc[0]
+            render_boton_registro(
+                ticker=_tk_sel_e,
+                fase=str(_row_e.get("Etapa_v12","-")),
+                precio=float(_row_e.get("Precio",0)),
+                score=int(_row_e.get("Score",0)),
+                prob_nbis=float(_row_e.get("Prob_NBIS",0)),
+                cat_fecha=str(_row_e.get("Cat_Fecha","-")),
+                arrastradas=str(_row_e.get("Arrastradas","-")),
+                lider=str(_row_e.get("Lider","-")),
+                opinion=str(_row_e.get("Opinion_Trader","-")),
+                key_prefix="tab3", tipo="ENTRADA"
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ══ TAB 4 - SYMPATHY ═══════════════════════════════════════════
@@ -6723,7 +7027,34 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 
             st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Cards de oportunidades encontradas en watchlist ─────
+        # ── v18: Registro entrada desde Watchlist ────────────
+        if wl_res_df is not None and not wl_res_df.empty:
+            st.markdown(
+                f'<div style="background:{G_BG};border:1px solid {G_BOR};border-radius:10px;'
+                f'padding:12px 16px;margin-top:10px">'
+                f'<div style="font-size:12px;font-weight:700;color:{G};margin-bottom:8px">'
+                f'💾 Registrar entrada en Google Sheets</div>',
+                unsafe_allow_html=True)
+            _tk_wl_reg = st.selectbox(
+                "Ticker a registrar",
+                ["— seleccionar —"] + list(wl_res_df["Ticker"].unique()),
+                key="sel_wl_reg"
+            )
+            if _tk_wl_reg and _tk_wl_reg != "— seleccionar —":
+                _rw_wl = wl_res_df[wl_res_df["Ticker"]==_tk_wl_reg].iloc[0]
+                render_boton_registro(
+                    ticker=_tk_wl_reg,
+                    fase=str(_rw_wl.get("Fase","-")),
+                    precio=float(_rw_wl.get("Precio",0)),
+                    score=int(_rw_wl.get("Score",0)),
+                    prob_nbis=float(_rw_wl.get("Prob_NBIS",0)),
+                    cat_fecha=str(_rw_wl.get("Cat_Fecha","-")),
+                    arrastradas=str(_rw_wl.get("Arrastradas","-")),
+                    lider=str(_rw_wl.get("Lider","-")),
+                    opinion=str(_rw_wl.get("Opinion_Trader","-")),
+                    key_prefix="tab5", tipo="ENTRADA"
+                )
+            st.markdown('</div>', unsafe_allow_html=True)
         wl_entrar = wl_res_df[wl_res_df["Decision"].isin(["ENTRAR","ANTICIPAR"])].sort_values("Score",ascending=False) if "Score" in wl_res_df.columns else wl_res_df[wl_res_df["Decision"].isin(["ENTRAR","ANTICIPAR"])]
         if not wl_entrar.empty:
             st.markdown(f'<div style="font-size:13px;font-weight:700;color:{G};margin:16px 0 10px">✅ Oportunidades detectadas en tu watchlist</div>',unsafe_allow_html=True)
@@ -7324,6 +7655,24 @@ También puedes descargar la plantilla de abajo y completarla.
                     f'<div style="font-size:11px;color:#374151;line-height:1.6">{_pir["razon"]}</div>'
                     f'</div>', unsafe_allow_html=True)
 
+            # ── v18: Botón de salida / T1 / Stop ─────────────
+            with st.expander(f"🏁 Registrar salida / T1 / Stop — {tk}", expanded=False):
+                _tipo_sal = st.radio("Tipo de cierre",
+                    ["T1 — venta parcial","SALIDA — cierre total","STOP — stop loss"],
+                    horizontal=True, key=f"tipo_sal_{tk}")
+                _tipo_map = {"T1 — venta parcial":"T1","SALIDA — cierre total":"SALIDA","STOP — stop loss":"STOP"}
+                render_boton_registro(
+                    ticker=tk, fase=str(r.get("Etapa_v12","-")),
+                    precio=float(pc), score=int(r.get("Score",0)),
+                    prob_nbis=float(r.get("Prob_NBIS",0)),
+                    cat_fecha=str(r.get("Cat_Fecha","-")),
+                    arrastradas=str(get_sympathy(tk)["arrastradas"]),
+                    lider=str(get_sympathy(tk)["lider"]),
+                    opinion=str(r.get("Opinion_Trader","-")),
+                    key_prefix=f"pos6_{tk}",
+                    tipo=_tipo_map.get(_tipo_sal,"SALIDA")
+                )
+
             st.markdown('</div>',unsafe_allow_html=True)  # cierra pos-card
 
         # ── Alerta concentración sectorial ──────────────────
@@ -7804,6 +8153,31 @@ with tab7:
                 render_pre_post_bar(tk, pa, G, A, R, TXT_MUT, TXT_SOFT, BG_HEAD, BOR),
                 unsafe_allow_html=True)
 
+            # ── REGISTRO EN GOOGLE SHEETS (Amparito) v18 ────
+            _col_reg_a1, _col_reg_a2 = st.columns(2)
+            with _col_reg_a1:
+                render_boton_registro(
+                    ticker=tk, fase=str(r.get("Etapa_v12",r.get("Fase","M2"))),
+                    precio=pa, score=int(r.get("Score",0)),
+                    prob_nbis=float(r.get("Prob_NBIS",0)),
+                    cat_fecha=str(r.get("Cat_Fecha","-")),
+                    arrastradas=str(_symp_pos_a.get("arrastradas","-")),
+                    lider=str(_symp_pos_a.get("lider","-")),
+                    opinion=str(r.get("Opinion_Trader","-")),
+                    key_prefix=f"amp_{tk}", tipo="ENTRADA",
+                )
+            with _col_reg_a2:
+                render_boton_registro(
+                    ticker=tk, fase=str(r.get("Etapa_v12",r.get("Fase",""))),
+                    precio=pa, score=int(r.get("Score",0)),
+                    prob_nbis=float(r.get("Prob_NBIS",0)),
+                    cat_fecha=str(r.get("Cat_Fecha","-")),
+                    arrastradas=str(_symp_pos_a.get("arrastradas","-")),
+                    lider=str(_symp_pos_a.get("lider","-")),
+                    opinion=str(r.get("Opinion_Trader","-")),
+                    key_prefix=f"amp_sal_{tk}", tipo="SALIDA",
+                )
+
             # ── PIRAMIDACIÓN v18 (Amparito) ──────────────────
             _pir_a = analisis.get("piramidar") if analisis else None
             if _pir_a:
@@ -7820,6 +8194,24 @@ with tab7:
                     f'</div>'
                     f'<div style="font-size:11px;color:#374151;line-height:1.6">{_pir_a["razon"]}</div>'
                     f'</div>', unsafe_allow_html=True)
+
+            # ── v18: Botón salida Amparito ───────────────────
+            with st.expander(f"🏁 Registrar salida — {tk}", expanded=False):
+                _ts_a = st.radio("Tipo cierre",
+                    ["T1 — venta parcial","SALIDA — cierre total","STOP — stop loss"],
+                    horizontal=True, key=f"tipo_sal_amp_{tk}")
+                _tm_a = {"T1 — venta parcial":"T1","SALIDA — cierre total":"SALIDA","STOP — stop loss":"STOP"}
+                render_boton_registro(
+                    ticker=tk, fase=str(r.get("Etapa_v12","-")),
+                    precio=float(pc), score=int(r.get("Score",0)),
+                    prob_nbis=float(r.get("Prob_NBIS",0)),
+                    cat_fecha=str(r.get("Cat_Fecha","-")),
+                    arrastradas=str(get_sympathy(tk)["arrastradas"]),
+                    lider=str(get_sympathy(tk)["lider"]),
+                    opinion=str(r.get("Opinion_Trader","-")),
+                    key_prefix=f"pos7_{tk}",
+                    tipo=_tm_a.get(_ts_a,"SALIDA")
+                )
 
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
@@ -8342,9 +8734,81 @@ with tab9:
                     use_container_width=True)
 
     # ════════════════════════════════════════════════════════
-    # SECCIÓN 2 — ATR SIZING
+    # SECCIÓN EXPORTACIÓN SEMANAL — memoria de trades
     # ════════════════════════════════════════════════════════
-    else:
+    st.markdown("---")
+    st.markdown(
+        f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:8px">'
+        f'📤 Exportación semanal — memoria de trades</div>',
+        unsafe_allow_html=True)
+
+    _exp_col1, _exp_col2, _exp_col3 = st.columns(3)
+    with _exp_col1:
+        # Exportar señales del modelo (candidatos guardados)
+        _local_trades = st.session_state.get("memoria_trades_local", [])
+        if _local_trades:
+            import pandas as _pd_exp, io as _io_exp, datetime as _dt_exp
+            _df_exp = _pd_exp.DataFrame(_local_trades)
+            _csv_exp = _df_exp.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                f"⬇️ Señales del modelo ({len(_local_trades)} registros)",
+                _csv_exp,
+                f"senales_modelo_{_dt_exp.date.today()}.csv",
+                "text/csv", use_container_width=True,
+                help="Señales M2/M3 que guardaste como candidatos esta semana"
+            )
+        else:
+            st.info("Sin señales registradas aún")
+
+    with _exp_col2:
+        # Exportar trades reales (posiciones reales Tab6/7)
+        _pos_mauri = st.session_state.get("posiciones_df_mauri")
+        _pos_amp   = st.session_state.get("posiciones_df_amparito")
+        if _pos_mauri is not None or _pos_amp is not None:
+            import pandas as _pd_pos, datetime as _dt_pos
+            _frames = []
+            if _pos_mauri is not None:
+                _df_m = _pos_mauri.copy(); _df_m["Cartera"] = "Mauri"; _frames.append(_df_m)
+            if _pos_amp is not None:
+                _df_a = _pos_amp.copy(); _df_a["Cartera"] = "Amparito"; _frames.append(_df_a)
+            if _frames:
+                _df_pos_exp = _pd_pos.concat(_frames, ignore_index=True)
+                st.download_button(
+                    "⬇️ Mis posiciones actuales",
+                    _df_pos_exp.to_csv(index=False).encode("utf-8"),
+                    f"posiciones_{_dt_pos.date.today()}.csv",
+                    "text/csv", use_container_width=True,
+                    help="Estado actual de todas tus posiciones con P&L"
+                )
+        else:
+            st.info("Carga tus posiciones primero")
+
+    with _exp_col3:
+        # Botón para limpiar memoria local (después de exportar)
+        if st.button("🗑️ Limpiar memoria local",
+                     key="btn_clear_local", use_container_width=True,
+                     help="Borra las señales guardadas localmente (ya las descargaste)"):
+            st.session_state["memoria_trades_local"] = []
+            st.success("✅ Memoria local limpiada")
+
+    # Instrucción semanal
+    st.markdown(
+        f'<div style="background:#FFFBEB;border:1px solid #FCD34D;border-radius:8px;'
+        f'padding:10px 14px;font-size:11px;color:#92400E;margin-top:8px">'
+        f'📅 <strong>Rutina semanal recomendada (lunes, 10 min):</strong> '
+        f'1) Descargar "Señales del modelo" · '
+        f'2) Descargar "Mis posiciones" · '
+        f'3) Pegar ambos en Google Sheets "GrekoTrader_Memoria" · '
+        f'4) Actualizar campo Error_Modelo para señales que fallaron · '
+        f'5) Limpiar memoria local'
+        f'</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════
+    # SECCIÓN 2 — ATR SIZING (else del radio _tool)
+    # ════════════════════════════════════════════════════════
+    if "ATR Sizing" in _tool:
         st.markdown(
             f'<div class="info-box">'
             f'<strong>¿Qué es el ATR Sizing?</strong> El ATR (Average True Range) mide '
