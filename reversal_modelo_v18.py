@@ -4895,17 +4895,28 @@ def render_table(df_sub, show_cols, tab_key="tabla"):
             elif col=="Opinion_Trader":
                 v2 = str(val) if val and str(val) not in ("-","","nan") else ""
                 if v2:
-                    # Color según contenido
                     _oc = G if any(x in v2 for x in ["M3","ENTRAR","confirmado","institucional"]) else \
                           C if any(x in v2 for x in ["Pre-señal","preparación","recién"]) else \
                           A if any(x in v2 for x in ["M2","M1","vigilar","esperar"]) else TXT_MUT
+                    # v18 fix: word-wrap + max-width contenida para no solaparse con Lectura
+                    _txt_short = v2[:120] + ("…" if len(v2) > 120 else "")
                     cell = (f'<div style="background:{BG_HEAD};border-left:3px solid {_oc};'
-                            f'border-radius:0 6px 6px 0;padding:4px 8px;min-width:180px;max-width:280px">'
-                            f'<span style="color:{_oc};font-size:10px;line-height:1.5">🦅 {v2}</span></div>')
+                            f'border-radius:0 6px 6px 0;padding:4px 8px;'
+                            f'width:200px;max-width:200px;'
+                            f'word-wrap:break-word;overflow-wrap:break-word;'
+                            f'white-space:normal;overflow:hidden">'
+                            f'<span style="color:{_oc};font-size:10px;line-height:1.4">'
+                            f'🦅 {_txt_short}</span></div>')
                 else:
                     cell = f'<span style="color:{TXT_SOFT};font-size:10px">—</span>'
             elif col=="Lectura":
-                v2=str(val); cell=f'<span style="color:{TXT_MUT};font-size:11px">{v2[:70]}{"…" if len(v2)>70 else ""}</span>'
+                v2=str(val)
+                # v18 fix: Lectura también contenida para no solaparse con Opinion_Trader
+                _lect_short = v2[:60] + ("…" if len(v2) > 60 else "")
+                cell = (f'<div style="width:160px;max-width:160px;'
+                        f'word-wrap:break-word;overflow-wrap:break-word;'
+                        f'white-space:normal">'
+                        f'<span style="color:{TXT_MUT};font-size:10px">{_lect_short}</span></div>')
             elif col=="Arrastradas":
                 if val and str(val) not in ("-","","nan"):
                     # v15: chips con tooltip "arrastra a X"
@@ -7214,8 +7225,10 @@ También puedes descargar la plantilla de abajo y completarla.
         if externos:
             st.info(f"🔄 Cargando datos para: {', '.join(externos)} - puede tomar unos segundos si hay internet...")
 
-        for _,pos in posiciones_df.iterrows():
+        for _loop_idx_6a, (_,pos) in enumerate(posiciones_df.iterrows()):
             tk  = str(pos["Ticker"]).upper()
+            # v18 fix: unique key suffix per row to avoid duplicate widget keys
+            _tk_key_6a = f"{tk}_{_loop_idx_6a}"
             pc  = float(pos["Precio_Compra"])
             qty = int(pos["Cantidad"])
             fch = str(pos.get("Fecha","-"))
@@ -7659,7 +7672,7 @@ También puedes descargar la plantilla de abajo y completarla.
             with st.expander(f"🏁 Registrar salida / T1 / Stop — {tk}", expanded=False):
                 _tipo_sal = st.radio("Tipo de cierre",
                     ["T1 — venta parcial","SALIDA — cierre total","STOP — stop loss"],
-                    horizontal=True, key=f"tipo_sal_{tk}")
+                    horizontal=True, key=f"tipo_sal_{_tk_key_6a}")
                 _tipo_map = {"T1 — venta parcial":"T1","SALIDA — cierre total":"SALIDA","STOP — stop loss":"STOP"}
                 render_boton_registro(
                     ticker=tk, fase=str(r.get("Etapa_v12","-")),
@@ -7669,7 +7682,7 @@ También puedes descargar la plantilla de abajo y completarla.
                     arrastradas=str(get_sympathy(tk)["arrastradas"]),
                     lider=str(get_sympathy(tk)["lider"]),
                     opinion=str(r.get("Opinion_Trader","-")),
-                    key_prefix=f"pos6_{tk}",
+                    key_prefix=f"pos6_{_tk_key_6a}",
                     tipo=_tipo_map.get(_tipo_sal,"SALIDA")
                 )
 
@@ -7704,9 +7717,11 @@ También puedes descargar la plantilla de abajo y completarla.
 
             # ── Botón A: Exportar análisis completo (como v11) ──────
             export_rows = []
-            for _, pos in posiciones_df.iterrows():
+            for _loop_idx_6b, (_, pos) in enumerate(posiciones_df.iterrows()):
                 try:
                     tk  = str(pos["Ticker"]).upper()
+                    # v18 fix: unique key suffix to avoid duplicate widget keys
+                    _tk_key = f"{tk}_b{_loop_idx_6b}"  # "b" prefix distinguishes from loop1
                     pc  = float(pos["Precio_Compra"])
                     qty = float(pos.get("Cantidad", 1))
                     r   = get_row_for_ticker(tk, pc)
@@ -7936,8 +7951,9 @@ with tab7:
     if amp_df is not None and len(amp_df) > 0:
         total_inv_a=0; total_act_a=0; total_pnl_a=0; n_ok_a=0
 
-        for _,pos in amp_df.iterrows():
+        for _idx_t7, (_,pos) in enumerate(amp_df.iterrows()):
             tk  = str(pos["Ticker"]).upper()
+            _tk_key_t7 = f"{tk}_t7{_idx_t7}"  # v18: "t7" prefix avoids collision with Tab6 per row
             pc  = float(pos["Precio_Compra"])
             qty = float(pos["Cantidad"])
             fch = str(pos.get("Fecha","-"))
@@ -8164,7 +8180,7 @@ with tab7:
                     arrastradas=str(_symp_pos_a.get("arrastradas","-")),
                     lider=str(_symp_pos_a.get("lider","-")),
                     opinion=str(r.get("Opinion_Trader","-")),
-                    key_prefix=f"amp_{tk}", tipo="ENTRADA",
+                    key_prefix=f"amp_{_tk_key_t7}", tipo="ENTRADA",
                 )
             with _col_reg_a2:
                 render_boton_registro(
@@ -8175,7 +8191,7 @@ with tab7:
                     arrastradas=str(_symp_pos_a.get("arrastradas","-")),
                     lider=str(_symp_pos_a.get("lider","-")),
                     opinion=str(r.get("Opinion_Trader","-")),
-                    key_prefix=f"amp_sal_{tk}", tipo="SALIDA",
+                    key_prefix=f"amp_sal_{_tk_key_t7}", tipo="SALIDA",
                 )
 
             # ── PIRAMIDACIÓN v18 (Amparito) ──────────────────
@@ -8199,7 +8215,7 @@ with tab7:
             with st.expander(f"🏁 Registrar salida — {tk}", expanded=False):
                 _ts_a = st.radio("Tipo cierre",
                     ["T1 — venta parcial","SALIDA — cierre total","STOP — stop loss"],
-                    horizontal=True, key=f"tipo_sal_amp_{tk}")
+                    horizontal=True, key=f"tipo_sal_amp_{_tk_key_t7}")
                 _tm_a = {"T1 — venta parcial":"T1","SALIDA — cierre total":"SALIDA","STOP — stop loss":"STOP"}
                 render_boton_registro(
                     ticker=tk, fase=str(r.get("Etapa_v12","-")),
@@ -8209,7 +8225,7 @@ with tab7:
                     arrastradas=str(get_sympathy(tk)["arrastradas"]),
                     lider=str(get_sympathy(tk)["lider"]),
                     opinion=str(r.get("Opinion_Trader","-")),
-                    key_prefix=f"pos7_{tk}",
+                    key_prefix=f"pos7_{_tk_key_t7}",
                     tipo=_tm_a.get(_ts_a,"SALIDA")
                 )
 
