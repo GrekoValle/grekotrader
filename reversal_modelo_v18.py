@@ -1123,53 +1123,127 @@ def render_pre_post_bar(ticker: str, precio_actual: float,
                         TXT_MUT: str, TXT_SOFT: str,
                         BG_HEAD: str, BOR: str) -> str:
     """
-    Genera HTML con Pre/Post Market y volumen para un ticker.
-    Se llama desde cada tarjeta del scanner.
+    v18: Pre/Post Market con interpretación de trader.
+    No solo muestra el % — explica qué hacer con el gap.
     """
     d = fetch_pre_post(ticker)
 
     def vol_semaforo(ratio):
         if ratio is None: return "⚪", TXT_MUT, "Sin datos"
-        if ratio >= 200:  return "🟢", G,       f"{ratio:.0f}% del promedio - Alto"
-        if ratio >= 120:  return "🟡", A,        f"{ratio:.0f}% del promedio - Normal"
-        return "🔴", R, f"{ratio:.0f}% del promedio - Bajo"
+        if ratio >= 200:  return "🟢", G,       f"{ratio:.0f}% — institucional"
+        if ratio >= 120:  return "🟡", A,        f"{ratio:.0f}% — normal"
+        return "🔴", R, f"{ratio:.0f}% — bajo"
 
     def chg_semaforo(chg):
         if chg is None:  return "⚪", TXT_MUT, "Sin datos"
-        if chg >= 3:     return "🟢", G,       f"+{chg:.2f}% - Fuerte"
-        if chg >= 1:     return "🟢", G,       f"+{chg:.2f}% - Positivo"
-        if chg >= 0:     return "🟡", A,        f"+{chg:.2f}% - Plano"
-        if chg >= -1:    return "🟡", A,        f"{chg:.2f}% - Leve baja"
-        return "🔴", R, f"{chg:.2f}% - Negativo"
+        if chg >= 5:     return "🔴", R,       f"+{chg:.1f}% — gap extremo"
+        if chg >= 2:     return "🟡", A,        f"+{chg:.1f}% — gap moderado"
+        if chg >= 0.5:   return "🟢", G,       f"+{chg:.1f}% — positivo"
+        if chg >= -0.5:  return "⚪", TXT_MUT, f"{chg:.1f}% — plano"
+        if chg >= -2:    return "🟡", A,        f"{chg:.1f}% — leve baja"
+        return "🔴", R, f"{chg:.1f}% — gap negativo"
+
+    # ── Interpretación del gap (la parte nueva v18) ──────────
+    def interpretar_gap(chg, vol_ratio) -> tuple:
+        """
+        Retorna (semaforo, consejo) según el tipo de gap.
+        Basado en las 5 reglas del pre-market.
+        """
+        if chg is None:
+            return "⚪", "Sin datos pre-market disponibles"
+
+        abs_chg = abs(chg)
+
+        if abs_chg > 8:
+            return ("🚫",
+                "Gap extremo (>8%) — tierra de nadie. "
+                "Primeros 30 min son muy volátiles. "
+                "Esperar que el precio se estabilice antes de entrar. "
+                "Caso IREN hoy: abrió +8%, osciló $18 en el día.")
+        elif abs_chg > 5:
+            return ("⚠️",
+                f"Gap {'positivo' if chg>0 else 'negativo'} fuerte ({chg:+.1f}%). "
+                "Regla: esperar 15-30 min y ver si MANTIENE el nivel. "
+                "Si el precio del primer minuto > precio pre-market → fuerza real. "
+                "Si retrocede en los primeros minutos → no perseguir.")
+        elif abs_chg > 2:
+            return ("🟡",
+                f"Gap moderado ({chg:+.1f}%). "
+                "Válido si la acción ya estaba en M2/M3 antes del gap. "
+                "Confirmar con volumen: si Vol > 150% del promedio → señal real. "
+                f"Volumen actual: {vol_ratio:.0f}% del promedio." if vol_ratio else
+                f"Gap moderado ({chg:+.1f}%). Confirmar con volumen al abrir.")
+        elif chg > 0.3:
+            return ("✅",
+                f"Gap de continuación ({chg:+.1f}%). "
+                "Tipo más seguro para entrar. "
+                "Si la acción tiene señal M2/M3 y el gap es pequeño → "
+                "puede entrar en apertura o en el primer pull-back.")
+        elif chg > -0.3:
+            return ("⚪", "Sin gap significativo — acción abre plana.")
+        else:
+            return ("🔴",
+                f"Gap negativo ({chg:+.1f}%). "
+                "Señal de debilidad. Si tenías posición → "
+                "revisar si el motivo de la baja cambia la tesis.")
 
     pre_ico,  pre_c,  pre_txt  = chg_semaforo(d["pre_chg"])
     post_ico, post_c, post_txt = chg_semaforo(d["post_chg"])
     vol_ico,  vol_c,  vol_txt  = vol_semaforo(d["vol_ratio"])
 
-    pre_precio  = f"${d['pre_price']:.2f}"  if d["pre_price"]  else "Sin datos"
-    post_precio = f"${d['post_price']:.2f}" if d["post_price"] else "Sin datos"
+    # Gap activo — pre-market si hay datos, sino post-market
+    gap_activo = d["pre_chg"] if d["pre_chg"] is not None else d["post_chg"]
+    gap_ico, gap_consejo = interpretar_gap(gap_activo, d["vol_ratio"] or 100)
+    es_pre = d["pre_chg"] is not None
+    gap_label = "PRE-MARKET" if es_pre else "POST-MARKET"
+
+    pre_precio  = f"${d['pre_price']:.2f}"  if d["pre_price"]  else "—"
+    post_precio = f"${d['post_price']:.2f}" if d["post_price"] else "—"
+
+    # Color del panel de interpretación
+    if gap_ico == "🚫":
+        panel_bg, panel_bor, panel_c = "#FEF2F2", "#FCA5A5", "#DC2626"
+    elif gap_ico == "⚠️":
+        panel_bg, panel_bor, panel_c = "#FFFBEB", "#FCD34D", "#D97706"
+    elif gap_ico == "✅":
+        panel_bg, panel_bor, panel_c = "#F0FDF4", "#86EFAC", "#16A34A"
+    else:
+        panel_bg, panel_bor, panel_c = BG_HEAD, BOR, TXT_MUT
 
     html = (
-        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:8px">'+
+        f'<div style="margin-top:8px">'
+        # Fila superior: Pre / Post / Volumen
+        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:6px">'
         # Pre-Market
-        f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:8px;padding:7px 10px">'+
-        f'<div style="font-size:9px;color:{TXT_MUT};font-weight:700;margin-bottom:2px">PRE-MARKET</div>'+
-        f'<div style="font-size:12px;font-weight:700;color:{pre_c}">{pre_ico} {pre_precio}</div>'+
-        f'<div style="font-size:10px;color:{pre_c}">{pre_txt}</div>'+
-        f'</div>'+
-        # Post-Market
-        f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:8px;padding:7px 10px">'+
-        f'<div style="font-size:9px;color:{TXT_MUT};font-weight:700;margin-bottom:2px">POST-MARKET</div>'+
-        f'<div style="font-size:12px;font-weight:700;color:{post_c}">{post_ico} {post_precio}</div>'+
-        f'<div style="font-size:10px;color:{post_c}">{post_txt}</div>'+
-        f'</div>'+
-        # Volumen
-        f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:8px;padding:7px 10px">'+
-        f'<div style="font-size:9px;color:{TXT_MUT};font-weight:700;margin-bottom:2px">VOLUMEN HOY</div>'+
-        f'<div style="font-size:12px;font-weight:700;color:{vol_c}">{vol_ico} {vol_txt.split(" - ")[0]}</div>'+
-        f'<div style="font-size:10px;color:{vol_c}">{vol_txt.split(" - ")[1] if " - " in vol_txt else vol_txt}</div>'+
-        f'</div>'+
+        f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:8px;padding:7px 10px">'
+        f'<div style="font-size:9px;color:{TXT_MUT};font-weight:700;margin-bottom:2px">PRE-MARKET</div>'
+        f'<div style="font-size:13px;font-weight:700;color:{pre_c}">{pre_ico} {pre_precio}</div>'
+        f'<div style="font-size:10px;color:{pre_c}">{pre_txt}</div>'
         f'</div>'
+        # Post-Market
+        f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:8px;padding:7px 10px">'
+        f'<div style="font-size:9px;color:{TXT_MUT};font-weight:700;margin-bottom:2px">POST-MARKET</div>'
+        f'<div style="font-size:13px;font-weight:700;color:{post_c}">{post_ico} {post_precio}</div>'
+        f'<div style="font-size:10px;color:{post_c}">{post_txt}</div>'
+        f'</div>'
+        # Volumen
+        f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:8px;padding:7px 10px">'
+        f'<div style="font-size:9px;color:{TXT_MUT};font-weight:700;margin-bottom:2px">VOL HOY</div>'
+        f'<div style="font-size:13px;font-weight:700;color:{vol_c}">{vol_ico} {d["vol_ratio"]:.0f}%</div>'
+        f'<div style="font-size:10px;color:{vol_c}">{vol_txt.split(" — ")[1] if " — " in vol_txt else vol_txt}</div>'
+        f'</div>'
+        f'</div>'
+        # Panel de interpretación del trader
+        + (
+        f'<div style="background:{panel_bg};border:1px solid {panel_bor};'
+        f'border-radius:8px;padding:8px 12px">'
+        f'<div style="font-size:10px;font-weight:800;color:{panel_c};margin-bottom:3px">'
+        f'{gap_ico} {gap_label} — Interpretación del trader</div>'
+        f'<div style="font-size:10px;color:#374151;line-height:1.5">{gap_consejo}</div>'
+        f'</div>'
+        if gap_activo is not None else ""
+        )
+        + f'</div>'
     )
     return html
 
@@ -4572,7 +4646,20 @@ def generar_opinion_trader(
 # ─────────────────────────────────────────────────────────────
 
 # ID del Google Sheet de memoria (se crea automáticamente la primera vez)
-_SHEET_NAME = "GrekoTrader_Memoria_Trades"
+_SHEET_NAME           = "GrekoTrader_Memoria_Trades"
+_SHEET_NAME_SENALES   = "GrekoTrader_Senales_Modelo"
+_SHEET_NAME_TRADES    = "GrekoTrader_Trades_Reales"
+_SHEET_NAME_MAURI     = "GrekoTrader_Posiciones_Mauri"
+_SHEET_NAME_AMPARITO  = "GrekoTrader_Posiciones_Amparito"
+
+# v18: leer Sheet IDs desde Streamlit secrets si están configurados
+def _get_sheet_id_from_secrets(key: str) -> str:
+    """Lee Sheet ID desde st.secrets[sheets][key] si existe."""
+    try:
+        return st.secrets["sheets"][key]
+    except Exception:
+        return ""
+
 _SHEET_HEADERS = [
     "Fecha_Señal","Ticker","Tipo_Registro","Fase","Precio_Entrada",
     "Cantidad","Score","Prob_NBIS","Cat_Fecha","Arrastradas","Lider",
@@ -4621,6 +4708,99 @@ def _buscar_sheet_id(nombre: str) -> str:
             return files[0]["id"] if files else ""
     except Exception:
         return ""
+
+def _buscar_sheet_id(nombre: str) -> str:
+    """Busca el ID del Google Sheet por nombre en Drive o en secrets."""
+    # Primero intentar desde secrets (más rápido, sin llamada a Drive API)
+    _secrets_map = {
+        _SHEET_NAME_MAURI:    "posiciones_mauri_id",
+        _SHEET_NAME_AMPARITO: "posiciones_amparito_id",
+        _SHEET_NAME_SENALES:  "senales_modelo_id",
+        _SHEET_NAME_TRADES:   "trades_reales_id",
+    }
+    if nombre in _secrets_map:
+        _id = _get_sheet_id_from_secrets(_secrets_map[nombre])
+        if _id:
+            return _id
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2 import service_account
+        if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=["https://www.googleapis.com/auth/drive.readonly"]
+            )
+            drive = build("drive", "v3", credentials=creds)
+            res = drive.files().list(
+                q=f"name='{nombre}' and mimeType='application/vnd.google-apps.spreadsheet'",
+                fields="files(id,name)"
+            ).execute()
+            files = res.get("files", [])
+            return files[0]["id"] if files else ""
+    except Exception:
+        return ""
+    return ""
+
+
+@st.cache_data(ttl=60, show_spinner=False)  # refresca cada 1 minuto
+def leer_posiciones_sheets(nombre_sheet: str) -> "pd.DataFrame | None":
+    """
+    v18: Lee posiciones VIVAS desde Google Sheets.
+    Si el Sheet está configurado → usa esos datos (siempre actualizados)
+    Si no → retorna None (usará el CSV subido manualmente)
+
+    Esto hace que ventas, retiros y cambios de cantidad persistan entre sesiones.
+    """
+    try:
+        svc = _get_sheets_service()
+        if not svc:
+            return None
+        sheet_id = _buscar_sheet_id(nombre_sheet)
+        if not sheet_id:
+            return None
+        result = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range="Sheet1!A1:Z1000"
+        ).execute()
+        values = result.get("values", [])
+        if len(values) < 2:
+            return None
+        headers = values[0]
+        rows    = values[1:]
+        # Normalizar filas (algunas pueden tener menos columnas)
+        rows_norm = [r + [""] * (len(headers) - len(r)) for r in rows]
+        df = pd.DataFrame(rows_norm, columns=headers)
+        # Filtrar filas vacías
+        df = df[df["Ticker"].str.strip() != ""]
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def guardar_posicion_sheets(nombre_sheet: str, df: pd.DataFrame) -> tuple:
+    """
+    Actualiza las posiciones en Google Sheets reemplazando todo el contenido.
+    Se llama cuando el usuario registra una venta o modifica una posición.
+    """
+    try:
+        svc = _get_sheets_service()
+        if not svc:
+            return False, "Google Sheets no configurado"
+        sheet_id = _buscar_sheet_id(nombre_sheet)
+        if not sheet_id:
+            return False, f"Sheet '{nombre_sheet}' no encontrado"
+        values = [list(df.columns)] + df.fillna("").values.tolist()
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range="Sheet1!A1",
+            valueInputOption="USER_ENTERED",
+            body={"values": values}
+        ).execute()
+        return True, f"✅ Posiciones actualizadas en Google Sheets"
+    except Exception as e:
+        return False, f"❌ Error: {str(e)[:60]}"
+
 
 def escribir_trade_sheets(
     tipo: str,          # "ENTRADA","SALIDA","CANDIDATO","T1","STOP"
@@ -5528,10 +5708,49 @@ def import_np():
 with st.sidebar:
     st.markdown(f'<div style="font-size:22px;font-weight:800;color:{B}">🦅 GrekoTrader</div>'
             f'<div style="font-size:10px;color:{TXT_MUT};margin-top:2px">'
-            f'v16  - Mayo 2026  - ATR Sizing + Backtesting Real + Dashboard Rendimiento  - '
+            f'v18  - Mayo 2026  - ATR Sizing + Backtesting Real + Dashboard Rendimiento  - '
             f'{len(SCAN_UNIVERSE)} tickers</div>'+
             f'</div>',unsafe_allow_html=True)
     st.markdown(f'<div style="font-size:11px;color:{TXT_MUT};margin-bottom:6px">{datetime.date.today():%d %b %Y}  - Modelo 3 Momentos</div>',unsafe_allow_html=True)
+
+    # ── Estado Google Sheets v18 ─────────────────────────────
+    _gs_configured = (hasattr(st, "secrets") and
+                      "gcp_service_account" in st.secrets and
+                      "sheets" in st.secrets)
+    if _gs_configured:
+        st.markdown(
+            f'<div style="background:#F0FDF4;border:1px solid #86EFAC;border-radius:8px;'
+            f'padding:6px 10px;margin-bottom:6px;font-size:10px;color:#16A34A;font-weight:700">'
+            f'🗄️ Google Sheets conectado — datos persisten</div>',
+            unsafe_allow_html=True)
+    else:
+        with st.expander("⚙️ Configurar Google Sheets", expanded=False):
+            st.markdown("""
+**Para que ventas y registros persistan:**
+
+**Paso 1** — Crear Google Sheet:
+`GrekoTrader_Posiciones_Mauri`
+
+**Paso 2** — Compartir con:
+`grekotrader-sheets@<proyecto>.iam.gserviceaccount.com`
+
+**Paso 3** — En Streamlit Secrets:
+```toml
+[gcp_service_account]
+type = "service_account"
+project_id = "grekotrader"
+private_key = "-----BEGIN..."
+client_email = "..."
+
+[sheets]
+posiciones_mauri_id = "ID_del_sheet"
+posiciones_amparito_id = "ID_del_sheet"
+senales_modelo_id = "ID_del_sheet"
+trades_reales_id = "ID_del_sheet"
+```
+
+📄 Ver guía completa adjunta
+""")
 
     # Badge indicadores live
     if _n_live > 0:
@@ -7140,14 +7359,39 @@ También puedes descargar la plantilla de abajo y completarla.
             key="dl_template",
         )
 
-    # ── Upload ─────────────────────────────────────────────
+    # ── v18: Cargar posiciones VIVAS desde Google Sheets ───────
+    _sheets_mauri = leer_posiciones_sheets(_SHEET_NAME_MAURI)
+    if _sheets_mauri is not None:
+        st.markdown(
+            f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+            f'border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:11px">'
+            f'<span style="font-weight:700;color:#16A34A">✅ Google Sheets conectado</span> — '
+            f'{len(_sheets_mauri)} posiciones cargadas desde <strong>{_SHEET_NAME_MAURI}</strong> · '
+            f'Ventas y retiros persisten automáticamente.</div>',
+            unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f'<div style="background:#FFFBEB;border:1px solid #FCD34D;'
+            f'border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:11px;color:#92400E">'
+            f'⚠️ <strong>Google Sheets no configurado</strong> — las ventas/retiros se perderán al recargar. '
+            f'Sigue la guía PDF adjunta para configurarlo (5 pasos).</div>',
+            unsafe_allow_html=True)
+
+    # ── Upload CSV manual (si no hay Sheets) ────────────────────
     uploaded = st.file_uploader(
-        "📂 Subir archivo CSV con posiciones",
+        "📂 Subir archivo CSV con posiciones" + (" (opcional — ya cargado desde Sheets)" if _sheets_mauri is not None else ""),
         type=["csv"],
         help="Formato: Ticker, Fecha_Compra, Precio_Compra, Cantidad",
     )
 
     posiciones_df = None
+
+    # v18: usar Sheets como fuente primaria si está disponible
+    if _sheets_mauri is not None:
+        posiciones_df = _sheets_mauri.copy()
+        # Normalizar columnas igual que el CSV
+        if "Fecha_Compra" in posiciones_df.columns and "Fecha" not in posiciones_df.columns:
+            posiciones_df = posiciones_df.rename(columns={"Fecha_Compra":"Fecha"})
 
     if uploaded:
         try:
