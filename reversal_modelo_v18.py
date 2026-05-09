@@ -4743,38 +4743,163 @@ def _buscar_sheet_id(nombre: str) -> str:
     return ""
 
 
-@st.cache_data(ttl=60, show_spinner=False)  # refresca cada 1 minuto
+@st.cache_data(ttl=60, show_spinner=False)
 def leer_posiciones_sheets(nombre_sheet: str) -> "pd.DataFrame | None":
     """
-    v18: Lee posiciones VIVAS desde Google Sheets.
-    Si el Sheet está configurado → usa esos datos (siempre actualizados)
-    Si no → retorna None (usará el CSV subido manualmente)
-
-    Esto hace que ventas, retiros y cambios de cantidad persistan entre sesiones.
+    v18 debug: Lee posiciones con diagnóstico paso a paso en session_state.
     """
+    import streamlit as _st
+
+    # Resetear debug log
+    _log = []
+    _st.session_state["sheets_debug_log"] = _log
+
     try:
-        svc = _get_sheets_service()
-        if not svc:
+        # PASO 1: secrets configurados?
+        has_secrets = hasattr(_st, "secrets")
+        has_gcp     = has_secrets and "gcp_service_account" in _st.secrets
+        has_sheets  = has_secrets and "sheets" in _st.secrets
+        _log.append(f"P1 secrets: has_secrets={has_secrets} has_gcp={has_gcp} has_sheets_section={has_sheets}")
+
+        if not has_gcp:
+            _st.session_state["sheets_error"] = "secrets_missing"
+            _log.append("FALLO: gcp_service_account no encontrado en secrets")
             return None
-        sheet_id = _buscar_sheet_id(nombre_sheet)
+
+        # PASO 2: construir credenciales
+        try:
+            from googleapiclient.discovery import build
+            from google.oauth2 import service_account
+            import os
+
+            # v18: SSL workaround para redes con proxy/antivirus (Kaspersky, ESET, etc.)
+            os.environ["PYTHONHTTPSVERIFY"] = "0"
+            os.environ["CURL_CA_BUNDLE"]    = ""
+            os.environ["REQUESTS_CA_BUNDLE"]= ""
+            try:
+                import urllib3
+                urllib3.disable_warnings()
+            except Exception:
+                pass
+
+            creds_dict = dict(_st.secrets["gcp_service_account"])
+            _log.append(f"P2 creds: project={creds_dict.get('project_id','?')} email={creds_dict.get('client_email','?')[:40]}")
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"
+                ]
+            )
+            _log.append("P2 OK: credenciales construidas")
+        except Exception as e2:
+            _st.session_state["sheets_error"] = f"creds_error:{str(e2)[:80]}"
+            _log.append(f"FALLO P2: {e2}")
+            return None
+
+        # PASO 3: obtener Sheet ID
+        sheet_id = ""
+        _id_map = {
+            "GrekoTrader_Posiciones_Mauri":    "posiciones_mauri_id",
+            "GrekoTrader_Posiciones_Amparito": "posiciones_amparito_id",
+            "GrekoTrader_Senales_Modelo":      "senales_modelo_id",
+            "GrekoTrader_Trades_Reales":       "trades_reales_id",
+        }
+        secrets_key = _id_map.get(nombre_sheet, "")
+        _log.append(f"P3 buscando: sheet='{nombre_sheet}' secrets_key='{secrets_key}'")
+
+        if has_sheets and secrets_key:
+            try:
+                sheet_id = str(_st.secrets["sheets"].get(secrets_key, "")).strip()
+                _log.append(f"P3 desde secrets: sheet_id='{sheet_id[:20]}...' " if len(sheet_id)>20 else f"P3 desde secrets: sheet_id='{sheet_id}' (vacío={'SÍ' if not sheet_id else 'NO'})")
+            except Exception as e3a:
+                _log.append(f"P3 secrets error: {e3a}")
+
+        # Si no está en secrets, buscar en Drive
         if not sheet_id:
+            _log.append("P3 sheet_id vacío en secrets → buscando en Drive por nombre")
+            try:
+                drive_svc = build("drive", "v3", credentials=creds)
+                res = drive_svc.files().list(
+                    q=f"name='{nombre_sheet}' and mimeType='application/vnd.google-apps.spreadsheet'",
+                    fields="files(id,name)"
+                ).execute()
+                files = res.get("files", [])
+                _log.append(f"P3 Drive encontró {len(files)} archivo(s) con nombre '{nombre_sheet}'")
+                if files:
+                    sheet_id = files[0]["id"]
+                    _log.append(f"P3 usando: {sheet_id[:20]}...")
+                else:
+                    _st.session_state["sheets_error"] = f"not_found:{nombre_sheet}"
+                    _log.append(f"FALLO P3: Sheet '{nombre_sheet}' no encontrado en Drive")
+                    _log.append("SOLUCIÓN: Compartir el Sheet con el email del service account")
+                    return None
+            except Exception as e3b:
+                _st.session_state["sheets_error"] = f"drive_error:{str(e3b)[:80]}"
+                _log.append(f"FALLO P3 Drive: {e3b}")
+                return None
+
+        # PASO 4: leer datos del Sheet
+        _log.append(f"P4 leyendo sheet_id={sheet_id[:20]}...")
+        try:
+            svc    = build("sheets", "v4", credentials=creds)
+            result = svc.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range="Sheet1!A1:Z1000"
+            ).execute()
+            values = result.get("values", [])
+            _log.append(f"P4 OK: {len(values)} filas leídas (incluyendo header)")
+        except Exception as e4:
+            _st.session_state["sheets_error"] = f"read_error:{str(e4)[:80]}"
+            e4_str = str(e4)
+            _log.append(f"FALLO P4 lectura: {e4_str[:150]}")
+            if "SSL" in e4_str or "CERTIFICATE" in e4_str:
+                _log.append("CAUSA: Error SSL — proxy o antivirus intercepta la conexión")
+                _log.append("SOLUCIÓN: Ver instrucciones de certificado SSL abajo")
+            elif "403" in e4_str:
+                _log.append("CAUSA: Sin permiso — compartir Sheet con grekotrader-sheets@grekotrader.iam.gserviceaccount.com")
+            elif "404" in e4_str:
+                _log.append("CAUSA: Sheet ID incorrecto o Sheet eliminado")
             return None
-        result = svc.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range="Sheet1!A1:Z1000"
-        ).execute()
-        values = result.get("values", [])
+
+        if len(values) < 1:
+            _st.session_state["sheets_error"] = "empty_sheet"
+            _log.append("FALLO: Sheet completamente vacío")
+            return None
         if len(values) < 2:
+            _st.session_state["sheets_error"] = "no_data_rows"
+            _log.append(f"FALLO: Solo headers '{values[0]}', sin filas de datos")
             return None
-        headers = values[0]
-        rows    = values[1:]
-        # Normalizar filas (algunas pueden tener menos columnas)
+
+        # PASO 5: construir DataFrame
+        headers   = values[0]
+        rows      = values[1:]
+        _log.append(f"P5 headers: {headers}")
+        _log.append(f"P5 filas de datos: {len(rows)}")
+
         rows_norm = [r + [""] * (len(headers) - len(r)) for r in rows]
         df = pd.DataFrame(rows_norm, columns=headers)
-        # Filtrar filas vacías
-        df = df[df["Ticker"].str.strip() != ""]
+
+        # Normalizar columna Fecha
+        if "Fecha_Compra" in df.columns and "Fecha" not in df.columns:
+            df = df.rename(columns={"Fecha_Compra": "Fecha"})
+
+        if "Ticker" not in df.columns:
+            _st.session_state["sheets_error"] = "no_ticker_column"
+            _log.append(f"FALLO: No hay columna 'Ticker'. Columnas encontradas: {list(df.columns)}")
+            return None
+
+        df["Ticker"] = df["Ticker"].str.upper().str.strip()
+        df = df[df["Ticker"] != ""]
+        _log.append(f"P5 OK: {len(df)} posiciones cargadas — {list(df['Ticker'])}")
+
+        _st.session_state["sheets_error"] = None
+        _st.session_state["sheets_sheet_id"] = sheet_id
         return df if not df.empty else None
-    except Exception:
+
+    except Exception as e:
+        _st.session_state["sheets_error"] = f"exception:{str(e)[:100]}"
+        _log.append(f"EXCEPCIÓN GLOBAL: {e}")
         return None
 
 
@@ -7361,6 +7486,8 @@ También puedes descargar la plantilla de abajo y completarla.
 
     # ── v18: Cargar posiciones VIVAS desde Google Sheets ───────
     _sheets_mauri = leer_posiciones_sheets(_SHEET_NAME_MAURI)
+    _sheets_error = st.session_state.get("sheets_error")
+
     if _sheets_mauri is not None:
         st.markdown(
             f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
@@ -7369,12 +7496,67 @@ También puedes descargar la plantilla de abajo y completarla.
             f'{len(_sheets_mauri)} posiciones cargadas desde <strong>{_SHEET_NAME_MAURI}</strong> · '
             f'Ventas y retiros persisten automáticamente.</div>',
             unsafe_allow_html=True)
+    elif _sheets_error:
+        # Mostrar diagnóstico específico del error
+        _error_msgs = {
+            "secrets_missing":
+                ("⚙️ Secrets no configurados",
+                 "Ve a Streamlit Cloud → Settings → Secrets y pega el bloque toml."),
+            "not_found:GrekoTrader_Posiciones_Mauri":
+                ("📄 Sheet no encontrado",
+                 f"El Sheet '{_SHEET_NAME_MAURI}' no existe o no está compartido. "
+                 f"Compártelo con el email del service account (ver guía)."),
+            "empty_sheet":
+                ("📋 Sheet vacío",
+                 f"El Sheet existe pero no tiene datos. Agrega tus posiciones en '{_SHEET_NAME_MAURI}'."),
+            "no_data_rows":
+                ("📋 Solo headers, sin posiciones",
+                 f"El Sheet tiene los headers pero no hay filas de datos. "
+                 f"Agrega tus posiciones bajo la fila 1."),
+            "no_ticker_column":
+                ("❌ Columna 'Ticker' no encontrada",
+                 "El Sheet no tiene una columna llamada 'Ticker'. "
+                 "Verifica que la primera fila tenga: Ticker | Precio_Compra | Cantidad | Fecha"),
+        }
+        _title, _detail = _error_msgs.get(
+            _sheets_error,
+            ("❌ Error de conexión",
+             f"Error: {_sheets_error}. Verifica las credenciales y que el Sheet esté compartido.")
+        )
+        st.markdown(
+            f'<div style="background:#FEF2F2;border:1px solid #FCA5A5;'
+            f'border-radius:8px;padding:10px 14px;margin-bottom:8px">'
+            f'<div style="font-size:12px;font-weight:700;color:#DC2626">'
+            f'🔴 Google Sheets: {_title}</div>'
+            f'<div style="font-size:11px;color:#7F1D1D;margin-top:4px">{_detail}</div>'
+            f'<div style="font-size:10px;color:#991B1B;margin-top:6px">'
+            f'Solución rápida: usa el CSV manual mientras resuelves la configuración.</div>'
+            f'</div>', unsafe_allow_html=True)
+
+        # Botón para limpiar cache y reintentar
+        if st.button("🔄 Reintentar conexión a Google Sheets",
+                     key="btn_retry_sheets", use_container_width=False):
+            st.cache_data.clear()
+            st.rerun()
+
+        # ── DEBUG LOG — muestra exactamente dónde falla ─────
+        _debug_log = st.session_state.get("sheets_debug_log", [])
+        if _debug_log:
+            with st.expander("🔍 Ver diagnóstico paso a paso", expanded=True):
+                for step in _debug_log:
+                    _ico = "✅" if step.startswith("P") and "FALLO" not in step else "❌" if "FALLO" in step else "ℹ️"
+                    color = "#16A34A" if _ico == "✅" else "#DC2626" if _ico == "❌" else "#374151"
+                    st.markdown(
+                        f'<div style="font-size:11px;color:{color};'
+                        f'font-family:monospace;padding:2px 0">{_ico} {step}</div>',
+                        unsafe_allow_html=True
+                    )
     else:
         st.markdown(
             f'<div style="background:#FFFBEB;border:1px solid #FCD34D;'
             f'border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:11px;color:#92400E">'
-            f'⚠️ <strong>Google Sheets no configurado</strong> — las ventas/retiros se perderán al recargar. '
-            f'Sigue la guía PDF adjunta para configurarlo (5 pasos).</div>',
+            f'⚠️ <strong>Google Sheets no configurado</strong> — usando CSV manual. '
+            f'Configura los Secrets en Streamlit para persistencia.</div>',
             unsafe_allow_html=True)
 
     # ── Upload CSV manual (si no hay Sheets) ────────────────────
@@ -8829,7 +9011,7 @@ with tab9:
         f'</div></div>', unsafe_allow_html=True)
 
     # ── Selector de herramienta ─────────────────────────────
-    _tool = st.radio("",
+    _tool = st.radio("Selecciona herramienta",
         ["🔬 Backtesting — ¿funcionó el modelo?",
          "📐 ATR Sizing — ¿cuántas acciones comprar?"],
         horizontal=True, label_visibility="collapsed")
