@@ -4651,6 +4651,7 @@ _SHEET_NAME_SENALES   = "GrekoTrader_Senales_Modelo"
 _SHEET_NAME_TRADES    = "GrekoTrader_Trades_Reales"
 _SHEET_NAME_MAURI     = "GrekoTrader_Posiciones_Mauri"
 _SHEET_NAME_AMPARITO  = "GrekoTrader_Posiciones_Amparito"
+_SHEET_NAME_GREKO     = "GrekoTrader_Posiciones_Greko"  # Tab C — paper trading
 
 # v18: leer Sheet IDs desde Streamlit secrets si están configurados
 def _get_sheet_id_from_secrets(key: str) -> str:
@@ -4717,6 +4718,7 @@ def _buscar_sheet_id(nombre: str) -> str:
         _SHEET_NAME_AMPARITO: "posiciones_amparito_id",
         _SHEET_NAME_SENALES:  "senales_modelo_id",
         _SHEET_NAME_TRADES:   "trades_reales_id",
+        _SHEET_NAME_GREKO:    "posiciones_greko_id",
     }
     if nombre in _secrets_map:
         _id = _get_sheet_id_from_secrets(_secrets_map[nombre])
@@ -4804,6 +4806,7 @@ def leer_posiciones_sheets(nombre_sheet: str) -> "pd.DataFrame | None":
             "GrekoTrader_Posiciones_Amparito": "posiciones_amparito_id",
             "GrekoTrader_Senales_Modelo":      "senales_modelo_id",
             "GrekoTrader_Trades_Reales":       "trades_reales_id",
+            "GrekoTrader_Posiciones_Greko":    "posiciones_greko_id",
         }
         secrets_key = _id_map.get(nombre_sheet, "")
         _log.append(f"P3 buscando: sheet='{nombre_sheet}' secrets_key='{secrets_key}'")
@@ -4842,24 +4845,52 @@ def leer_posiciones_sheets(nombre_sheet: str) -> "pd.DataFrame | None":
         # PASO 4: leer datos del Sheet
         _log.append(f"P4 leyendo sheet_id={sheet_id[:20]}...")
         try:
-            svc    = build("sheets", "v4", credentials=creds)
+            svc = build("sheets", "v4", credentials=creds)
+
+            # v18 fix: detectar nombre real de la hoja
+            # En español Google Sheets crea "Hoja 1" en lugar de "Sheet1"
+            meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+            hojas = [s["properties"]["title"] for s in meta.get("sheets", [])]
+            _log.append(f"P4 hojas encontradas: {hojas}")
+
+            # Usar la primera hoja disponible
+            hoja = hojas[0] if hojas else "Sheet1"
+            _log.append(f"P4 usando hoja: '{hoja}'")
+
             result = svc.spreadsheets().values().get(
                 spreadsheetId=sheet_id,
-                range="Sheet1!A1:Z1000"
+                range=f"'{hoja}'!A1:Z1000"
             ).execute()
             values = result.get("values", [])
             _log.append(f"P4 OK: {len(values)} filas leídas (incluyendo header)")
         except Exception as e4:
-            _st.session_state["sheets_error"] = f"read_error:{str(e4)[:80]}"
-            e4_str = str(e4)
-            _log.append(f"FALLO P4 lectura: {e4_str[:150]}")
-            if "SSL" in e4_str or "CERTIFICATE" in e4_str:
-                _log.append("CAUSA: Error SSL — proxy o antivirus intercepta la conexión")
-                _log.append("SOLUCIÓN: Ver instrucciones de certificado SSL abajo")
-            elif "403" in e4_str:
-                _log.append("CAUSA: Sin permiso — compartir Sheet con grekotrader-sheets@grekotrader.iam.gserviceaccount.com")
-            elif "404" in e4_str:
-                _log.append("CAUSA: Sheet ID incorrecto o Sheet eliminado")
+            # Capturar TODOS los detalles del error
+            import traceback
+            e4_str     = str(e4)
+            e4_type    = type(e4).__name__
+            e4_repr    = repr(e4)
+            e4_trace   = traceback.format_exc()[-300:]
+
+            _st.session_state["sheets_error"] = f"read_error:{e4_type}:{e4_str[:80]}"
+            _log.append(f"FALLO P4 tipo: {e4_type}")
+            _log.append(f"FALLO P4 msg: {e4_str[:200] if e4_str else '(vacío)'}")
+            _log.append(f"FALLO P4 repr: {e4_repr[:150]}")
+            _log.append(f"FALLO P4 trace: {e4_trace[-200:]}")
+
+            # Diagnóstico específico
+            full_err = e4_str + e4_repr + e4_trace
+            if "SSL" in full_err or "CERTIFICATE" in full_err or "ssl" in full_err:
+                _log.append("→ CAUSA: SSL — proxy o antivirus")
+            elif "403" in full_err:
+                _log.append("→ CAUSA: 403 — Sheet no compartido con service account")
+            elif "404" in full_err:
+                _log.append("→ CAUSA: 404 — Sheet ID incorrecto")
+            elif "API" in full_err and ("not" in full_err or "disabled" in full_err):
+                _log.append("→ CAUSA: API no habilitada en Google Cloud")
+            elif "quota" in full_err.lower():
+                _log.append("→ CAUSA: Cuota de API excedida")
+            elif not e4_str:
+                _log.append("→ Error vacío — posible problema de red o timeout")
             return None
 
         if len(values) < 1:
@@ -4975,16 +5006,32 @@ def escribir_trade_sheets(
         razon_salida, fue_correcto, error_modelo, notas
     ]
 
+    # v18 fix: usar el Sheet correcto según el tipo de registro
+    # CANDIDATO/ENTRADA/SALIDA → Senales_Modelo
+    # GREKO_PAPER → Posiciones_Greko
+    if hasattr(locals(), 'sheet_name') and sheet_name:
+        _sheet_destino = sheet_name
+    elif tipo in ("GREKO_PAPER",):
+        _sheet_destino = _SHEET_NAME_GREKO
+    else:
+        _sheet_destino = _SHEET_NAME_SENALES  # antes era _SHEET_NAME (Memoria_Trades)
+
     # Intentar escribir en Google Sheets
     try:
         svc = _get_sheets_service()
         if svc:
-            sheet_id = _buscar_sheet_id(_SHEET_NAME)
+            sheet_id = _buscar_sheet_id(_sheet_destino)
             if not sheet_id:
-                return False, f"Sheet '{_SHEET_NAME}' no encontrado. Créalo en Google Drive."
+                return False, f"Sheet '{_sheet_destino}' no encontrado. Verificar secrets."
+            # Detectar nombre real de la hoja (Hoja 1 en español, Sheet1 en inglés)
+            try:
+                _meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+                _hoja = _meta["sheets"][0]["properties"]["title"]
+            except Exception:
+                _hoja = "Hoja 1"
             svc.spreadsheets().values().append(
                 spreadsheetId=sheet_id,
-                range="Sheet1!A1",
+                range=f"'{_hoja}'!A1",
                 valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
                 body={"values": [fila]}
@@ -6485,9 +6532,12 @@ with col_signal:
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 st.markdown("---")
 
-tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9=st.tabs([
+tab1,tab2,tab3,tab4,tab5,tab_greko,tab6,tab7,tab8,tab9=st.tabs([
     "📡 Detectadas M1","⚡ Swing Activo","🔥 Entrar hoy",
-    "🔗 Sympathy","🔎 Mi Watchlist","💼 Mis Posiciones","💜 Posiciones Amparito",
+    "🔗 Sympathy","🔎 Mi Watchlist",
+    "🦅 Posiciones Greko",           # Tab C — paper trading del modelo
+    "💼 Posiciones MVALLE",           # Tab D — dinero real Mauri
+    "💜 Posiciones Amparito",         # Tab E — dinero real Amparito
     "💰 Estrategia ETF","📊 Backtesting",
 ])
 
@@ -7447,6 +7497,225 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 
 # ══ TAB 6 - MIS POSICIONES ═════════════════════════════════════
 # ══ TAB 7 - MIS POSICIONES ═════════════════════════════════════
+with tab_greko:
+    # ══ TAB C — POSICIONES GREKO (Paper Trading) ══════════════
+    # Registra las recomendaciones del modelo para medir su win rate real
+    # Sin dinero real — solo seguimiento para calibrar el modelo
+
+    st.markdown(
+        f'<div style="background:#F5F3FF;border:2px solid #C4B5FD;border-radius:14px;'
+        f'padding:16px 20px;margin-bottom:16px">'
+        f'<div style="font-size:16px;font-weight:800;color:#7C3AED;margin-bottom:6px">'
+        f'🦅 Posiciones Greko — Paper Trading del Modelo</div>'
+        f'<div style="font-size:12px;color:#374151;line-height:1.7">'
+        f'Aquí van las recomendaciones del modelo que decides seguir en papel — '
+        f'<strong>sin dinero real</strong>. '
+        f'Cada vez que el modelo dice M2/M3, lo registras aquí. '
+        f'Cuando cierra, marcas si ganó o perdió. '
+        f'Con eso calculamos el win rate real del modelo.</div>'
+        f'</div>', unsafe_allow_html=True)
+
+    # ── Cargar desde Google Sheets ───────────────────────────
+    _sheets_greko = leer_posiciones_sheets(_SHEET_NAME_GREKO)
+
+    if _sheets_greko is not None and not _sheets_greko.empty:
+        st.markdown(
+            f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+            f'border-radius:8px;padding:8px 14px;margin-bottom:10px;font-size:11px">'
+            f'<span style="font-weight:700;color:#16A34A">✅ Google Sheets conectado</span> — '
+            f'{len(_sheets_greko)} posiciones Greko cargadas</div>',
+            unsafe_allow_html=True)
+    else:
+        st.info("Sin posiciones Greko registradas aún. Usa el formulario abajo para agregar.")
+
+    # ── Formulario para agregar nueva posición Greko ─────────
+    with st.expander("➕ Registrar nueva recomendación del modelo", expanded=False):
+        _gc1,_gc2,_gc3,_gc4 = st.columns(4)
+        with _gc1: _g_tk     = st.text_input("Ticker", key="greko_tk").upper()
+        with _gc2: _g_precio = st.number_input("Precio entrada", min_value=0.01, value=100.0, key="greko_precio")
+        with _gc3: _g_fase   = st.selectbox("Fase", ["M3","M2","SWING"], key="greko_fase")
+        with _gc4: _g_fuente = st.selectbox("Fuente", ["Swing Activo","Watchlist","Detectadas M1","Manual"], key="greko_fuente")
+        _gc5,_gc6,_gc7 = st.columns(3)
+        with _gc5: _g_score  = st.number_input("Score modelo", min_value=0, max_value=100, value=60, key="greko_score")
+        with _gc6: _g_prob   = st.number_input("Prob NBIS %", min_value=0, max_value=100, value=50, key="greko_prob")
+        with _gc7: _g_fecha  = st.date_input("Fecha recomendación", key="greko_fecha")
+        _g_notas = st.text_input("Notas / razón del modelo", key="greko_notas")
+
+        if st.button("🦅 Registrar posición Greko", key="btn_greko_add",
+                     use_container_width=True, type="primary"):
+            if _g_tk:
+                _nueva_fila = {
+                    "Ticker": _g_tk,
+                    "Precio_Compra": _g_precio,
+                    "Cantidad": 0,
+                    "Fecha": str(_g_fecha),
+                    "Notas": _g_notas,
+                    "Fecha_Recomendacion": str(_g_fecha),
+                    "Fuente": _g_fuente,
+                    "Fase": _g_fase,
+                    "Score": _g_score,
+                    "Prob_NBIS": _g_prob,
+                    "Precio_Salida": "",
+                    "Fecha_Salida": "",
+                    "Resultado_Pct": "",
+                    "Fue_Correcto": "",
+                    "Error_Modelo": "",
+                }
+                # Escribir en Google Sheets
+                try:
+                    _ok, _msg = escribir_trade_sheets(
+                        tipo="GREKO_PAPER",
+                        ticker=_g_tk,
+                        precio=_g_precio,
+                        fase=_g_fase,
+                        score=_g_score,
+                        prob_nbis=_g_prob,
+                        cat_fecha=str(_g_fecha),
+                        notas=_g_notas,
+                        sheet_name=_SHEET_NAME_GREKO,
+                    )
+                    if _ok:
+                        st.success(f"✅ {_g_tk} registrado en Posiciones Greko")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        # Guardar localmente si falla Sheets
+                        if "greko_local" not in st.session_state:
+                            st.session_state["greko_local"] = []
+                        st.session_state["greko_local"].append(_nueva_fila)
+                        st.success(f"✅ {_g_tk} guardado localmente (Sheets: {_msg})")
+                except Exception as _eg:
+                    if "greko_local" not in st.session_state:
+                        st.session_state["greko_local"] = []
+                    st.session_state["greko_local"].append(_nueva_fila)
+                    st.success(f"✅ {_g_tk} guardado localmente")
+
+    # ── Tabla de posiciones Greko ────────────────────────────
+    # Combinar Sheets + local
+    _greko_rows = []
+    if _sheets_greko is not None and not _sheets_greko.empty:
+        _greko_rows = _sheets_greko.to_dict("records")
+    _greko_rows += st.session_state.get("greko_local", [])
+
+    if _greko_rows:
+        # KPIs del paper trading
+        _g_total  = len(_greko_rows)
+        _g_cerradas = [r for r in _greko_rows if str(r.get("Fue_Correcto","")).strip() != ""]
+        _g_ganadoras = [r for r in _g_cerradas if str(r.get("Fue_Correcto","")).upper() in ("SI","SÍ","YES","TRUE","1")]
+        _g_wr = round(len(_g_ganadoras)/len(_g_cerradas)*100,1) if _g_cerradas else 0
+        _g_abiertas = _g_total - len(_g_cerradas)
+
+        _gk1,_gk2,_gk3,_gk4 = st.columns(4)
+        for _gkc, _gkv, _gkl, _gkco in [
+            (_gk1, f"{_g_total}",    "Total posiciones",  "#7C3AED"),
+            (_gk2, f"{_g_abiertas}", "Abiertas",          "#2563EB"),
+            (_gk3, f"{len(_g_cerradas)}", "Cerradas",     "#374151"),
+            (_gk4, f"{_g_wr}%",      "Win Rate Modelo",
+             "#16A34A" if _g_wr>=60 else "#D97706" if _g_wr>=50 else "#DC2626"),
+        ]:
+            with _gkc:
+                st.markdown(
+                    f'<div style="background:white;border:1px solid #E9D5FF;'
+                    f'border-radius:10px;padding:12px;text-align:center">'
+                    f'<div style="font-size:10px;color:#6B7280;font-weight:600">{_gkl}</div>'
+                    f'<div style="font-size:24px;font-weight:800;color:{_gkco}">{_gkv}</div>'
+                    f'</div>', unsafe_allow_html=True)
+
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+        # Tabla de posiciones
+        rows_greko = ""
+        for _idx_g, _rg in enumerate(_greko_rows):
+            _tk_g    = str(_rg.get("Ticker",""))
+            _pc_g    = _rg.get("Precio_Compra",0)
+            _ps_g    = _rg.get("Precio_Salida","")
+            _res_g   = _rg.get("Resultado_Pct","")
+            _correc  = str(_rg.get("Fue_Correcto","")).upper()
+            _fase_g  = str(_rg.get("Fase",""))
+            _score_g = _rg.get("Score","")
+            _prob_g  = _rg.get("Prob_NBIS","")
+            _fuente_g= str(_rg.get("Fuente",""))
+            _fecha_g = str(_rg.get("Fecha_Recomendacion", _rg.get("Fecha","")))[:10]
+            _error_g = str(_rg.get("Error_Modelo",""))
+
+            # Calcular resultado en vivo si está abierta
+            _precio_live = 0.0
+            _res_live    = ""
+            try:
+                import yfinance as _yf_g
+                _precio_live = float(_yf_g.Ticker(_tk_g).fast_info.last_price or 0)
+                if _precio_live > 0 and float(_pc_g) > 0:
+                    _res_live = round((_precio_live/float(_pc_g)-1)*100,1)
+            except Exception:
+                pass
+
+            _estado_g = ("✅ Ganadora" if _correc in ("SI","SÍ","YES","TRUE","1")
+                        else "❌ Perdedora" if _correc in ("NO","FALSE","0")
+                        else "🔄 Abierta")
+            _est_c = "#16A34A" if "✅" in _estado_g else "#DC2626" if "❌" in _estado_g else "#2563EB"
+            _res_color = "#16A34A" if isinstance(_res_live,float) and _res_live>0 else "#DC2626"
+
+            rows_greko += (
+                f"<tr>"
+                f"<td><strong style='color:#7C3AED'>{_tk_g}</strong></td>"
+                f"<td>{_fecha_g}</td>"
+                f"<td><span style='background:#F5F3FF;color:#7C3AED;border-radius:4px;padding:1px 6px;font-size:10px'>{_fase_g}</span></td>"
+                f"<td>{_fuente_g}</td>"
+                f"<td>${float(_pc_g):.2f}</td>"
+                f"<td><span style='color:{_res_color};font-weight:700'>"
+                f"{'%+.1f%%' % _res_live if isinstance(_res_live,float) and _res_live!='' else '—'}"
+                f"</span></td>"
+                f"<td>{_score_g}</td>"
+                f"<td>{_prob_g}%</td>"
+                f"<td><span style='color:{_est_c};font-weight:700'>{_estado_g}</span></td>"
+                f"<td style='font-size:9px;color:#6B7280'>{_error_g[:30]}</td>"
+                f"</tr>"
+            )
+
+        _hdr_g = "<tr>" + "".join(
+            f"<th>{h}</th>" for h in
+            ["Ticker","Fecha","Fase","Fuente","Entrada","Resultado Live",
+             "Score","Prob","Estado","Error Modelo"]
+        ) + "</tr>"
+
+        st.markdown(
+            f'<div class="tbl-wrap"><table class="dtbl">'
+            f'<thead>{_hdr_g}</thead><tbody>{rows_greko}</tbody>'
+            f'</table></div>', unsafe_allow_html=True)
+
+        # Cerrar posición Greko
+        st.markdown("---")
+        st.markdown("**🏁 Cerrar posición Greko:**")
+        _close_cols = st.columns([2,1,1,2,1])
+        with _close_cols[0]:
+            _tickers_greko_open = [r["Ticker"] for r in _greko_rows
+                                   if str(r.get("Fue_Correcto","")).strip() == ""]
+            _g_close_tk = st.selectbox("Ticker a cerrar", ["—"] + _tickers_greko_open,
+                                        key="greko_close_tk")
+        with _close_cols[1]:
+            _g_close_precio = st.number_input("Precio salida", min_value=0.01,
+                                               value=100.0, key="greko_close_precio")
+        with _close_cols[2]:
+            _g_close_correcto = st.selectbox("¿Fue correcto?", ["SI","NO","PARCIAL"],
+                                              key="greko_close_correcto")
+        with _close_cols[3]:
+            _g_close_error = st.text_input("Error del modelo (si falló)",
+                                            key="greko_close_error")
+        with _close_cols[4]:
+            if st.button("✅ Cerrar", key="btn_greko_close") and _g_close_tk != "—":
+                st.success(f"✅ {_g_close_tk} cerrada — actualizar manualmente en Google Sheets "
+                           f"con Precio_Salida={_g_close_precio}, Fue_Correcto={_g_close_correcto}")
+
+        # Exportar
+        _df_greko_exp = pd.DataFrame(_greko_rows)
+        st.download_button(
+            "⬇️ Exportar Posiciones Greko CSV",
+            _df_greko_exp.to_csv(index=False).encode("utf-8"),
+            f"posiciones_greko_{pd.Timestamp.today().date()}.csv",
+            "text/csv", use_container_width=True
+        )
+
+
 with tab6:
     st.markdown(f'<div class="sec-header" style="background:{B_BG};border-color:{B_BOR}"><span style="font-size:20px">💼</span><div><span style="font-size:16px;font-weight:700;color:{B}">Mis posiciones abiertas</span><span style="font-size:12px;color:{TXT_MUT};margin-left:10px">Carga tu CSV  - señales de salida  - Prob. NBIS  - Similitud</span></div></div>',unsafe_allow_html=True)
 
@@ -7586,59 +7855,75 @@ También puedes descargar la plantilla de abajo y completarla.
                                         encoding="utf-8-sig",
                                         on_bad_lines="skip")
             posiciones_df.columns = [c.strip() for c in posiciones_df.columns]
-            # Aceptar tanto "Fecha_Compra" como "Fecha"
             if "Fecha_Compra" in posiciones_df.columns and "Fecha" not in posiciones_df.columns:
                 posiciones_df = posiciones_df.rename(columns={"Fecha_Compra": "Fecha"})
             required = ["Ticker","Precio_Compra","Cantidad","Fecha"]
             missing = [c for c in required if c not in posiciones_df.columns]
             if missing:
                 st.error(f"❌ Columnas faltantes en el CSV: {', '.join(missing)}")
-                posiciones_df = None
+                posiciones_df = _sheets_mauri.copy() if _sheets_mauri is not None else None
             else:
                 posiciones_df["Ticker"]        = posiciones_df["Ticker"].str.upper().str.strip()
                 posiciones_df["Precio_Compra"] = pd.to_numeric(posiciones_df["Precio_Compra"], errors="coerce")
                 posiciones_df["Cantidad"]      = pd.to_numeric(posiciones_df["Cantidad"], errors="coerce")
                 posiciones_df = posiciones_df.dropna(subset=["Precio_Compra","Cantidad"])
-                # Normalizar fechas - acepta DD-MM-YYYY y YYYY-MM-DD
                 for _fcol in ["Fecha","Cat_Fecha"]:
                     if _fcol in posiciones_df.columns:
                         posiciones_df[_fcol] = pd.to_datetime(
                             posiciones_df[_fcol], dayfirst=True, errors="coerce"
                         ).dt.strftime("%Y-%m-%d").fillna("-")
-                # Columnas opcionales
                 if "Cat_Fecha" not in posiciones_df.columns:
                     posiciones_df["Cat_Fecha"] = "-"
                 if "Tipo" not in posiciones_df.columns:
                     posiciones_df["Tipo"] = "Accion"
                 if "Estrategia" not in posiciones_df.columns:
                     posiciones_df["Estrategia"] = "Swing"
-                # Múltiples compras del mismo ticker = filas separadas (precio de compra distinto)
                 if posiciones_df["Ticker"].duplicated().any():
                     n_dup = posiciones_df["Ticker"].duplicated().sum()
                     tickers_dup = posiciones_df[posiciones_df["Ticker"].duplicated(keep=False)]["Ticker"].unique().tolist()
-                    st.info(f"ℹ️ {tickers_dup} tienen múltiples compras - se muestran como filas separadas con su precio de compra individual.")
-                st.success(f"✅ CSV cargado - {len(posiciones_df)} posiciones encontradas")
+                    st.info(f"ℹ️ {tickers_dup} tienen múltiples compras - se muestran como filas separadas.")
+                st.success(f"✅ CSV cargado — {len(posiciones_df)} posiciones encontradas")
         except Exception as e:
             st.error(f"❌ Error leyendo el CSV: {e}")
-            posiciones_df = None
+            posiciones_df = _sheets_mauri.copy() if _sheets_mauri is not None else None
+    elif _sheets_mauri is not None:
+        # ── v18 fix: usar Sheets si no hay CSV subido ─────────
+        # Normalizar columnas necesarias
+        posiciones_df["Ticker"]        = posiciones_df["Ticker"].str.upper().str.strip()
+        posiciones_df["Precio_Compra"] = pd.to_numeric(posiciones_df["Precio_Compra"], errors="coerce")
+        posiciones_df["Cantidad"]      = pd.to_numeric(posiciones_df["Cantidad"], errors="coerce")
+        posiciones_df = posiciones_df.dropna(subset=["Precio_Compra","Cantidad"])
+        for _fcol in ["Fecha","Cat_Fecha","Fecha_Compra"]:
+            if _fcol in posiciones_df.columns:
+                posiciones_df[_fcol] = pd.to_datetime(
+                    posiciones_df[_fcol], dayfirst=True, errors="coerce"
+                ).dt.strftime("%Y-%m-%d").fillna("-")
+        if "Cat_Fecha" not in posiciones_df.columns:
+            posiciones_df["Cat_Fecha"] = "-"
+        if "Tipo" not in posiciones_df.columns:
+            posiciones_df["Tipo"] = "Accion"
+        if "Estrategia" not in posiciones_df.columns:
+            posiciones_df["Estrategia"] = "Swing"
+        # No mostrar mensaje de éxito — ya lo muestra el badge verde de arriba
     else:
+        # Sin Sheets ni CSV — mostrar instrucciones
         posiciones_df = None
         st.markdown(
-            f'<div style="background:{B_BG};border:1px solid {B_BOR};border-radius:12px;'+
-            f'padding:32px;text-align:center;margin-top:16px">'+
-            f'<div style="font-size:36px;margin-bottom:10px">💼</div>'+
-            f'<div style="font-size:15px;font-weight:700;color:{B};margin-bottom:8px">'+
-            f'Sube tu archivo CSV para ver tus posiciones</div>'+
-            f'<div style="font-size:12px;color:{TXT_MUT};margin-bottom:16px;line-height:1.7">'+
-            f'Formato requerido:<br>'+
-            f'<code style="background:{BG_HEAD};padding:2px 8px;border-radius:4px;font-size:11px">'+
-            f'Ticker, Precio_Compra, Cantidad, Fecha</code><br><br>'+
-            f'Ejemplo:<br>'+
-            f'<code style="background:{BG_HEAD};padding:4px 8px;border-radius:4px;font-size:11px;display:inline-block;text-align:left">'+
-            f'NBIS,129.90,3,2026-04-09<br>MRNA,42.58,15,2026-02-17<br>CROX,78.72,4,2026-02-17</code>'+
-            f'</div>'+
-            f'<div style="font-size:11px;color:{TXT_SOFT}">'+
-            f'Usa el botón "Browse files" del sidebar para subir tu archivo</div>'+
+            f'<div style="background:{B_BG};border:1px solid {B_BOR};border-radius:12px;'
+            f'padding:32px;text-align:center;margin-top:16px">'
+            f'<div style="font-size:36px;margin-bottom:10px">💼</div>'
+            f'<div style="font-size:15px;font-weight:700;color:{B};margin-bottom:8px">'
+            f'Sube tu archivo CSV para ver tus posiciones</div>'
+            f'<div style="font-size:12px;color:{TXT_MUT};margin-bottom:16px;line-height:1.7">'
+            f'Formato requerido:<br>'
+            f'<code style="background:{BG_HEAD};padding:2px 8px;border-radius:4px;font-size:11px">'
+            f'Ticker, Precio_Compra, Cantidad, Fecha</code><br><br>'
+            f'Ejemplo:<br>'
+            f'<code style="background:{BG_HEAD};padding:4px 8px;border-radius:4px;font-size:11px;display:inline-block;text-align:left">'
+            f'NBIS,129.90,3,2026-04-09<br>MRNA,42.58,15,2026-02-17<br>CROX,78.72,4,2026-02-17</code>'
+            f'</div>'
+            f'<div style="font-size:11px;color:{TXT_SOFT}">'
+            f'Usa el botón "Browse files" del sidebar para subir tu archivo</div>'
             f'</div>', unsafe_allow_html=True)
 
     # ── Análisis de posiciones ──────────────────────────────
