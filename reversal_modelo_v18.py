@@ -4958,6 +4958,19 @@ def guardar_posicion_sheets(nombre_sheet: str, df: pd.DataFrame) -> tuple:
         return False, f"❌ Error: {str(e)[:60]}"
 
 
+
+def limpiar_cache_sheets_only():
+    """
+    v18 fix: Limpia SOLO el cache de Google Sheets.
+    NO limpia el cache de scans de mercado (scan_swing, scan_tab, etc.)
+    para evitar que los tabs se bloqueen re-descargando 100+ tickers.
+    """
+    leer_posiciones_sheets.clear()
+    try:
+        _buscar_sheet_id.clear()
+    except Exception:
+        pass
+
 def escribir_trade_sheets(
     tipo: str,          # "ENTRADA","SALIDA","CANDIDATO","T1","STOP"
     ticker: str,
@@ -5949,12 +5962,13 @@ trades_reales_id = "ID_del_sheet"
         st.session_state["mkt_cache"] = {}
         st.rerun()
     if st.button("🗑️ Limpiar cache de precios", use_container_width=True,
-                  help="Fuerza descarga de precios frescos - usar si los datos parecen desactualizados"):
+                  help="Fuerza descarga de precios frescos — los tabs tardarán 1-2 min en recargar"):
         st.cache_data.clear()
         for key in ["scan_swing","scan_entrar","scan_detectadas","scan_sympathy",
                     "mkt_cache","etf_data","earnings_mis_pos","earnings_amparito"]:
             if key in st.session_state:
                 del st.session_state[key]
+        st.warning("⚠️ Cache limpiado — los tabs Swing y Entrar Hoy tardarán 1-2 min en recargar. Es normal.")
         st.success("✅ Cache limpiado - datos frescos al escanear")
         st.rerun()
     st.markdown("---")
@@ -7576,7 +7590,7 @@ with tab_greko:
                     )
                     if _ok:
                         st.success(f"✅ {_g_tk} registrado en Posiciones Greko")
-                        st.cache_data.clear()
+                        limpiar_cache_sheets_only()
                         st.rerun()
                     else:
                         # Guardar localmente si falla Sheets
@@ -7805,7 +7819,7 @@ También puedes descargar la plantilla de abajo y completarla.
         # Botón para limpiar cache y reintentar
         if st.button("🔄 Reintentar conexión a Google Sheets",
                      key="btn_retry_sheets", use_container_width=False):
-            st.cache_data.clear()
+            limpiar_cache_sheets_only()
             st.rerun()
 
         # ── DEBUG LOG — muestra exactamente dónde falla ─────
