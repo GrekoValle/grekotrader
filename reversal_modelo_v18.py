@@ -4662,7 +4662,7 @@ def _get_sheet_id_from_secrets(key: str) -> str:
         return ""
 
 _SHEET_HEADERS = [
-    "Fecha_Señal","Ticker","Tipo_Registro","Fase","Precio_Entrada",
+    "Fecha_Señal","Ticker","Area","Tipo_Registro","Fase","Precio_Entrada",
     "Cantidad","Score","Prob_NBIS","Cat_Fecha","Arrastradas","Lider",
     "Opinion_Trader","Version_Modelo","SPY_RSI",
     "Fecha_Salida","Precio_Salida","Resultado_Pct","Razon_Salida",
@@ -5008,8 +5008,18 @@ def escribir_trade_sheets(
     except Exception:
         pass
 
+    # Obtener Area del ticker desde RAW
+    _area_write = "-"
+    try:
+        for _r in RAW:
+            if isinstance(_r, tuple) and len(_r) > 2 and str(_r[0]).upper() == ticker.upper():
+                _area_write = str(_r[2])
+                break
+    except Exception:
+        pass
+
     fila = [
-        hoy, ticker, tipo, fase, precio_entrada,
+        hoy, ticker, _area_write, tipo, fase, precio_entrada,
         cantidad, score, prob_nbis, cat_fecha, arrastradas, lider,
         opinion[:100] if opinion else "-",
         "v18", spy_rsi,
@@ -6302,6 +6312,89 @@ if oil.get("_ok") and oil.get("presion_sectorial"):
         f'Señales de estos sectores requieren mayor confirmación.</span></div>'
         f'</div>', unsafe_allow_html=True)
 
+# ── Estado del mercado (abierto/cerrado/pre/post) ─────────────
+def get_market_status() -> dict:
+    """
+    Detecta si el mercado NYSE está abierto, cerrado, en pre o post market.
+    Basado en hora de Nueva York (ET).
+    """
+    import datetime as _dt
+    try:
+        import pytz
+        ny_tz = pytz.timezone("America/New_York")
+        now_ny = _dt.datetime.now(ny_tz)
+    except ImportError:
+        # Sin pytz — usar UTC-5 como aproximación
+        now_ny = _dt.datetime.utcnow() - _dt.timedelta(hours=5)
+
+    hora    = now_ny.hour
+    minuto  = now_ny.minute
+    weekday = now_ny.weekday()  # 0=Lunes, 6=Domingo
+    hora_decimal = hora + minuto/60
+
+    # Fin de semana
+    if weekday >= 5:
+        return {
+            "estado":  "cerrado",
+            "label":   "🔴 Mercado Cerrado — Fin de semana",
+            "detalle": f"Abre el lunes a las 9:30 AM ET",
+            "color":   "#DC2626",
+            "bg":      "#FEF2F2",
+        }
+    # Pre-market: 4:00 AM - 9:30 AM ET
+    if 4.0 <= hora_decimal < 9.5:
+        mins_para_open = int((9.5 - hora_decimal) * 60)
+        return {
+            "estado":  "pre_market",
+            "label":   "🟡 Pre-Market",
+            "detalle": f"Mercado abre en {mins_para_open} min (9:30 AM ET) — precios orientativos",
+            "color":   "#D97706",
+            "bg":      "#FFFBEB",
+        }
+    # Mercado abierto: 9:30 AM - 4:00 PM ET
+    if 9.5 <= hora_decimal < 16.0:
+        mins_para_close = int((16.0 - hora_decimal) * 60)
+        return {
+            "estado":  "abierto",
+            "label":   "🟢 Mercado Abierto",
+            "detalle": f"Cierra en {mins_para_close} min (4:00 PM ET)",
+            "color":   "#16A34A",
+            "bg":      "#F0FDF4",
+        }
+    # Post-market: 4:00 PM - 8:00 PM ET
+    if 16.0 <= hora_decimal < 20.0:
+        return {
+            "estado":  "post_market",
+            "label":   "🔵 Post-Market",
+            "detalle": "Mercado cerrado — solo trading extendido hasta 8:00 PM ET",
+            "color":   "#2563EB",
+            "bg":      "#EFF6FF",
+        }
+    # Noche / madrugada
+    return {
+        "estado":  "cerrado",
+        "label":   "🔴 Mercado Cerrado",
+        "detalle": "Pre-market abre a las 4:00 AM ET",
+        "color":   "#DC2626",
+        "bg":      "#FEF2F2",
+    }
+
+_mkt_status = get_market_status()
+
+# ── Banner de estado del mercado ───────────────────────────────
+st.markdown(
+    f'<div style="background:{_mkt_status["bg"]};border:1px solid {_mkt_status["color"]}40;'
+    f'border-radius:8px;padding:6px 14px;margin-bottom:8px;'
+    f'display:flex;align-items:center;gap:12px">'
+    f'<span style="font-size:13px;font-weight:800;color:{_mkt_status["color"]}">'
+    f'{_mkt_status["label"]}</span>'
+    f'<span style="font-size:11px;color:#6B7280">{_mkt_status["detalle"]}</span>'
+    + (f'<span style="font-size:10px;color:#9CA3AF;margin-left:auto">'
+       f'Los precios y señales son orientativos fuera del horario de mercado</span>'
+       if _mkt_status["estado"] != "abierto" else "")
+    + f'</div>',
+    unsafe_allow_html=True)
+
 # ── Semáforo VIX ──────────────────────────────────────────────
 if not vix["_ok"]:
     st.markdown(
@@ -7182,11 +7275,12 @@ with tab5:
 El modelo descarga el precio actual y calcula todos los indicadores automáticamente.
 """)
         wl_template = pd.DataFrame({
-            "Ticker":  ["TAN","CROX","CNC","SOFI","MSTR"],
-            "Nombre":  ["Invesco Solar ETF","Crocs Inc","Centene Corp","SoFi Tech","Strategy Inc"],
-            "Area":    ["Energía","Consumo","Salud","Fintech","Cripto/AI"],
+            "Ticker":  ["TAN","CROX","CNC","OCUL","VRDN"],
+            "Nombre":  ["Invesco Solar ETF","Crocs Inc","Centene Corp","Ocugen Inc","Viridian Therapeutics"],
+            "Area":    ["Energía","Consumo","Salud","Biotech","Biotech"],
             "Nota":    ["Solar recovery","Post dip consumer","Healthcare turnaround",
-                        "Banking license","BTC proxy"],
+                        "visto en X — FDA catalyst","dilución reciente — esperar absorción"],
+            "Fuente":  ["Investing","Amigo","Manual","Twitter/X","Earnings"],
         })
         st.download_button(
             "⬇️ Descargar plantilla Watchlist CSV",
@@ -7292,7 +7386,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
             "EMA50":"vs EMA50","MACD":"MACD","Score":"Score","Cat_Fecha":"Earnings",
             "Arrastradas":"🔗 Arrastra a","Lider":"🏆 Líder","Opinion_Trader":"🦅 Opinión Trader",
             "Prob_NBIS":"Prob NBIS","Sim_NBIS":"Sim. NBIS",
-            "Motivo":"Motivo","Nota":"Tu nota","Fuente":"Fuente",
+            "Motivo":"Motivo","Nota":"Tu nota","Fuente":"📌 Fuente",
         }
 
         for _, r in (wl_res_df.sort_values("Score", ascending=False) if "Score" in wl_res_df.columns else wl_res_df).iterrows():
@@ -7361,6 +7455,34 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
             _r_prob_nbis = r['Prob_NBIS']
             _r_sim_nbis = r['Sim_NBIS']
             _r_motivo = r['Motivo']
+
+            # v18: Fuente con badge de color según origen
+            _fuente_raw = str(r.get("Fuente","-")).strip()
+            _fuente_cfg = {
+                "Twitter/X":   ("#000000","#F0F0F0","🐦"),
+                "X":           ("#000000","#F0F0F0","🐦"),
+                "Investing":   ("#1D4ED8","#EFF6FF","📊"),
+                "Amigo":       ("#7C3AED","#F5F3FF","👥"),
+                "Earnings":    ("#16A34A","#F0FDF4","📅"),
+                "Manual":      ("#374151","#F9FAFB","✏️"),
+                "Modelo":      ("#D97706","#FFFBEB","🦅"),
+                "Swing":       ("#D97706","#FFFBEB","⚡"),
+                "Watchlist":   ("#2563EB","#EFF6FF","👁"),
+            }
+            # Buscar coincidencia parcial
+            _f_color, _f_bg, _f_icon = "#374151","#F3F4F6","📌"
+            for _fk, (_fc, _fb, _fi) in _fuente_cfg.items():
+                if _fk.lower() in _fuente_raw.lower():
+                    _f_color, _f_bg, _f_icon = _fc, _fb, _fi
+                    break
+            _fuente_html = (
+                f'<span style="background:{_f_bg};color:{_f_color};'
+                f'border-radius:5px;padding:2px 7px;font-size:10px;font-weight:600">'
+                f'{_f_icon} {_fuente_raw}</span>'
+                if _fuente_raw not in ("-","","nan") else
+                f'<span style="color:{TXT_SOFT};font-size:10px">—</span>'
+            )
+
             rows_html += (
                 f"<tr>"
                 f"<td><strong style='color:{B};font-size:13px'>{_tk_r}</strong></td>"
@@ -7381,7 +7503,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                 f"<td><span style='color:{sim_c};font-weight:700'>{round(float(_r_sim_nbis),1)}</span></td>"
                 f"<td><span style='color:{TXT_MUT};font-size:11px'>{_r_motivo}</span></td>"
                 f"<td><span style='color:{B};font-style:italic'>{nota_str}</span></td>"
-                f"<td>{source_badge_html}</td>"
+                f"<td>{_fuente_html}</td>"
                 f"</tr>"
             )
 
@@ -7558,8 +7680,19 @@ with tab_greko:
         if st.button("🦅 Registrar posición Greko", key="btn_greko_add",
                      use_container_width=True, type="primary"):
             if _g_tk:
+                # Obtener área del ticker desde RAW
+                _area_greko = "-"
+                try:
+                    for _r in RAW:
+                        if isinstance(_r, tuple) and len(_r) > 2 and str(_r[0]).upper() == _g_tk:
+                            _area_greko = str(_r[2])
+                            break
+                except Exception:
+                    pass
+
                 _nueva_fila = {
                     "Ticker": _g_tk,
+                    "Area": _area_greko,
                     "Precio_Compra": _g_precio,
                     "Cantidad": 0,
                     "Fecha": str(_g_fecha),
@@ -7669,8 +7802,12 @@ with tab_greko:
             _est_c = "#16A34A" if "✅" in _estado_g else "#DC2626" if "❌" in _estado_g else "#2563EB"
             _res_color = "#16A34A" if isinstance(_res_live,float) and _res_live>0 else "#DC2626"
 
+            # Obtener area del ticker
+            _area_g = str(_rg.get("Area","-"))
+            _area_color_g = SECTOR_COLORS.get(_area_g, TXT_MUT)
             rows_greko += (
                 f"<tr>"
+                f"<td><span style='color:{_area_color_g};font-size:10px;font-weight:600'>{_area_g}</span></td>"
                 f"<td><strong style='color:#7C3AED'>{_tk_g}</strong></td>"
                 f"<td>{_fecha_g}</td>"
                 f"<td><span style='background:#F5F3FF;color:#7C3AED;border-radius:4px;padding:1px 6px;font-size:10px'>{_fase_g}</span></td>"
@@ -7688,7 +7825,7 @@ with tab_greko:
 
         _hdr_g = "<tr>" + "".join(
             f"<th>{h}</th>" for h in
-            ["Ticker","Fecha","Fase","Fuente","Entrada","Resultado Live",
+            ["Area","Ticker","Fecha","Fase","Fuente","Entrada","Resultado Live",
              "Score","Prob","Estado","Error Modelo"]
         ) + "</tr>"
 
@@ -9442,6 +9579,50 @@ with tab9:
 
             # Tabla de trades
             if _bt_trds:
+                # ── RENDIMIENTO POR SECTOR ──────────────────────
+                _areas_bt = {}
+                for _t in _bt_trds:
+                    _a = str(_t.get("area", _t.get("Area", "Sin área")))
+                    if not _a or _a in ("", "-", "nan"): _a = "Sin área"
+                    if _a not in _areas_bt:
+                        _areas_bt[_a] = {"total":0,"gan":0,"res":[]}
+                    _areas_bt[_a]["total"] += 1
+                    if _t.get("ganadora"): _areas_bt[_a]["gan"] += 1
+                    _areas_bt[_a]["res"].append(float(_t.get("resultado",0)))
+
+                if len(_areas_bt) > 1:
+                    st.markdown(
+                        f'<div style="font-size:13px;font-weight:700;color:{TXT};margin:14px 0 6px">'
+                        f'📊 Rendimiento por Sector — ¿cuál funciona mejor con el modelo?</div>',
+                        unsafe_allow_html=True)
+                    _area_rows_bt = ""
+                    for _an, _av in sorted(_areas_bt.items(),
+                            key=lambda x: x[1]["gan"]/max(x[1]["total"],1), reverse=True):
+                        _wr_a  = round(_av["gan"]/_av["total"]*100,1) if _av["total"]>0 else 0
+                        _avg_a = round(sum(_av["res"])/_av["total"],1) if _av["total"]>0 else 0
+                        _wrc   = G if _wr_a>=60 else A if _wr_a>=50 else R
+                        _avrc  = "#16A34A" if _avg_a>0 else "#DC2626"
+                        _sector_c = SECTOR_COLORS.get(_an, TXT_MUT)
+                        _area_rows_bt += (
+                            f"<tr>"
+                            f"<td><span style='color:{_sector_c};font-weight:600'>{_an}</span></td>"
+                            f"<td style='text-align:center'>{_av['total']}</td>"
+                            f"<td style='text-align:center;color:{_wrc};font-weight:800'>{_wr_a}%</td>"
+                            f"<td style='text-align:center;color:{_avrc};font-weight:700'>{_avg_a:+.1f}%</td>"
+                            f"<td style='text-align:center'>"
+                            f"{'✅ Modelo funciona bien aquí' if _wr_a>=60 else '⚠️ Mejorable' if _wr_a>=50 else '❌ Filtrar este sector'}"
+                            f"</td>"
+                            f"</tr>"
+                        )
+                    st.markdown(
+                        f'<div class="tbl-wrap"><table class="dtbl">'
+                        f'<thead><tr>'
+                        f'<th>Sector</th><th>Señales</th><th>Win Rate</th>'
+                        f'<th>Promedio %</th><th>Diagnóstico</th>'
+                        f'</tr></thead>'
+                        f'<tbody>{_area_rows_bt}</tbody></table></div>',
+                        unsafe_allow_html=True)
+
                 st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin:10px 0 4px">📋 Detalle de señales históricas</div>', unsafe_allow_html=True)
                 _rows = ""
                 for _t in sorted(_bt_trds, key=lambda x: x.get("fecha",""), reverse=True)[:40]:
