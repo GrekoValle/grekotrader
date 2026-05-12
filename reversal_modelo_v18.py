@@ -3684,6 +3684,14 @@ def scan_tab(rsi_max: float, dd_min: float,
                     sc = min(100, int(sc * vix_mult))
                 if sc < score_min:
                     continue
+                # v18 mejora: Score máximo 55 (semana 27abr-08may)
+                # Score 40-55: WR 70%, avg +3.1%
+                # Score > 55: WR 25%, avg -0.3% — señal tardía, precio ya se movió
+                _score_max = getattr(st.session_state, "score_max_filtro", 55)
+                if sc > _score_max and decisions and "M3" in str(decisions):
+                    pass  # M3 puede tener score alto — es breakout confirmado
+                elif sc > _score_max:
+                    continue
                 # v12: calcular Prob NBIS con datos reales del yfinance loop
                 _mom_s     = round((close[-1]/close[-4]-1)*100, 2) if len(close)>=4 else 0
                 _tiene_c_s = str(earn) not in ("-","","nan") if 'earn' in dir() else False
@@ -4539,6 +4547,33 @@ def analizar_posicion(precio_compra, precio_actual, rsi, macd,
                 "razon":"Posición en pérdida con earnings próximos. "
                         "Riesgo asimétrico - cerrar antes del reporte.",
                 "color":R,"urgencia":"HOY"}
+
+    # -0.5: Alerta día 7 — ventana óptima de salida (dato semana 27abr-08may)
+    # IONQ día 9 +24.9%, RUN día 8 +26.5%, PANW día 9 +16.3%
+    # Después del día 9 el momentum se agota — alerta para revisar
+    if 7 <= dias_posicion < 10 and estrategia != "Largo_Plazo":
+        if pnl_pct >= 8:
+            return {
+                "señal": f"⚡ Día {dias_posicion} — ventana óptima",
+                "accion": (f"Estás en la VENTANA ÓPTIMA de salida (días 7-9). "
+                           f"Considera vender 50-60% HOY para asegurar ganancia. "
+                           f"Mantén 40% como runner si RSI < 68 y tendencia activa."),
+                "urgencia": "ESTA SEMANA",
+                "tramos": [(55,"VENDER 55%"),(45,"RUNNER")],
+                "color": "D97706",
+                "piramidar": None,
+            }
+        elif 0 < pnl_pct < 8:
+            return {
+                "señal": f"📡 Día {dias_posicion} — sin T1 aún",
+                "accion": (f"Día {dias_posicion} sin llegar a T1 (+8%). "
+                           f"Si no supera T1 antes del día 9 → salir. "
+                           f"El modelo tiene WR bajo después del día 9 sin T1."),
+                "urgencia": "VIGILAR",
+                "tramos": [(100,"MANTENER")],
+                "color": "2563EB",
+                "piramidar": None,
+            }
 
     # -1. Verificar día 10 con excepción por catalizador
     if dias_posicion >= 10 and estrategia != "Largo_Plazo":
@@ -5973,9 +6008,11 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = 
                 pico     = float(close.max())
                 dd       = round((precio - pico) / pico * 100, 1)
 
-                # Filtro: debe haber corrección previa real
-                if dd > -5:
-                    continue  # no hubo corrección suficiente
+                # v18 mejora: DD mínimo -20% (dato semana 27abr-08may)
+                # DD -5% a -20% tiene WR 33-40% — ruido, no rebote real
+                # DD -20% o más tiene WR 65-67% — corrección real con soporte
+                if dd > -20:
+                    continue  # corrección insuficiente para rebote técnico real
 
                 # Detectar días consecutivos alcistas (últimos 3)
                 dias_alcistas = 0
@@ -6010,6 +6047,11 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = 
                 if _prob_sw < 25:  # mínimo 25% para aparecer en Swing
                     continue
 
+                # v18 mejora: Score máximo 55
+                # Score > 55 = acción ya se movió, llegaste tarde (WR 25% vs 70% en 40-55)
+                # Se calcula aquí usando _prob_sw como proxy del score
+                # El score real se calcula más abajo — aplicar filtro allí también
+
                 # Volumen creciente en días alcistas
                 avg_v = float(import_np().mean(vol[-20:]))
                 vol_k = avg_v / 1000
@@ -6028,8 +6070,11 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = 
                 loss  = (-delta.clip(upper=0)).rolling(14).mean()
                 rsi   = round(float(100-100/(1+gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
 
-                # RSI no debe estar sobrecomprado
-                if rsi > 65:
+                # v18 mejora: RSI zona válida 48-65
+                # RSI < 48: acción aún débil, rebote no confirmado (WR cae a 33%)
+                # RSI > 65: sobrecomprada, llegaste tarde
+                # Zona óptima 48-65: WR 91% (semana 27abr-08may)
+                if rsi > 65 or rsi < 48:
                     continue
 
                 # RSI debe estar girando (hoy > hace 3 días)
@@ -6184,6 +6229,24 @@ with st.sidebar:
             f'{len(SCAN_UNIVERSE)} tickers</div>'+
             f'</div>',unsafe_allow_html=True)
     st.markdown(f'<div style="font-size:11px;color:{TXT_MUT};margin-bottom:6px">{datetime.date.today():%d %b %Y}  - Modelo 3 Momentos</div>',unsafe_allow_html=True)
+
+    # ── Parámetros del modelo v18 (semana 27abr-08may) ─────────
+    with st.expander("📊 Umbrales activos del modelo", expanded=False):
+        st.markdown("""
+**Basados en análisis semana 27 Abr — 08 May:**
+
+| Variable | Umbral | WR sin filtro | WR con filtro |
+|----------|--------|--------------|--------------|
+| M1 Detectadas | Solo radar ❌ entrada | 0% | — |
+| DD mínimo | -20% | 33% | 65%+ |
+| RSI entrada | 48-65 | 48% | 91% |
+| Score | 40-55 | 48% | 70% |
+| Ventana salida | Día 7-9 | — | alerta |
+
+**Combo óptimo esta semana:**
+DD≤-20% + RSI 48-65 + Score 40-55 + Sector AI/Tech
+→ **WR 100%, avg +12.2%** (n=6)
+""")
 
     # ── Estado Google Sheets v18 ─────────────────────────────
     _gs_configured = (hasattr(st, "secrets") and
@@ -6449,7 +6512,18 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
         cols_con_senal = ["Ticker","Señal modelo"] + [c for c in cols_con_senal if c not in ("Ticker","Señal modelo")]
 
     # ── BOTONES DE REGISTRO v18 ─────────────────────────────────
+    # v18 fix: M1 = solo radar. Botón Greko disponible pero con aviso claro
     if not df_show.empty:
+        # Si es Tab M1 Detectadas, mostrar aviso de no entrada
+        if tab_key == "scan_detectadas":
+            st.markdown(
+                f'<div style="background:#FEF3C7;border:1px solid #FCD34D;'
+                f'border-radius:8px;padding:8px 14px;margin-bottom:6px;font-size:11px">'
+                f'<strong>📡 M1 = Solo Radar</strong> — estas acciones están en corrección. '
+                f'NO son señales de entrada. Agrégalas al radar para esperar M2/M3. '
+                f'<strong>Win rate M1 como entrada esta semana: 0%</strong>'
+                f'</div>', unsafe_allow_html=True)
+
         _reg_col1, _reg_col2, _reg_col3 = st.columns([2,2,2])
         with _reg_col1:
             _reg_tk = st.selectbox(
@@ -7143,6 +7217,50 @@ with tab2:
         # OK o ruido normal: sin filtro
         sw_result_display = sw_result
 
+    # ── v18 MEJORAS (semana 27abr-08may): aplicar filtros en display ──
+    # Fundamentación estadística:
+    #   DD -5% a -20%: WR 33-40%  → correcciones leves = ruido
+    #   DD -20% o más: WR 65-67%  → corrección real con soporte
+    #   RSI < 48: WR bajo, rebote no confirmado
+    #   RSI 48-65: WR 91%  ← zona óptima
+    #   Score > 55: WR 25% (señal tardía, precio ya se movió)
+    #   Score 40-55: WR 70% ← zona óptima
+    if sw_result_display is not None and not sw_result_display.empty:
+        n_antes = len(sw_result_display)
+        _cols_sw = sw_result_display.columns.tolist()
+
+        # Filtro 1: DD mínimo -20%
+        if "DD_pico" in _cols_sw:
+            sw_result_display = sw_result_display[
+                pd.to_numeric(sw_result_display["DD_pico"], errors="coerce") <= -20
+            ]
+
+        # Filtro 2: RSI zona 48-65
+        if "RSI" in _cols_sw:
+            _rsi_sw = pd.to_numeric(sw_result_display["RSI"], errors="coerce")
+            sw_result_display = sw_result_display[
+                (_rsi_sw >= 48) & (_rsi_sw <= 65)
+            ]
+
+        # Filtro 3: Score 40-55
+        if "Score_Rebote" in _cols_sw:
+            _sc_sw = pd.to_numeric(sw_result_display["Score_Rebote"], errors="coerce")
+            sw_result_display = sw_result_display[
+                (_sc_sw >= 40) & (_sc_sw <= 55)
+            ]
+
+        n_despues = len(sw_result_display)
+        if n_antes != n_despues:
+            st.markdown(
+                f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+                f'border-radius:8px;padding:6px 14px;margin-bottom:8px;font-size:11px">'
+                f'<strong style="color:#16A34A">🔬 Filtros v18 activos:</strong> '
+                f'{n_antes} señales → <strong>{n_despues} de calidad</strong> '
+                f'(DD≤-20% · RSI 48-65 · Score 40-55) — '
+                f'<span style="color:#6B7280">WR histórico con estos filtros: 80%+</span>'
+                f'</div>',
+                unsafe_allow_html=True)
+
     if sw_result is None:
         st.markdown(
             f'<div style="background:{C_BG};border:1px solid {C_BOR};border-radius:12px;'+
@@ -7661,6 +7779,53 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 
         wl_res_df = pd.DataFrame(wl_results)
 
+        # ── v18: Filtros de calidad en Watchlist (semana 27abr-08may) ──
+        # Solo para la vista "ENTRAR/ANTICIPAR" — no bloquear el radar completo
+        # El watchlist sigue mostrando todas las acciones
+        # pero marca claramente cuáles cumplen los criterios de entrada
+        if not wl_res_df.empty:
+            _wl_n_total = len(wl_res_df)
+            _wl_filtros = wl_res_df.copy()
+
+            # Aplicar filtros
+            if "DD_pico" in _wl_filtros.columns:
+                _wl_filtros = _wl_filtros[
+                    pd.to_numeric(_wl_filtros["DD_pico"], errors="coerce") <= -20
+                ]
+            if "RSI" in _wl_filtros.columns:
+                _rsi_wl = pd.to_numeric(_wl_filtros["RSI"], errors="coerce")
+                _wl_filtros = _wl_filtros[(_rsi_wl >= 48) & (_rsi_wl <= 65)]
+            if "Score" in _wl_filtros.columns:
+                _sc_wl = pd.to_numeric(_wl_filtros["Score"], errors="coerce")
+                _wl_filtros = _wl_filtros[(_sc_wl >= 40) & (_sc_wl <= 55)]
+
+            _tickers_aptos = set(_wl_filtros["Ticker"].tolist())
+            _n_aptos = len(_tickers_aptos)
+
+            # Agregar columna que indica si cumple filtros
+            wl_res_df["_apto_entrada"] = wl_res_df["Ticker"].isin(_tickers_aptos)
+
+            if _n_aptos > 0:
+                st.markdown(
+                    f'<div style="background:#F0FDF4;border:2px solid #86EFAC;'
+                    f'border-radius:10px;padding:10px 16px;margin-bottom:10px">'
+                    f'<span style="font-weight:800;color:#16A34A;font-size:13px">'
+                    f'✅ {_n_aptos} de {_wl_n_total} acciones cumplen filtros de entrada</span>'
+                    f'<span style="font-size:11px;color:#374151;margin-left:10px">'
+                    f'DD≤-20% · RSI 48-65 · Score 40-55 · WR histórico 80%+</span><br>'
+                    f'<span style="font-size:11px;font-weight:700;color:#16A34A">'
+                    f'{"  ·  ".join(sorted(_tickers_aptos))}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f'<div style="background:#FEF3C7;border:1px solid #FCD34D;'
+                    f'border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:11px">'
+                    f'<strong>⚠️ Ninguna acción del Watchlist cumple los filtros de entrada hoy</strong>'
+                    f' — DD≤-20% · RSI 48-65 · Score 40-55. '
+                    f'Monitorear para cuando las condiciones mejoren.</div>',
+                    unsafe_allow_html=True)
+
         # ── Resumen por momento ─────────────────────────────────
         sm1,sm2,sm3,sm4 = st.columns(4)
         for col,dec,lbl,color in [
@@ -7755,6 +7920,15 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                 earn_cell = f'<span style="color:{TXT_SOFT};font-size:10px">-</span>'
 
             _tk_r = r['Ticker']; _area_r = r['Area']; _dec_r = r['Decision']
+            # v18: badge de aptitud para entrada
+            _apto_r = r.get("_apto_entrada", False)
+            _apto_badge = (
+                '<span style="background:#DCFCE7;color:#16A34A;border-radius:4px;'
+                'padding:1px 6px;font-size:9px;font-weight:800">✅ APTA</span>'
+                if _apto_r else
+                '<span style="background:#F3F4F6;color:#9CA3AF;border-radius:4px;'
+                'padding:1px 6px;font-size:9px">👁 RADAR</span>'
+            )
             _fase_r = r['Fase']; _trig_r = r['Trigger']; _precio_r = r['Precio']
             _rsi_r = r['RSI']; _vol_r2 = r['Volumen']
             _vol_color = G if _vol_r2>150 else TXT_MUT
@@ -7795,7 +7969,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 
             rows_html += (
                 f"<tr>"
-                f"<td><strong style='color:{B};font-size:13px'>{_tk_r}</strong></td>"
+                f"<td><strong style='color:{B};font-size:13px'>{_tk_r}</strong> {_apto_badge}</td>"
                 f"<td><span style='color:{sec_c};font-size:11px'>{_area_r}</span></td>"
                 f"<td>{badge(_dec_r,dec_cls)}</td>"
                 f"<td><span style='color:{TXT_MUT};font-size:11px'>{_fase_r}</span></td>"
