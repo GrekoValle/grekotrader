@@ -334,7 +334,7 @@ def fetch_guidance_flag(ticker: str) -> dict:
     o el ratio estimado/real < 0.95, marca como guidance negativo.
     """
     resultado = {"guidance_negativo": False, "razon": "", "score_penalty": 0}
-    _BAD_TICKERS = {"MSTU","CRWN","SDNK","VIX","ENTX"}  # v17: SNDK removido — era confusión con typo SDNK
+    _BAD_TICKERS = {"MSTU","CRWN","SDNK","VIX","ENTX","AXCM"}  # v17: SNDK removido — era confusión con typo SDNK
     if ticker.upper() in _BAD_TICKERS:
         return resultado
     try:
@@ -389,7 +389,7 @@ def fetch_guidance_flag(ticker: str) -> dict:
 def get_precio_live_batch(tickers: tuple) -> dict:
     """Obtiene precios actuales para una lista de tickers. Cache 1h."""
     result = {}
-    _BAD = {"MSTU","CRWN","SDNK","VIX","ENTX"}  # v17: SNDK removido — era confusión con typo SDNK
+    _BAD = {"MSTU","CRWN","SDNK","VIX","ENTX","AXCM"}  # v17: SNDK removido — era confusión con typo SDNK
     try:
         import yfinance as yf
         tks_valid = [t for t in tickers if t not in _BAD]
@@ -465,7 +465,7 @@ def detectar_dilucion_reciente(ticker: str, dias: int = 90) -> dict:
         "accion":            "",
         "penalizacion_score": 0,
     }
-    _BAD = {"MSTU","CRWN","SDNK","VIX","ENTX"}
+    _BAD = {"MSTU","CRWN","SDNK","VIX","ENTX","AXCM"}
     if not ticker or ticker.upper() in _BAD:
         return resultado
     try:
@@ -713,7 +713,7 @@ def fetch_earnings_dates(tickers):
     import yfinance as yf, datetime
     ETF_SIN_EARNINGS = ["VOO","SPY","IVV","QQQ","VTI","SCHB","IBIT","ETHA","GBTC","FBTC","TAN","XBI","IBB","XLF","XLE","XLK","XLV","ARKK","SOXX"]
     # v15: tickers que generan 404 en yfinance - skip silencioso
-    TICKERS_MALOS = {"MSTU","CRWN","SDNK","VIX","ENTX"}  # v17: SNDK removido — era confusión con typo SDNK
+    TICKERS_MALOS = {"MSTU","CRWN","SDNK","VIX","ENTX","AXCM"}  # v17: SNDK removido — era confusión con typo SDNK
     rows = []
     for tk in tickers:
         if tk.upper() in TICKERS_MALOS:
@@ -759,7 +759,7 @@ def get_earnings_single(ticker: str) -> str:
     ETF_SKIP = {"VOO","SPY","IVV","QQQ","VTI","SCHB","IBIT","ETHA","GBTC","FBTC",
                 "TAN","XBI","IBB","XLF","XLE","XLK","XLV","ARKK","SOXX"}
     # v15: misma blacklist que fetch_ticker_data - evita 404 spam
-    _BAD = {"MSTU","CRWN","SDNK","VIX","ENTX"}  # v17: SNDK removido — era confusión con typo SDNK
+    _BAD = {"MSTU","CRWN","SDNK","VIX","ENTX","AXCM"}  # v17: SNDK removido — era confusión con typo SDNK
     if ticker in ETF_SKIP or ticker.upper() in _BAD:
         return "-"
     try:
@@ -1964,12 +1964,190 @@ def calcular_señales_salida_v12(pnl_pct: float, precio_compra: float,
     urgencia = "-"
     color = "64748B"
 
-    # Stop automático -7%
-    stop_pct = -7.0 if tipo in ("Accion",) else -12.0 if tipo == "ETF_Indice" else -10.0
+    # Stop diferenciado por tipo — v18 fix: ETF_Cripto necesita -20% mínimo
+    # ETHA puede caer 15% en un día — stop de -10% sería señal falsa
+    if tipo == "Accion":
+        stop_pct = -7.0
+        stop_label = "Stop acción (-7%)"
+    elif tipo == "ETF_Indice":
+        stop_pct = -12.0
+        stop_label = "Stop ETF Índice (-12%)"
+    elif tipo == "ETF_Cripto":
+        stop_pct = -20.0
+        stop_label = "Stop ETF Cripto (-20%) — volatilidad normal en crypto"
+    elif tipo == "ETF_Sectorial":
+        stop_pct = -12.0
+        stop_label = "Stop ETF Sectorial (-12%)"
+    elif tipo == "ETF_LatAm":
+        stop_pct = -12.0
+        stop_label = "Stop ETF LatAm (-12%)"
+    else:
+        stop_pct = -10.0
+        stop_label = "Stop (-10%)"
+
+    # ══════════════════════════════════════════════════════════
+    # LÓGICA ETF — completamente distinta a acciones
+    # Los ETF no se venden por señales técnicas individuales
+    # ══════════════════════════════════════════════════════════
+
+    if tipo == "ETF_Indice":
+        # VOO, SPY, QQQ — acumulación de largo plazo
+        # NUNCA vender por señal técnica — solo rebalanceo o necesidad de capital
+        if pnl_pct <= -12.0:
+            return {
+                "señal": "⚠️ Corrección ETF Índice (-12%)",
+                "accion": "Considerar AGREGAR posición — el S&P500 siempre se recupera históricamente. Solo salir si necesitas el capital.",
+                "urgencia": "REVISAR",
+                "tramos": [(0,"MANTENER"),(100,"CONSIDERAR AGREGAR")],
+                "color": "2563EB",
+            }
+        if pnl_pct >= 25.0:
+            return {
+                "señal": "✅ ETF Índice +25% — Rebalanceo opcional",
+                "accion": f"Ganancia +{pnl_pct:.0f}%. Puedes vender 20-30% para rebalancear portafolio. Mantener el resto indefinidamente.",
+                "urgencia": "OPCIONAL",
+                "tramos": [(25,"REBALANCEO OPCIONAL"),(75,"MANTENER LP")],
+                "color": "16A34A",
+            }
+        if pnl_pct >= 15.0:
+            return {
+                "señal": f"📈 ETF Índice +{pnl_pct:.0f}% — en tendencia",
+                "accion": "Mantener. ETF índice no se vende en tendencia alcista. Stop mental en -12% desde precio de compra.",
+                "urgencia": "MANTENER",
+                "tramos": [(100,"MANTENER LP")],
+                "color": "16A34A",
+            }
+        if pnl_pct >= 0:
+            return {
+                "señal": f"📊 ETF Índice +{pnl_pct:.0f}%",
+                "accion": "Mantener. Horizonte largo plazo. Agregar en correcciones de -5% o más.",
+                "urgencia": "MANTENER",
+                "tramos": [(100,"MANTENER LP")],
+                "color": "2563EB",
+            }
+        # En pérdida — oportunidad de agregar
+        return {
+            "señal": f"⚡ ETF Índice {pnl_pct:.0f}% — oportunidad",
+            "accion": f"Pérdida temporal {pnl_pct:.0f}%. Considera agregar más VOO/SPY — las correcciones son oportunidades de acumulación. Stop mental -12%.",
+            "urgencia": "REVISAR",
+            "tramos": [(100,"MANTENER / AGREGAR")],
+            "color": "D97706",
+        }
+
+    elif tipo == "ETF_Sectorial":
+        # TAN, XBI — sector rotation, horizontes medios
+        # Stop -12%, targets +20/40/60%
+        if pnl_pct <= -12.0:
+            return {
+                "señal": "🛑 Stop ETF Sectorial (-12%)",
+                "accion": f"Stop activado en -12%. El sector cambió de tendencia. Salir y reasignar a sector más fuerte.",
+                "urgencia": "HOY",
+                "tramos": [(100,"VENDER TODO")],
+                "color": "DC2626",
+            }
+        if pnl_pct >= 60.0:
+            return {
+                "señal": f"🚀 ETF Sectorial +{pnl_pct:.0f}% — T3 runner",
+                "accion": "Objetivo T3 alcanzado. Vender 50%, mantener 50% con stop en +40% (breakeven alto).",
+                "urgencia": "HOY",
+                "tramos": [(50,"VENDER 50%"),(50,"RUNNER")],
+                "color": "16A34A",
+            }
+        if pnl_pct >= 40.0:
+            return {
+                "señal": f"✅ ETF Sectorial +{pnl_pct:.0f}% — T2",
+                "accion": "T2 alcanzado (+40%). Vender 40%. Mantener 60% con stop en +20%.",
+                "urgencia": "ESTA SEMANA",
+                "tramos": [(40,"VENDER 40%"),(60,"MANTENER")],
+                "color": "16A34A",
+            }
+        if pnl_pct >= 20.0:
+            return {
+                "señal": f"✅ ETF Sectorial +{pnl_pct:.0f}% — T1",
+                "accion": "T1 alcanzado (+20%). Vender 30%. Mover stop a breakeven (+0%). Dejar correr al T2 (+40%).",
+                "urgencia": "ESTA SEMANA",
+                "tramos": [(30,"VENDER 30%"),(70,"MANTENER")],
+                "color": "16A34A",
+            }
+        if pnl_pct >= 0:
+            return {
+                "señal": f"📈 ETF Sectorial +{pnl_pct:.0f}%",
+                "accion": f"En camino al T1 (+20%). Mantener. Stop en -12%.",
+                "urgencia": "MANTENER",
+                "tramos": [(100,"MANTENER")],
+                "color": "2563EB",
+            }
+        falta_stop = pnl_pct - (-12.0)
+        return {
+            "señal": f"⚠️ ETF Sectorial {pnl_pct:.0f}%",
+            "accion": f"Pérdida {pnl_pct:.0f}%. Stop a {abs(falta_stop):.1f}% de activarse (-12%). Revisar si el sector sigue válido.",
+            "urgencia": "VIGILAR",
+            "tramos": [(100,"MANTENER")],
+            "color": "D97706",
+        }
+
+    elif tipo == "ETF_Cripto":
+        # IBIT, ETHA — alta volatilidad, ciclos crypto
+        # Stop -20%, targets +30/60/100%
+        if pnl_pct <= -20.0:
+            return {
+                "señal": "🛑 Stop ETF Cripto (-20%)",
+                "accion": "Stop activado en -20%. Salir del ciclo bajista crypto. Reentrar cuando BTC/ETH retome tendencia alcista.",
+                "urgencia": "HOY",
+                "tramos": [(100,"VENDER TODO")],
+                "color": "DC2626",
+            }
+        if pnl_pct >= 100.0:
+            return {
+                "señal": f"🚀 ETF Cripto +{pnl_pct:.0f}% — T3 excepcional",
+                "accion": "Objetivo máximo superado. Vender 60%, mantener 40% como runner con stop en +60%.",
+                "urgencia": "ESTA SEMANA",
+                "tramos": [(60,"VENDER 60%"),(40,"RUNNER")],
+                "color": "16A34A",
+            }
+        if pnl_pct >= 60.0:
+            return {
+                "señal": f"✅ ETF Cripto +{pnl_pct:.0f}% — T2",
+                "accion": "T2 alcanzado (+60%). Vender 40%. Mantener 60% con stop en +30%. Ciclo crypto puede continuar.",
+                "urgencia": "ESTA SEMANA",
+                "tramos": [(40,"VENDER 40%"),(60,"MANTENER")],
+                "color": "16A34A",
+            }
+        if pnl_pct >= 30.0:
+            return {
+                "señal": f"✅ ETF Cripto +{pnl_pct:.0f}% — T1",
+                "accion": "T1 alcanzado (+30%). Vender 30%. Stop a breakeven (+0%). Dejar correr al T2 (+60%).",
+                "urgencia": "ESTA SEMANA",
+                "tramos": [(30,"VENDER 30%"),(70,"MANTENER")],
+                "color": "16A34A",
+            }
+        if pnl_pct >= 0:
+            falta = 30.0 - pnl_pct
+            return {
+                "señal": f"📈 ETF Cripto +{pnl_pct:.0f}%",
+                "accion": f"En camino al T1 (+30%). Faltan +{falta:.0f}%. Stop en -20%. Ciclos crypto son lentos — paciencia.",
+                "urgencia": "MANTENER",
+                "tramos": [(100,"MANTENER")],
+                "color": "2563EB",
+            }
+        falta_stop = pnl_pct - (-20.0)
+        return {
+            "señal": f"⚠️ ETF Cripto {pnl_pct:.0f}%",
+            "accion": f"Pérdida {pnl_pct:.0f}%. Stop a {abs(falta_stop):.1f}% de activarse (-20%). Crypto puede caer más — stop es amplio por diseño.",
+            "urgencia": "VIGILAR",
+            "tramos": [(100,"MANTENER")],
+            "color": "D97706",
+        }
+
+    # ══════════════════════════════════════════════════════════
+    # LÓGICA ACCIONES — T1/T2/Trailing original
+    # ══════════════════════════════════════════════════════════
+
+    stop_pct = -7.0
     if pnl_pct <= stop_pct:
         return {
             "señal": f"🛑 STOP ACTIVADO ({stop_pct}%)",
-            "accion": f"VENDER TODO AHORA - pérdida máxima alcanzada",
+            "accion": f"VENDER TODO AHORA — {stop_label}",
             "urgencia": "AHORA",
             "tramos": [(100, "VENDER TODO")],
             "color": "DC2626",
@@ -4642,11 +4820,11 @@ def generar_opinion_trader(
 # ─────────────────────────────────────────────────────────────
 #  MEMORIA DE TRADES — Google Sheets v18
 #  Registra entradas/salidas/candidatos automáticamente
-#  Sheet: "GrekoTrader_Memoria_Trades"
+#  Sheet: GrekoTrader_Senales_Modelo (señales) o GrekoTrader_Posiciones_Greko (paper)
 # ─────────────────────────────────────────────────────────────
 
 # ID del Google Sheet de memoria (se crea automáticamente la primera vez)
-_SHEET_NAME           = "GrekoTrader_Memoria_Trades"
+_SHEET_NAME           = "GrekoTrader_Senales_Modelo"  # v18: nombre correcto
 _SHEET_NAME_SENALES   = "GrekoTrader_Senales_Modelo"
 _SHEET_NAME_TRADES    = "GrekoTrader_Trades_Reales"
 _SHEET_NAME_MAURI     = "GrekoTrader_Posiciones_Mauri"
@@ -4947,9 +5125,15 @@ def guardar_posicion_sheets(nombre_sheet: str, df: pd.DataFrame) -> tuple:
         if not sheet_id:
             return False, f"Sheet '{nombre_sheet}' no encontrado"
         values = [list(df.columns)] + df.fillna("").values.tolist()
+        # v18: detectar nombre real de hoja (Hoja 1 en español, Sheet1 en inglés)
+        try:
+            _meta_gps = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+            _hoja_gps = _meta_gps["sheets"][0]["properties"]["title"]
+        except Exception:
+            _hoja_gps = "Hoja 1"
         svc.spreadsheets().values().update(
             spreadsheetId=sheet_id,
-            range="Sheet1!A1",
+            range=f"'{_hoja_gps}'!A1",
             valueInputOption="USER_ENTERED",
             body={"values": values}
         ).execute()
@@ -4988,13 +5172,14 @@ def escribir_trade_sheets(
     fue_correcto: str = "-",
     error_modelo: str = "-",
     notas: str = "",
+    area: str = "",    # v18: área del sector (opcional, usa RAW si vacío)
 ) -> tuple:
     """
-    Escribe una fila en Google Sheets GrekoTrader_Memoria_Trades.
+    Escribe una fila en Google Sheets según el tipo de registro.
     Retorna (ok: bool, mensaje: str)
     """
     import datetime as _dt
-    hoy = _dt.date.today().isoformat()
+    hoy = str(_dt.date.today().isoformat())  # v18: str() fuerza texto, evita serial de Excel
     
     resultado_pct = ""
     if precio_salida > 0 and precio_entrada > 0:
@@ -5009,24 +5194,39 @@ def escribir_trade_sheets(
         pass
 
     # Obtener Area del ticker desde RAW
-    _area_write = "-"
-    try:
-        for _r in RAW:
-            if isinstance(_r, tuple) and len(_r) > 2 and str(_r[0]).upper() == ticker.upper():
-                _area_write = str(_r[2])
-                break
-    except Exception:
-        pass
+    # v18: Area desde parámetro > RAW
+    _area_write = area if area and area not in ("-","","nan") else "-"
+    if _area_write == "-":
+        try:
+            for _r in RAW:
+                if isinstance(_r, tuple) and len(_r) > 2 and str(_r[0]).upper() == ticker.upper():
+                    _area_write = str(_r[2])
+                    break
+        except Exception:
+            pass
 
+    # v18 fix: orden exacto de columnas del Sheet GrekoTrader_Senales_Modelo
+    # Fecha_Señal | Ticker | Fase | Precio_Entrada | Score | Prob_NBIS |
+    # Cat_Fecha | Arrastradas | Lider | Opinion_Trader | Version_Modelo |
+    # SPY_RSI_Dia | Tipo | Notas | Timestamp | Area
     fila = [
-        hoy, ticker, _area_write, tipo, fase, precio_entrada,
-        cantidad, score, prob_nbis, cat_fecha, arrastradas, lider,
-        opinion[:100] if opinion else "-",
-        "v18", spy_rsi,
-        hoy if precio_salida > 0 else "-",
-        precio_salida if precio_salida > 0 else "-",
-        resultado_pct,
-        razon_salida, fue_correcto, error_modelo, notas
+        str(hoy),                               # Fecha_Señal
+        ticker,                                 # Ticker
+        fase,                                   # Fase
+        precio_entrada,                         # Precio_Entrada
+        score,                                  # Score
+        prob_nbis,                              # Prob_NBIS
+        cat_fecha,                              # Cat_Fecha
+        arrastradas,                            # Arrastradas
+        lider,                                  # Lider
+        # v18: asegurar que Opinion_Trader llega con contenido
+        (opinion[:150] if opinion and opinion not in ("-","","nan") else "-"),  # Opinion_Trader
+        "v18",                                  # Version_Modelo
+        spy_rsi,                                # SPY_RSI_Dia
+        tipo,                                   # Tipo
+        notas,                                  # Notas
+        str(hoy),                               # Timestamp
+        _area_write,                            # Area
     ]
 
     # v18 fix: usar el Sheet correcto según el tipo de registro
@@ -5070,11 +5270,87 @@ def escribir_trade_sheets(
         return False, f"❌ Error al guardar: {str(e)[:60]}"
 
 
+
+def escribir_greko_sheets(
+    ticker: str,
+    precio_compra: float,
+    fase: str,
+    score: int,
+    prob_nbis: float,
+    area: str,
+    tipo: str,
+    fuente: str,
+    arrastradas: str = "-",
+    opinion: str = "-",
+    cantidad: float = 0,
+    notas: str = "",
+) -> tuple:
+    """
+    v18: Escribe una señal en GrekoTrader_Posiciones_Greko
+    con las 19 columnas del momento exacto de la señal.
+    Se llama desde el botón 🦅 en Tab2/Tab3/Tab5.
+    """
+    import datetime as _dtg
+    hoy = _dtg.date.today().isoformat()
+
+    # SPY RSI del día
+    spy_rsi = "-"
+    try:
+        _mkt_g = st.session_state.get("mercado_data", {})
+        spy_rsi = round(float(_mkt_g.get("spy", {}).get("rsi", 0)), 1)
+    except Exception:
+        pass
+
+    # Precio Max y Min histórico desde hoy (al entrar son iguales al precio)
+    fila_greko = [
+        ticker,           # Ticker
+        precio_compra,    # Precio_Compra
+        cantidad,         # Cantidad
+        hoy,              # Fecha_Entrada
+        fuente,           # Fuente
+        fase,             # Fase
+        score,            # Score
+        prob_nbis,        # Prob_NBIS
+        spy_rsi,          # SPY_RSI_Dia
+        area,             # Area
+        tipo,             # Tipo
+        arrastradas,      # Arrastradas
+        opinion[:120] if opinion else "-",  # Opinion_Trader
+        "",               # Precio_Salida (vacío al entrar)
+        "",               # Fecha_Salida
+        "",               # Fue_Correcto
+        "",               # Razon_Salida
+        "",               # Error_Modelo
+        notas,            # Notas
+    ]
+
+    try:
+        svc = _get_sheets_service()
+        if not svc:
+            return False, "Google Sheets no configurado"
+        sheet_id = _buscar_sheet_id(_SHEET_NAME_GREKO)
+        if not sheet_id:
+            return False, f"Sheet '{_SHEET_NAME_GREKO}' no encontrado"
+        meta_g = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        hoja_g = meta_g["sheets"][0]["properties"]["title"]
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"'{hoja_g}'!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [fila_greko]}
+        ).execute()
+        limpiar_cache_sheets_only()
+        return True, f"✅ {ticker} agregado a Posiciones Greko"
+    except Exception as e:
+        return False, f"❌ Error: {str(e)[:80]}"
+
 def render_boton_registro(
     ticker: str, fase: str, precio: float, score: int,
     prob_nbis: float, cat_fecha: str, arrastradas: str,
     lider: str, opinion: str, key_prefix: str,
-    tipo: str = "ENTRADA"
+    tipo: str = "ENTRADA",
+    area: str = ""
 ):
     """
     Renderiza el botón de registro + formulario rápido.
@@ -5121,6 +5397,7 @@ def render_boton_registro(
                 precio_salida=_p_sal, razon_salida=_razon,
                 fue_correcto=_correcto, error_modelo=_error,
                 notas=_notas,
+                area=area,
             )
             if ok:
                 st.success(msg)
@@ -6040,8 +6317,8 @@ trades_reales_id = "ID_del_sheet"
 df = pd.DataFrame()
 
 # v15 fix: Arrastradas y Lider ahora visibles en todas las tablas
-COLS_MAIN=["Ticker","Score_Rebote","Nivel_Rebote","Etapa_v12","Area","Precio","RSI","DD_pico","Cat_Fecha","Arrastradas","Lider","Prob_NBIS","Opinion_Trader","Lectura"]
-COLS_EXT =["Ticker","Score_Rebote","Nivel_Rebote","Etapa_v12","Area","Decision","Precio","Score","RSI","DD_pico","Cat_Fecha","Arrastradas","Lider","Prob_NBIS","Detalle_Rebote","Opinion_Trader","Lectura"]
+COLS_MAIN=["Ticker","Score_Rebote","Nivel_Rebote","Etapa_v12","Area","Precio","RSI","DD_pico","Cat_Fecha","Prob_NBIS","Opinion_Trader","Lectura"]
+COLS_EXT =["Ticker","Score_Rebote","Nivel_Rebote","Etapa_v12","Area","Decision","Precio","Score","RSI","DD_pico","Cat_Fecha","Prob_NBIS","Detalle_Rebote","Opinion_Trader","Lectura"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -6171,30 +6448,62 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
     if "Señal modelo" not in cols_con_senal:
         cols_con_senal = ["Ticker","Señal modelo"] + [c for c in cols_con_senal if c not in ("Ticker","Señal modelo")]
 
-    # ── BOTÓN REGISTRO v18 — guardar señal como candidato ──────────
+    # ── BOTONES DE REGISTRO v18 ─────────────────────────────────
     if not df_show.empty:
-        _reg_col1, _reg_col2 = st.columns([2,3])
+        _reg_col1, _reg_col2, _reg_col3 = st.columns([2,2,2])
         with _reg_col1:
             _reg_tk = st.selectbox(
-                "💾 Registrar señal",
-                ["— seleccionar ticker —"] + list(df_show["Ticker"].unique()),
+                "Seleccionar ticker",
+                ["— seleccionar —"] + list(df_show["Ticker"].unique()),
                 key=f"reg_sel_{tab_key}",
-                help="Guarda esta señal en tu memoria de trades (Google Sheets)"
+                label_visibility="collapsed",
             )
-        if _reg_tk != "— seleccionar ticker —":
-            _rr = df_show[df_show["Ticker"]==_reg_tk].iloc[0]
-            render_boton_registro(
-                ticker=_reg_tk,
-                fase=str(_rr.get("Etapa_v12",_rr.get("Fase",""))),
-                precio=float(_rr.get("Precio",0)),
-                score=int(_rr.get("Score",_rr.get("Score_Rebote",0))),
-                prob_nbis=float(_rr.get("Prob_NBIS",0)),
-                cat_fecha=str(_rr.get("Cat_Fecha","-")),
-                arrastradas=str(_rr.get("Arrastradas","-")),
-                lider=str(_rr.get("Lider","-")),
-                opinion=str(_rr.get("Opinion_Trader","-")),
-                key_prefix=tab_key, tipo="CANDIDATO",
+        with _reg_col2:
+            _reg_cant = st.number_input(
+                "Cantidad", min_value=0.0, value=0.0, step=1.0,
+                key=f"reg_cant_{tab_key}", label_visibility="collapsed",
+                help="Cantidad de acciones (0 = sin especificar)"
             )
+        with _reg_col3:
+            _reg_nota = st.text_input(
+                "Nota", value="", key=f"reg_nota_{tab_key}",
+                label_visibility="collapsed", placeholder="nota..."
+            )
+
+        if _reg_tk != "— seleccionar —":
+            _rr       = df_show[df_show["Ticker"]==_reg_tk].iloc[0]
+            _rr_tk    = _reg_tk
+            _rr_precio= float(_rr.get("Precio",0))
+            _rr_fase  = str(_rr.get("Etapa_v12",_rr.get("Fase","")))
+            _rr_score = int(_rr.get("Score",_rr.get("Score_Rebote",0)))
+            _rr_prob  = float(_rr.get("Prob_NBIS",0))
+            _rr_arr   = str(_rr.get("Arrastradas","-"))
+            _rr_op    = str(_rr.get("Opinion_Trader","-"))
+            _rr_area  = str(_rr.get("Area","-"))
+
+            _bc1, _bc2 = st.columns(2)
+            with _bc1:
+                if st.button(f"🦅 Agregar a Posiciones Greko",
+                             key=f"btn_greko_{tab_key}_{_rr_tk}",
+                             use_container_width=True, type="primary",
+                             help="Paper trading — registra señal para validar el modelo"):
+                    _ok_g, _msg_g = escribir_greko_sheets(
+                        ticker=_rr_tk, precio_compra=_rr_precio,
+                        fase=_rr_fase, score=_rr_score, prob_nbis=_rr_prob,
+                        area=_rr_area, tipo="Accion", fuente=tab_key,
+                        arrastradas=_rr_arr, opinion=_rr_op,
+                        cantidad=_reg_cant, notas=_reg_nota,
+                    )
+                    if _ok_g: st.success(_msg_g)
+                    else:     st.error(_msg_g)
+            with _bc2:
+                render_boton_registro(
+                    ticker=_rr_tk, fase=_rr_fase, precio=_rr_precio,
+                    score=_rr_score, prob_nbis=_rr_prob,
+                    cat_fecha=str(_rr.get("Cat_Fecha","-")),
+                    arrastradas=_rr_arr, lider=str(_rr.get("Lider","-")),
+                    opinion=_rr_op, key_prefix=tab_key, tipo="CANDIDATO",
+                )
 
     render_table(df_show, cols_con_senal, tab_key=tab_key)
 
@@ -7113,8 +7422,9 @@ with tab2:
                         cat_fecha=str(_rw.get("Cat_Fecha","-")),
                         arrastradas=str(_rw.get("Arrastradas","-")),
                         lider=str(_rw.get("Lider","-")),
-                        opinion=str(_rw.get("Lectura","-")),
-                        key_prefix="tab2", tipo="CANDIDATO"
+                        opinion=str(_rw.get("Opinion_Trader", _rw.get("Lectura", "-"))),
+                        key_prefix="tab2", tipo="CANDIDATO",
+                        area=str(_rw.get("Area","-")),
                     )
 
         # Exportar
@@ -7377,7 +7687,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
         rows_html = ""
         cols_wl = ["Ticker","Area","Decision","Fase","Trigger","Precio",
                    "RSI","Volumen","EMA50","MACD","Score","Cat_Fecha",
-                   "Arrastradas","Lider","Opinion_Trader",
+                   "Opinion_Trader",
                    "Prob_NBIS","Sim_NBIS","Motivo","Nota","Fuente"]
 
         hdr_names = {
@@ -7497,8 +7807,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                 f"<td><span style='color:{_macd_color};font-weight:600'>{macd_v:+.2f}</span></td>"
                 f"<td><span style='color:{sc2};font-weight:700'>{_r_score}</span></td>"
                 f"<td>{earn_cell}</td>"
-                f"<td>{arr_chips_wl}</td>"
-                f"<td>{lid_chip_wl}</td>"
+                # Arrastradas/Lider ocultos visualmente — datos en Google Sheet
                 f"<td><span style='color:{prob_c};font-weight:700'>{_r_prob_nbis}</span></td>"
                 f"<td><span style='color:{sim_c};font-weight:700'>{round(float(_r_sim_nbis),1)}</span></td>"
                 f"<td><span style='color:{TXT_MUT};font-size:11px'>{_r_motivo}</span></td>"
@@ -7595,6 +7904,26 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                     opinion=str(_rw_wl.get("Opinion_Trader","-")),
                     key_prefix="tab5", tipo="ENTRADA"
                 )
+                # ── Botón 🦅 Greko en Watchlist ──────────────
+                _wl_tk_g = str(_rw_wl.get("Ticker",""))
+                if st.button(f"🦅 Agregar a Posiciones Greko",
+                             key=f"btn_greko_wl_{_wl_tk_g}",
+                             use_container_width=True,
+                             help="Paper trading — registra para validar el modelo"):
+                    _ok_wg, _msg_wg = escribir_greko_sheets(
+                        ticker=_wl_tk_g,
+                        precio_compra=float(_rw_wl.get("Precio",0)),
+                        fase=str(_rw_wl.get("Fase","")),
+                        score=int(_rw_wl.get("Score",0)),
+                        prob_nbis=float(_rw_wl.get("Prob_NBIS",0)),
+                        area=str(_rw_wl.get("Area","-")),
+                        tipo="Accion",
+                        fuente="Watchlist",
+                        arrastradas=str(_rw_wl.get("Arrastradas","-")),
+                        opinion=str(_rw_wl.get("Opinion_Trader","-")),
+                    )
+                    if _ok_wg: st.success(_msg_wg)
+                    else:      st.error(_msg_wg)
             st.markdown('</div>', unsafe_allow_html=True)
         wl_entrar = wl_res_df[wl_res_df["Decision"].isin(["ENTRAR","ANTICIPAR"])].sort_values("Score",ascending=False) if "Score" in wl_res_df.columns else wl_res_df[wl_res_df["Decision"].isin(["ENTRAR","ANTICIPAR"])]
         if not wl_entrar.empty:
@@ -7634,241 +7963,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 # ══ TAB 6 - MIS POSICIONES ═════════════════════════════════════
 # ══ TAB 7 - MIS POSICIONES ═════════════════════════════════════
 with tab_greko:
-    # ══ TAB C — POSICIONES GREKO (Paper Trading) ══════════════
-    # Registra las recomendaciones del modelo para medir su win rate real
-    # Sin dinero real — solo seguimiento para calibrar el modelo
-
-    st.markdown(
-        f'<div style="background:#F5F3FF;border:2px solid #C4B5FD;border-radius:14px;'
-        f'padding:16px 20px;margin-bottom:16px">'
-        f'<div style="font-size:16px;font-weight:800;color:#7C3AED;margin-bottom:6px">'
-        f'🦅 Posiciones Greko — Paper Trading del Modelo</div>'
-        f'<div style="font-size:12px;color:#374151;line-height:1.7">'
-        f'Aquí van las recomendaciones del modelo que decides seguir en papel — '
-        f'<strong>sin dinero real</strong>. '
-        f'Cada vez que el modelo dice M2/M3, lo registras aquí. '
-        f'Cuando cierra, marcas si ganó o perdió. '
-        f'Con eso calculamos el win rate real del modelo.</div>'
-        f'</div>', unsafe_allow_html=True)
-
-    # ── Cargar desde Google Sheets ───────────────────────────
-    _sheets_greko = leer_posiciones_sheets(_SHEET_NAME_GREKO)
-
-    if _sheets_greko is not None and not _sheets_greko.empty:
-        st.markdown(
-            f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
-            f'border-radius:8px;padding:8px 14px;margin-bottom:10px;font-size:11px">'
-            f'<span style="font-weight:700;color:#16A34A">✅ Google Sheets conectado</span> — '
-            f'{len(_sheets_greko)} posiciones Greko cargadas</div>',
-            unsafe_allow_html=True)
-    else:
-        st.info("Sin posiciones Greko registradas aún. Usa el formulario abajo para agregar.")
-
-    # ── Formulario para agregar nueva posición Greko ─────────
-    with st.expander("➕ Registrar nueva recomendación del modelo", expanded=False):
-        _gc1,_gc2,_gc3,_gc4 = st.columns(4)
-        with _gc1: _g_tk     = st.text_input("Ticker", key="greko_tk").upper()
-        with _gc2: _g_precio = st.number_input("Precio entrada", min_value=0.01, value=100.0, key="greko_precio")
-        with _gc3: _g_fase   = st.selectbox("Fase", ["M3","M2","SWING"], key="greko_fase")
-        with _gc4: _g_fuente = st.selectbox("Fuente", ["Swing Activo","Watchlist","Detectadas M1","Manual"], key="greko_fuente")
-        _gc5,_gc6,_gc7 = st.columns(3)
-        with _gc5: _g_score  = st.number_input("Score modelo", min_value=0, max_value=100, value=60, key="greko_score")
-        with _gc6: _g_prob   = st.number_input("Prob NBIS %", min_value=0, max_value=100, value=50, key="greko_prob")
-        with _gc7: _g_fecha  = st.date_input("Fecha recomendación", key="greko_fecha")
-        _g_notas = st.text_input("Notas / razón del modelo", key="greko_notas")
-
-        if st.button("🦅 Registrar posición Greko", key="btn_greko_add",
-                     use_container_width=True, type="primary"):
-            if _g_tk:
-                # Obtener área del ticker desde RAW
-                _area_greko = "-"
-                try:
-                    for _r in RAW:
-                        if isinstance(_r, tuple) and len(_r) > 2 and str(_r[0]).upper() == _g_tk:
-                            _area_greko = str(_r[2])
-                            break
-                except Exception:
-                    pass
-
-                _nueva_fila = {
-                    "Ticker": _g_tk,
-                    "Area": _area_greko,
-                    "Precio_Compra": _g_precio,
-                    "Cantidad": 0,
-                    "Fecha": str(_g_fecha),
-                    "Notas": _g_notas,
-                    "Fecha_Recomendacion": str(_g_fecha),
-                    "Fuente": _g_fuente,
-                    "Fase": _g_fase,
-                    "Score": _g_score,
-                    "Prob_NBIS": _g_prob,
-                    "Precio_Salida": "",
-                    "Fecha_Salida": "",
-                    "Resultado_Pct": "",
-                    "Fue_Correcto": "",
-                    "Error_Modelo": "",
-                }
-                # Escribir en Google Sheets
-                try:
-                    _ok, _msg = escribir_trade_sheets(
-                        tipo="GREKO_PAPER",
-                        ticker=_g_tk,
-                        precio=_g_precio,
-                        fase=_g_fase,
-                        score=_g_score,
-                        prob_nbis=_g_prob,
-                        cat_fecha=str(_g_fecha),
-                        notas=_g_notas,
-                        sheet_name=_SHEET_NAME_GREKO,
-                    )
-                    if _ok:
-                        st.success(f"✅ {_g_tk} registrado en Posiciones Greko")
-                        limpiar_cache_sheets_only()
-                        st.rerun()
-                    else:
-                        # Guardar localmente si falla Sheets
-                        if "greko_local" not in st.session_state:
-                            st.session_state["greko_local"] = []
-                        st.session_state["greko_local"].append(_nueva_fila)
-                        st.success(f"✅ {_g_tk} guardado localmente (Sheets: {_msg})")
-                except Exception as _eg:
-                    if "greko_local" not in st.session_state:
-                        st.session_state["greko_local"] = []
-                    st.session_state["greko_local"].append(_nueva_fila)
-                    st.success(f"✅ {_g_tk} guardado localmente")
-
-    # ── Tabla de posiciones Greko ────────────────────────────
-    # Combinar Sheets + local
-    _greko_rows = []
-    if _sheets_greko is not None and not _sheets_greko.empty:
-        _greko_rows = _sheets_greko.to_dict("records")
-    _greko_rows += st.session_state.get("greko_local", [])
-
-    if _greko_rows:
-        # KPIs del paper trading
-        _g_total  = len(_greko_rows)
-        _g_cerradas = [r for r in _greko_rows if str(r.get("Fue_Correcto","")).strip() != ""]
-        _g_ganadoras = [r for r in _g_cerradas if str(r.get("Fue_Correcto","")).upper() in ("SI","SÍ","YES","TRUE","1")]
-        _g_wr = round(len(_g_ganadoras)/len(_g_cerradas)*100,1) if _g_cerradas else 0
-        _g_abiertas = _g_total - len(_g_cerradas)
-
-        _gk1,_gk2,_gk3,_gk4 = st.columns(4)
-        for _gkc, _gkv, _gkl, _gkco in [
-            (_gk1, f"{_g_total}",    "Total posiciones",  "#7C3AED"),
-            (_gk2, f"{_g_abiertas}", "Abiertas",          "#2563EB"),
-            (_gk3, f"{len(_g_cerradas)}", "Cerradas",     "#374151"),
-            (_gk4, f"{_g_wr}%",      "Win Rate Modelo",
-             "#16A34A" if _g_wr>=60 else "#D97706" if _g_wr>=50 else "#DC2626"),
-        ]:
-            with _gkc:
-                st.markdown(
-                    f'<div style="background:white;border:1px solid #E9D5FF;'
-                    f'border-radius:10px;padding:12px;text-align:center">'
-                    f'<div style="font-size:10px;color:#6B7280;font-weight:600">{_gkl}</div>'
-                    f'<div style="font-size:24px;font-weight:800;color:{_gkco}">{_gkv}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-
-        # Tabla de posiciones
-        rows_greko = ""
-        for _idx_g, _rg in enumerate(_greko_rows):
-            _tk_g    = str(_rg.get("Ticker",""))
-            _pc_g    = _rg.get("Precio_Compra",0)
-            _ps_g    = _rg.get("Precio_Salida","")
-            _res_g   = _rg.get("Resultado_Pct","")
-            _correc  = str(_rg.get("Fue_Correcto","")).upper()
-            _fase_g  = str(_rg.get("Fase",""))
-            _score_g = _rg.get("Score","")
-            _prob_g  = _rg.get("Prob_NBIS","")
-            _fuente_g= str(_rg.get("Fuente",""))
-            _fecha_g = str(_rg.get("Fecha_Recomendacion", _rg.get("Fecha","")))[:10]
-            _error_g = str(_rg.get("Error_Modelo",""))
-
-            # Calcular resultado en vivo si está abierta
-            _precio_live = 0.0
-            _res_live    = ""
-            try:
-                import yfinance as _yf_g
-                _precio_live = float(_yf_g.Ticker(_tk_g).fast_info.last_price or 0)
-                if _precio_live > 0 and float(_pc_g) > 0:
-                    _res_live = round((_precio_live/float(_pc_g)-1)*100,1)
-            except Exception:
-                pass
-
-            _estado_g = ("✅ Ganadora" if _correc in ("SI","SÍ","YES","TRUE","1")
-                        else "❌ Perdedora" if _correc in ("NO","FALSE","0")
-                        else "🔄 Abierta")
-            _est_c = "#16A34A" if "✅" in _estado_g else "#DC2626" if "❌" in _estado_g else "#2563EB"
-            _res_color = "#16A34A" if isinstance(_res_live,float) and _res_live>0 else "#DC2626"
-
-            # Obtener area del ticker
-            _area_g = str(_rg.get("Area","-"))
-            _area_color_g = SECTOR_COLORS.get(_area_g, TXT_MUT)
-            rows_greko += (
-                f"<tr>"
-                f"<td><span style='color:{_area_color_g};font-size:10px;font-weight:600'>{_area_g}</span></td>"
-                f"<td><strong style='color:#7C3AED'>{_tk_g}</strong></td>"
-                f"<td>{_fecha_g}</td>"
-                f"<td><span style='background:#F5F3FF;color:#7C3AED;border-radius:4px;padding:1px 6px;font-size:10px'>{_fase_g}</span></td>"
-                f"<td>{_fuente_g}</td>"
-                f"<td>${float(_pc_g):.2f}</td>"
-                f"<td><span style='color:{_res_color};font-weight:700'>"
-                f"{'%+.1f%%' % _res_live if isinstance(_res_live,float) and _res_live!='' else '—'}"
-                f"</span></td>"
-                f"<td>{_score_g}</td>"
-                f"<td>{_prob_g}%</td>"
-                f"<td><span style='color:{_est_c};font-weight:700'>{_estado_g}</span></td>"
-                f"<td style='font-size:9px;color:#6B7280'>{_error_g[:30]}</td>"
-                f"</tr>"
-            )
-
-        _hdr_g = "<tr>" + "".join(
-            f"<th>{h}</th>" for h in
-            ["Area","Ticker","Fecha","Fase","Fuente","Entrada","Resultado Live",
-             "Score","Prob","Estado","Error Modelo"]
-        ) + "</tr>"
-
-        st.markdown(
-            f'<div class="tbl-wrap"><table class="dtbl">'
-            f'<thead>{_hdr_g}</thead><tbody>{rows_greko}</tbody>'
-            f'</table></div>', unsafe_allow_html=True)
-
-        # Cerrar posición Greko
-        st.markdown("---")
-        st.markdown("**🏁 Cerrar posición Greko:**")
-        _close_cols = st.columns([2,1,1,2,1])
-        with _close_cols[0]:
-            _tickers_greko_open = [r["Ticker"] for r in _greko_rows
-                                   if str(r.get("Fue_Correcto","")).strip() == ""]
-            _g_close_tk = st.selectbox("Ticker a cerrar", ["—"] + _tickers_greko_open,
-                                        key="greko_close_tk")
-        with _close_cols[1]:
-            _g_close_precio = st.number_input("Precio salida", min_value=0.01,
-                                               value=100.0, key="greko_close_precio")
-        with _close_cols[2]:
-            _g_close_correcto = st.selectbox("¿Fue correcto?", ["SI","NO","PARCIAL"],
-                                              key="greko_close_correcto")
-        with _close_cols[3]:
-            _g_close_error = st.text_input("Error del modelo (si falló)",
-                                            key="greko_close_error")
-        with _close_cols[4]:
-            if st.button("✅ Cerrar", key="btn_greko_close") and _g_close_tk != "—":
-                st.success(f"✅ {_g_close_tk} cerrada — actualizar manualmente en Google Sheets "
-                           f"con Precio_Salida={_g_close_precio}, Fue_Correcto={_g_close_correcto}")
-
-        # Exportar
-        _df_greko_exp = pd.DataFrame(_greko_rows)
-        st.download_button(
-            "⬇️ Exportar Posiciones Greko CSV",
-            _df_greko_exp.to_csv(index=False).encode("utf-8"),
-            f"posiciones_greko_{pd.Timestamp.today().date()}.csv",
-            "text/csv", use_container_width=True
-        )
-
-
-with tab6:
-    st.markdown(f'<div class="sec-header" style="background:{B_BG};border-color:{B_BOR}"><span style="font-size:20px">💼</span><div><span style="font-size:16px;font-weight:700;color:{B}">Mis posiciones abiertas</span><span style="font-size:12px;color:{TXT_MUT};margin-left:10px">Carga tu CSV  - señales de salida  - Prob. NBIS  - Similitud</span></div></div>',unsafe_allow_html=True)
+    st.markdown(f'<div class="sec-header" style="background:#F5F3FF;border-color:#C4B5FD"><span style="font-size:20px">🦅</span><div><span style="font-size:16px;font-weight:700;color:#7C3AED">Posiciones Greko — Paper Trading</span><span style="font-size:12px;color:{TXT_MUT};margin-left:10px">Carga tu CSV  - señales de salida  - Prob. NBIS  - Similitud</span></div></div>',unsafe_allow_html=True)
 
     # ── Instrucciones CSV ──────────────────────────────────
     with st.expander("📋 Formato del CSV - cómo preparar el archivo", expanded=False):
@@ -7901,19 +7996,19 @@ También puedes descargar la plantilla de abajo y completarla.
             csv_template,
             "posiciones_template.csv",
             "text/csv",
-            key="dl_template",
+            key="dl_template_g",
         )
 
     # ── v18: Cargar posiciones VIVAS desde Google Sheets ───────
-    _sheets_mauri = leer_posiciones_sheets(_SHEET_NAME_MAURI)
+    _sheets_greko_p = leer_posiciones_sheets(_SHEET_NAME_GREKO)
     _sheets_error = st.session_state.get("sheets_error")
 
-    if _sheets_mauri is not None:
+    if _sheets_greko_p is not None:
         st.markdown(
             f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
             f'border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:11px">'
             f'<span style="font-weight:700;color:#16A34A">✅ Google Sheets conectado</span> — '
-            f'{len(_sheets_mauri)} posiciones cargadas desde <strong>{_SHEET_NAME_MAURI}</strong> · '
+            f'{len(_sheets_greko_p)} posiciones cargadas desde <strong>{_SHEET_NAME_MAURI}</strong> · '
             f'Ventas y retiros persisten automáticamente.</div>',
             unsafe_allow_html=True)
     elif _sheets_error:
@@ -7922,7 +8017,7 @@ También puedes descargar la plantilla de abajo y completarla.
             "secrets_missing":
                 ("⚙️ Secrets no configurados",
                  "Ve a Streamlit Cloud → Settings → Secrets y pega el bloque toml."),
-            "not_found:GrekoTrader_Posiciones_Mauri":
+            "not_found:GrekoTrader_Posiciones_Greko":
                 ("📄 Sheet no encontrado",
                  f"El Sheet '{_SHEET_NAME_MAURI}' no existe o no está compartido. "
                  f"Compártelo con el email del service account (ver guía)."),
@@ -7955,7 +8050,7 @@ También puedes descargar la plantilla de abajo y completarla.
 
         # Botón para limpiar cache y reintentar
         if st.button("🔄 Reintentar conexión a Google Sheets",
-                     key="btn_retry_sheets", use_container_width=False):
+                     key="btn_retry_sheets_g", use_container_width=False):
             limpiar_cache_sheets_only()
             st.rerun()
 
@@ -7981,19 +8076,23 @@ También puedes descargar la plantilla de abajo y completarla.
 
     # ── Upload CSV manual (si no hay Sheets) ────────────────────
     uploaded = st.file_uploader(
-        "📂 Subir archivo CSV con posiciones" + (" (opcional — ya cargado desde Sheets)" if _sheets_mauri is not None else ""),
+        "📂 Subir archivo CSV con posiciones" + (" (opcional — ya cargado desde Sheets)" if _sheets_greko_p is not None else ""),
         type=["csv"],
         help="Formato: Ticker, Fecha_Compra, Precio_Compra, Cantidad",
+        key="uploader_greko",
     )
 
-    posiciones_df = None
+    posiciones_greko_df = None
 
     # v18: usar Sheets como fuente primaria si está disponible
-    if _sheets_mauri is not None:
-        posiciones_df = _sheets_mauri.copy()
+    if _sheets_greko_p is not None:
+        posiciones_greko_df = _sheets_greko_p.copy()
         # Normalizar columnas igual que el CSV
-        if "Fecha_Compra" in posiciones_df.columns and "Fecha" not in posiciones_df.columns:
-            posiciones_df = posiciones_df.rename(columns={"Fecha_Compra":"Fecha"})
+        # v18 fix: normalizar tanto Fecha_Compra como Fecha_Entrada → Fecha
+        if "Fecha_Entrada" in posiciones_greko_df.columns and "Fecha" not in posiciones_greko_df.columns:
+            posiciones_greko_df = posiciones_greko_df.rename(columns={"Fecha_Entrada":"Fecha"})
+        elif "Fecha_Compra" in posiciones_greko_df.columns and "Fecha" not in posiciones_greko_df.columns:
+            posiciones_greko_df = posiciones_greko_df.rename(columns={"Fecha_Compra":"Fecha"})
 
     if uploaded:
         try:
@@ -8001,64 +8100,109 @@ También puedes descargar la plantilla de abajo y completarla.
             _raw_pos = uploaded.read()
             _sep_pos = ";" if b";" in _raw_pos[:200] else ","
             import io
-            posiciones_df = pd.read_csv(io.BytesIO(_raw_pos),
+            posiciones_greko_df = pd.read_csv(io.BytesIO(_raw_pos),
                                         sep=_sep_pos,
                                         encoding="utf-8-sig",
                                         on_bad_lines="skip")
-            posiciones_df.columns = [c.strip() for c in posiciones_df.columns]
-            if "Fecha_Compra" in posiciones_df.columns and "Fecha" not in posiciones_df.columns:
-                posiciones_df = posiciones_df.rename(columns={"Fecha_Compra": "Fecha"})
+            posiciones_greko_df.columns = [c.strip() for c in posiciones_greko_df.columns]
+            if "Fecha_Compra" in posiciones_greko_df.columns and "Fecha" not in posiciones_greko_df.columns:
+                posiciones_greko_df = posiciones_greko_df.rename(columns={"Fecha_Compra": "Fecha"})
             required = ["Ticker","Precio_Compra","Cantidad","Fecha"]
-            missing = [c for c in required if c not in posiciones_df.columns]
+            missing = [c for c in required if c not in posiciones_greko_df.columns]
             if missing:
                 st.error(f"❌ Columnas faltantes en el CSV: {', '.join(missing)}")
-                posiciones_df = _sheets_mauri.copy() if _sheets_mauri is not None else None
+                posiciones_greko_df = _sheets_greko_p.copy() if _sheets_greko_p is not None else None
             else:
-                posiciones_df["Ticker"]        = posiciones_df["Ticker"].str.upper().str.strip()
-                posiciones_df["Precio_Compra"] = pd.to_numeric(posiciones_df["Precio_Compra"], errors="coerce")
-                posiciones_df["Cantidad"]      = pd.to_numeric(posiciones_df["Cantidad"], errors="coerce")
-                posiciones_df = posiciones_df.dropna(subset=["Precio_Compra","Cantidad"])
+                posiciones_greko_df["Ticker"]        = posiciones_greko_df["Ticker"].str.upper().str.strip()
+                posiciones_greko_df["Precio_Compra"] = pd.to_numeric(posiciones_greko_df["Precio_Compra"], errors="coerce")
+                posiciones_greko_df["Cantidad"]      = pd.to_numeric(posiciones_greko_df["Cantidad"], errors="coerce")
+                posiciones_greko_df = posiciones_greko_df.dropna(subset=["Precio_Compra","Cantidad"])
                 for _fcol in ["Fecha","Cat_Fecha"]:
-                    if _fcol in posiciones_df.columns:
-                        posiciones_df[_fcol] = pd.to_datetime(
-                            posiciones_df[_fcol], dayfirst=True, errors="coerce"
+                    if _fcol in posiciones_greko_df.columns:
+                        posiciones_greko_df[_fcol] = pd.to_datetime(
+                            posiciones_greko_df[_fcol], dayfirst=True, errors="coerce"
                         ).dt.strftime("%Y-%m-%d").fillna("-")
-                if "Cat_Fecha" not in posiciones_df.columns:
-                    posiciones_df["Cat_Fecha"] = "-"
-                if "Tipo" not in posiciones_df.columns:
-                    posiciones_df["Tipo"] = "Accion"
-                if "Estrategia" not in posiciones_df.columns:
-                    posiciones_df["Estrategia"] = "Swing"
-                if posiciones_df["Ticker"].duplicated().any():
-                    n_dup = posiciones_df["Ticker"].duplicated().sum()
-                    tickers_dup = posiciones_df[posiciones_df["Ticker"].duplicated(keep=False)]["Ticker"].unique().tolist()
+                if "Cat_Fecha" not in posiciones_greko_df.columns:
+                    posiciones_greko_df["Cat_Fecha"] = "-"
+                if "Tipo" not in posiciones_greko_df.columns:
+                    posiciones_greko_df["Tipo"] = "Accion"
+                if "Estrategia" not in posiciones_greko_df.columns:
+                    posiciones_greko_df["Estrategia"] = "Swing"
+                if posiciones_greko_df["Ticker"].duplicated().any():
+                    n_dup = posiciones_greko_df["Ticker"].duplicated().sum()
+                    tickers_dup = posiciones_greko_df[posiciones_greko_df["Ticker"].duplicated(keep=False)]["Ticker"].unique().tolist()
                     st.info(f"ℹ️ {tickers_dup} tienen múltiples compras - se muestran como filas separadas.")
-                st.success(f"✅ CSV cargado — {len(posiciones_df)} posiciones encontradas")
+                st.success(f"✅ CSV cargado — {len(posiciones_greko_df)} posiciones encontradas")
         except Exception as e:
             st.error(f"❌ Error leyendo el CSV: {e}")
-            posiciones_df = _sheets_mauri.copy() if _sheets_mauri is not None else None
-    elif _sheets_mauri is not None:
+            posiciones_greko_df = _sheets_greko_p.copy() if _sheets_greko_p is not None else None
+    elif _sheets_greko_p is not None:
         # ── v18 fix: usar Sheets si no hay CSV subido ─────────
+        posiciones_greko_df = _sheets_greko_p.copy()  # ← asignación que faltaba
         # Normalizar columnas necesarias
-        posiciones_df["Ticker"]        = posiciones_df["Ticker"].str.upper().str.strip()
-        posiciones_df["Precio_Compra"] = pd.to_numeric(posiciones_df["Precio_Compra"], errors="coerce")
-        posiciones_df["Cantidad"]      = pd.to_numeric(posiciones_df["Cantidad"], errors="coerce")
-        posiciones_df = posiciones_df.dropna(subset=["Precio_Compra","Cantidad"])
-        for _fcol in ["Fecha","Cat_Fecha","Fecha_Compra"]:
-            if _fcol in posiciones_df.columns:
-                posiciones_df[_fcol] = pd.to_datetime(
-                    posiciones_df[_fcol], dayfirst=True, errors="coerce"
+        posiciones_greko_df["Ticker"]        = posiciones_greko_df["Ticker"].str.upper().str.strip()
+        posiciones_greko_df["Precio_Compra"] = pd.to_numeric(posiciones_greko_df["Precio_Compra"], errors="coerce")
+        posiciones_greko_df["Cantidad"]      = pd.to_numeric(posiciones_greko_df["Cantidad"], errors="coerce")
+        posiciones_greko_df = posiciones_greko_df.dropna(subset=["Precio_Compra","Cantidad"])
+        # v18: normalizar todos los nombres posibles de fecha
+        for _fcol in ["Fecha","Cat_Fecha","Fecha_Compra","Fecha_Entrada"]:
+            if _fcol in posiciones_greko_df.columns:
+                posiciones_greko_df[_fcol] = pd.to_datetime(
+                    posiciones_greko_df[_fcol], dayfirst=True, errors="coerce"
                 ).dt.strftime("%Y-%m-%d").fillna("-")
-        if "Cat_Fecha" not in posiciones_df.columns:
-            posiciones_df["Cat_Fecha"] = "-"
-        if "Tipo" not in posiciones_df.columns:
-            posiciones_df["Tipo"] = "Accion"
-        if "Estrategia" not in posiciones_df.columns:
-            posiciones_df["Estrategia"] = "Swing"
-        # No mostrar mensaje de éxito — ya lo muestra el badge verde de arriba
+        # Consolidar Fecha_Entrada → Fecha después de normalizar
+        if "Fecha_Entrada" in posiciones_greko_df.columns and "Fecha" not in posiciones_greko_df.columns:
+            posiciones_greko_df = posiciones_greko_df.rename(columns={"Fecha_Entrada":"Fecha"})
+        if "Cat_Fecha" not in posiciones_greko_df.columns:
+            posiciones_greko_df["Cat_Fecha"] = "-"
+        if "Tipo" not in posiciones_greko_df.columns:
+            posiciones_greko_df["Tipo"] = "Accion"
+        if "Estrategia" not in posiciones_greko_df.columns:
+            posiciones_greko_df["Estrategia"] = "Swing"
+
+        # ── v18: Calcular columnas de evolución automáticamente ──
+        # Precio_Max, DD_Max, T1/T2 alcanzado, Días en posición
+        with st.spinner("⚡ Calculando evolución de posiciones Greko..."):
+            for _ig, _rowg in posiciones_greko_df.iterrows():
+                _tkg  = str(_rowg.get("Ticker","")).upper()
+                _pcg  = float(str(_rowg.get("Precio_Compra",0) or 0).replace(",","."))
+                _fchg = str(_rowg.get("Fecha_Entrada", _rowg.get("Fecha","")) or "")[:10]
+                if not _tkg or _pcg <= 0:
+                    continue
+                try:
+                    import yfinance as _yf_ev
+                    import datetime as _dt_ev
+                    # Precio actual
+                    _pa_ev = float(_yf_ev.Ticker(_tkg).fast_info.last_price or _pcg)
+                    _res_ev = round((_pa_ev/_pcg-1)*100,2)
+                    posiciones_greko_df.at[_ig, "Resultado_Pct"] = _res_ev
+
+                    # Días en posición
+                    try:
+                        _dias_ev = (_dt_ev.date.today() - _dt_ev.date.fromisoformat(_fchg)).days
+                        posiciones_greko_df.at[_ig, "Dias_En_Posicion"] = _dias_ev
+                    except Exception:
+                        pass
+
+                    # Precio max/min desde entrada (para T1/T2/DD)
+                    if _fchg and _fchg not in ("-","","nan"):
+                        try:
+                            _hist_ev = _yf_ev.Ticker(_tkg).history(
+                                start=_fchg, period="1y")
+                            if not _hist_ev.empty:
+                                _pmax = float(_hist_ev["High"].max())
+                                _pmin = float(_hist_ev["Low"].min())
+                                posiciones_greko_df.at[_ig, "Precio_Max_Alcanzado"] = round(_pmax,2)
+                                posiciones_greko_df.at[_ig, "DD_Max_Sufrido"]       = round((_pmin-_pcg)/_pcg*100,2)
+                                posiciones_greko_df.at[_ig, "T1_Alcanzado"]  = "SÍ" if _pmax >= _pcg*1.08  else "NO"
+                                posiciones_greko_df.at[_ig, "T2_Alcanzado"]  = "SÍ" if _pmax >= _pcg*1.20  else "NO"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
     else:
         # Sin Sheets ni CSV — mostrar instrucciones
-        posiciones_df = None
+        posiciones_greko_df = None
         st.markdown(
             f'<div style="background:{B_BG};border:1px solid {B_BOR};border-radius:12px;'
             f'padding:32px;text-align:center;margin-top:16px">'
@@ -8078,21 +8222,68 @@ También puedes descargar la plantilla de abajo y completarla.
             f'</div>', unsafe_allow_html=True)
 
     # ── Análisis de posiciones ──────────────────────────────
-    if posiciones_df is not None and len(posiciones_df) > 0:
+    if posiciones_greko_df is not None and len(posiciones_greko_df) > 0:
         total_inv=0; total_act=0; total_pnl=0; n_ok=0
 
         # Barra de progreso mientras carga tickers externos
-        tickers_csv = posiciones_df["Ticker"].str.upper().str.strip().tolist()
+        tickers_csv = posiciones_greko_df["Ticker"].str.upper().str.strip().tolist()
         externos = tickers_csv  # v8: todos son externos
         if externos:
             st.info(f"🔄 Cargando datos para: {', '.join(externos)} - puede tomar unos segundos si hay internet...")
 
-        for _loop_idx_6a, (_,pos) in enumerate(posiciones_df.iterrows()):
+        # ── v18: Ordenar posiciones por prioridad de acción ──────
+        # 1° Urgentes (stop cerca / earnings próximos)
+        # 2° Ganadoras con piramidación
+        # 3° Ganadoras en tendencia
+        # 4° Neutras
+        # 5° Pérdidas moderadas
+        # 6° Pérdidas fuertes
+        def _prioridad_pos(row):
+            try:
+                import yfinance as _yf_ord
+                _pc = float(row.get("Precio_Compra", 0))
+                _pa = float(_yf_ord.Ticker(str(row["Ticker"]).upper()).fast_info.last_price or _pc)
+                _pnl = (_pa - _pc) / _pc * 100 if _pc > 0 else 0
+                _cat = str(row.get("Cat_Fecha", "-"))
+                _dias_cat = 999
+                try:
+                    import datetime as _dtt_ord
+                    _dias_cat = (_dtt_ord.date.fromisoformat(_cat[:10]) - _dtt_ord.date.today()).days
+                except Exception:
+                    pass
+                # Urgente: stop cerca o earnings en 1-3 días
+                if _pnl <= -8 or (0 <= _dias_cat <= 3):
+                    return 0
+                # Ganadora con piramidación (earnings próximos)
+                if _pnl >= 5 and 1 <= _dias_cat <= 15:
+                    return 1
+                # Ganadora en tendencia
+                if _pnl >= 5:
+                    return 2
+                # Neutra
+                if -3 <= _pnl < 5:
+                    return 3
+                # Pérdida moderada
+                if -8 < _pnl < -3:
+                    return 4
+                return 5
+            except Exception:
+                return 3
+
+        try:
+            posiciones_greko_df = posiciones_greko_df.copy()
+            posiciones_greko_df["_orden"] = posiciones_greko_df.apply(_prioridad_pos, axis=1)
+            posiciones_greko_df = posiciones_greko_df.sort_values("_orden").drop(columns=["_orden"])
+            posiciones_greko_df = posiciones_greko_df.reset_index(drop=True)
+        except Exception:
+            pass  # Si falla el sort, usar orden original
+
+        for _gloop_idx, (_,pos) in enumerate(posiciones_greko_df.iterrows()):
             tk  = str(pos["Ticker"]).upper()
             # v18 fix: unique key suffix per row to avoid duplicate widget keys
-            _tk_key_6a = f"{tk}_{_loop_idx_6a}"
+            _gtk_key = f"{tk}_{_gloop_idx}"
             pc  = float(pos["Precio_Compra"])
-            qty = int(pos["Cantidad"])
+            qty = float(str(pos["Cantidad"]).replace(",","."))  # v18: float para acciones fraccionarias
             fch = str(pos.get("Fecha","-"))
 
             r = get_row_for_ticker(tk, pc)
@@ -8109,13 +8300,38 @@ También puedes descargar la plantilla de abajo y completarla.
             _tipo_pos = str(pos.get("Tipo","Accion")) if "Tipo" in pos else "Accion"
             _estrategia_pos = str(pos.get("Estrategia","Swing")) if "Estrategia" in pos else "Swing"
             # Auto-detectar cripto ETFs por ticker si Tipo no está definido
-            _crypto_etfs = ["IBIT","ETHA","GBTC","FBTC","ETHW","BITB","ARKB","BRRR","BTCO","DEFI"]
-            _index_etfs  = ["VOO","SPY","IVV","QQQ","VTI","SCHB","ITOT","VEA","VWO","AGG","BND"]
-            if _tipo_pos == "Accion":
+            _crypto_etfs   = ["IBIT","ETHA","GBTC","FBTC","ETHW","BITB","ARKB","BRRR","BTCO","DEFI"]
+            _index_etfs    = ["VOO","SPY","IVV","QQQ","VTI","SCHB","ITOT","VEA","VWO","AGG","BND"]
+            _sector_etfs   = ["XLK","XLF","XLV","XLE","XLI","XLU","XLB","XLRE","XLC","XLP","XLY",
+                               "TAN","ARKK","ARKG","ARKF","SMH","SOXX","IBB","GDX","GDXJ"]
+            _latam_etfs    = ["EWZ","EWW","ILF","ARGT","ECH","GXG","EPU"]
+
+            if _tipo_pos in ("Accion", "", "nan", "-"):
                 if tk in _crypto_etfs:
                     _tipo_pos = "ETF_Cripto"
                 elif tk in _index_etfs:
                     _tipo_pos = "ETF_Indice"
+                elif tk in _sector_etfs:
+                    _tipo_pos = "ETF_Sectorial"
+                elif tk in _latam_etfs:
+                    _tipo_pos = "ETF_LatAm"
+                else:
+                    # Auto-detectar via yfinance si el ticker termina en ETF-like pattern
+                    try:
+                        import yfinance as _yf_tipo
+                        _info_tipo = _yf_tipo.Ticker(tk).info or {}
+                        _qt = str(_info_tipo.get("quoteType","")).upper()
+                        if _qt == "ETF":
+                            # Subclasificar por nombre
+                            _long_name = str(_info_tipo.get("longName","")).lower()
+                            if any(x in _long_name for x in ["bitcoin","ethereum","crypto","blockchain"]):
+                                _tipo_pos = "ETF_Cripto"
+                            elif any(x in _long_name for x in ["s&p","nasdaq","index","total market"]):
+                                _tipo_pos = "ETF_Indice"
+                            else:
+                                _tipo_pos = "ETF_Sectorial"
+                    except Exception:
+                        pass
             # Score de rebote v11
             _tiene_cat = _cat_fecha_use not in ("-","","nan")
             _dias_cat  = 999
@@ -8200,12 +8416,29 @@ También puedes descargar la plantilla de abajo y completarla.
             # Fila 1: identificación + resumen
             ci1,ci2,ci3,ci4,ci5 = st.columns([2,1,1,1,2])
             with ci1:
+                # Badge Tipo (Acción/ETF) v18
+                _tipo_cfg = {
+                    "Accion":        ("🔷","#1D4ED8","#DBEAFE"),
+                    "ETF_Indice":    ("📊","#16A34A","#F0FDF4"),
+                    "ETF_Cripto":    ("₿", "#D97706","#FFFBEB"),
+                    "ETF_Sectorial": ("🏭","#7C3AED","#F5F3FF"),
+                    "ETF_LatAm":     ("🌎","#DC2626","#FEF2F2"),
+                }
+                _t_icon, _t_color, _t_bg = _tipo_cfg.get(_tipo_pos, ("🔷","#1D4ED8","#DBEAFE"))
+                _tipo_badge = (f'<span style="background:{_t_bg};color:{_t_color};'
+                               f'border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700">'
+                               f'{_t_icon} {_tipo_pos.replace("ETF_","ETF ")}</span>')
+
                 source_badge = ""
                 if source == "yfinance":
                     source_badge = f'<span style="background:{G_BG};color:{G};border:1px solid {G_BOR};border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;margin-left:6px">● live</span>'
                 elif source == "estimado":
                     source_badge = f'<span style="background:{A_BG};color:{A};border:1px solid {A_BOR};border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;margin-left:6px">⚠ estimado</span>'
-                st.markdown(f'<div><span style="font-size:22px;font-weight:800;color:{B}">{tk}</span>{source_badge}<span style="color:{sec_c};font-size:11px;font-weight:700;margin-left:8px">{r["Area"]}</span><br><span style="color:{TXT_MUT};font-size:11px">{qty} acciones  - compra ${pc:.2f}  - {fch}</span></div>',unsafe_allow_html=True)
+                st.markdown(f'<div><span style="font-size:22px;font-weight:800;color:{B}">{tk}</span>{source_badge}<span style="color:{sec_c};font-size:11px;font-weight:700;margin-left:8px">{r["Area"]}</span><br>'
+                    f'<span style="color:{TXT_MUT};font-size:11px">'
+                    f'{"%.4g" % qty} acciones · compra ${pc:.2f} · '
+                    f'{"Fecha: " + str(fch)[:10] if fch not in ("-","","nan","NaT","None","nat") else "Sin fecha"}'
+                    f'</span></div>',unsafe_allow_html=True)
             with ci2:
                 # Determinar fuente del precio
                 es_live_pos = r.get("_precio_live", False) or source == "yfinance"
@@ -8259,50 +8492,8 @@ También puedes descargar la plantilla de abajo y completarla.
 
             st.markdown(f'<hr style="border:none;border-top:1px solid {BOR};margin:12px 0">',unsafe_allow_html=True)
 
-            # ── TREN DE ARRASTRE v18 — vital para decidir qué comprar ──
-            _symp_pos = get_sympathy(tk)
-            _arr_pos  = _symp_pos["arrastradas"]
-            _lid_pos  = _symp_pos["lider"]
-            if _arr_pos not in ("-","","nan") or _lid_pos not in ("-","","nan"):
-                _arr_chips = " ".join([
-                    f'<a style="background:#0891B2;color:white;border-radius:6px;'
-                    f'padding:3px 10px;font-weight:700;font-size:11px;margin:2px;'
-                    f'display:inline-block;text-decoration:none">'
-                    f'🔗 {a.strip()}</a>'
-                    for a in _arr_pos.split(",") if a.strip() and a.strip() != "-"
-                ]) if _arr_pos not in ("-","","nan") else ""
-                _lid_chip = (
-                    f'<span style="background:#7C3AED;color:white;border-radius:6px;'
-                    f'padding:3px 10px;font-weight:700;font-size:11px">🏆 {_lid_pos}</span>'
-                    if _lid_pos not in ("-","","nan") else ""
-                )
-                # Descripción de la oportunidad
-                if _arr_pos not in ("-","","nan"):
-                    _tren_desc = (
-                        f"<strong>{tk}</strong> arrastra a {_arr_pos}. "
-                        f"Si {tk} sube con fuerza, busca estas acciones en M1/M2 — "
-                        f"suelen seguir 3-7 días después. Candidatas para piramidación escalonada."
-                    )
-                else:
-                    _tren_desc = (
-                        f"<strong>{tk}</strong> es arrastrada por {_lid_pos}. "
-                        f"Verificar que {_lid_pos} sigue subiendo para confirmar la tendencia."
-                    )
-                st.markdown(
-                    f'<div style="background:linear-gradient(135deg,#EFF6FF,#F0FDF4);'
-                    f'border:1px solid #BFDBFE;border-radius:10px;'
-                    f'padding:10px 14px;margin-bottom:8px">'
-                    f'<div style="font-size:11px;font-weight:800;color:#1D4ED8;margin-bottom:6px">'
-                    f'🚂 Tren de Arrastre</div>'
-                    f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
-                    + (_lid_chip + ' <span style="color:#9CA3AF;font-size:11px">→ líder</span> · ' if _lid_chip else "")
-                    + f'<span style="background:#16A34A;color:white;border-radius:6px;'
-                    f'padding:3px 10px;font-weight:800;font-size:12px">{tk}</span>'
-                    + (f' <span style="color:#9CA3AF;font-size:11px">arrastra →</span> {_arr_chips}' if _arr_chips else "")
-                    + f'</div>'
-                    f'<div style="font-size:10px;color:#374151;line-height:1.5">{_tren_desc}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True)
+
+            # Tren de Arrastre — datos en Sheet GrekoTrader_Sympathy (próximamente)
 
             # Fila 2: indicadores + NBIS + objetivos + lectura
             cd1,cd2,cd3,cd4 = st.columns(4)
@@ -8508,10 +8699,7 @@ También puedes descargar la plantilla de abajo y completarla.
                 render_nbis_panel(
                     r.get("Prob_NBIS", 0), r.get("Sim_NBIS", 0),
                     G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR
-                ) + render_pre_post_bar(
-                    str(r.get("Ticker", tk)), r.get("Precio", pa),
-                    G, A, R, TXT_MUT, TXT_SOFT, BG_HEAD, BOR
-                ), unsafe_allow_html=True)
+                ), unsafe_allow_html=True)  # v18: Pre/Post Market removido de posiciones
 
             # ── PIRAMIDACIÓN v18 — agregar a posición ganadora ──
             _pir = analisis.get("piramidar") if analisis else None
@@ -8534,7 +8722,898 @@ También puedes descargar la plantilla de abajo y completarla.
             with st.expander(f"🏁 Registrar salida / T1 / Stop — {tk}", expanded=False):
                 _tipo_sal = st.radio("Tipo de cierre",
                     ["T1 — venta parcial","SALIDA — cierre total","STOP — stop loss"],
-                    horizontal=True, key=f"tipo_sal_{_tk_key_6a}")
+                    horizontal=True, key=f"gtipo_sal_{_gtk_key}")
+                _tipo_map = {"T1 — venta parcial":"T1","SALIDA — cierre total":"SALIDA","STOP — stop loss":"STOP"}
+                render_boton_registro(
+                    ticker=tk, fase=str(r.get("Etapa_v12","-")),
+                    precio=float(pc), score=int(r.get("Score",0)),
+                    prob_nbis=float(r.get("Prob_NBIS",0)),
+                    cat_fecha=str(r.get("Cat_Fecha","-")),
+                    arrastradas=str(get_sympathy(tk)["arrastradas"]),
+                    lider=str(get_sympathy(tk)["lider"]),
+                    opinion=str(r.get("Opinion_Trader","-")),
+                    key_prefix=f"pos6_{_gtk_key}",
+                    tipo=_tipo_map.get(_tipo_sal,"SALIDA")
+                )
+
+            st.markdown('</div>',unsafe_allow_html=True)  # cierra pos-card
+
+        # ── Alerta concentración sectorial ──────────────────
+        sectores_pos = {}
+        for _, _prow in posiciones_greko_df.iterrows():
+            _ptk = str(_prow["Ticker"]).upper()
+        # Calcular concentración desde los datos ya cargados
+        if n_ok > 0:
+            _areas = {}
+            for _, _prow in posiciones_greko_df.iterrows():
+                _tipo_c = str(_prow.get("Tipo","Accion"))
+                _areas[_tipo_c] = _areas.get(_tipo_c, 0) + 1
+            _concentradas = {k:v for k,v in _areas.items() if v >= 3}
+            if _concentradas:
+                for _sector_c, _cnt_c in _concentradas.items():
+                    st.warning(f"⚠️ Concentración: tienes {_cnt_c} posiciones en {_sector_c}. "
+                               f"Si el sector cae, caen todas juntas. Considera diversificar.")
+
+        # ── Resumen portafolio ──────────────────────────────
+        if n_ok>0:
+            pnl_total_pct=(total_act/total_inv-1)*100 if total_inv>0 else 0
+            st.markdown("---")
+            st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">Resumen del portafolio</div>',unsafe_allow_html=True)
+            pr1,pr2,pr3,pr4=st.columns(4)
+            with pr1: st.metric("Invertido",f"${total_inv:,.0f}")
+            with pr2: st.metric("Valor actual",f"${total_act:,.0f}")
+            with pr3: st.metric("P&L total",f"${total_pnl:+,.0f}",f"{pnl_total_pct:+.1f}%",delta_color="normal" if pnl_total_pct>0 else "inverse")
+            with pr4: st.metric("Posiciones",n_ok)
+
+            # ── Botón A: Exportar análisis completo (como v11) ──────
+            export_rows = []
+            for _gloop_idx_b, (_, pos) in enumerate(posiciones_greko_df.iterrows()):
+                try:
+                    tk  = str(pos["Ticker"]).upper()
+                    # v18 fix: unique key suffix to avoid duplicate widget keys
+                    _tk_key = f"{tk}_b{_gloop_idx_b}"  # "b" prefix distinguishes from loop1
+                    pc  = float(pos["Precio_Compra"])
+                    qty = float(pos.get("Cantidad", 1))
+                    r   = get_row_for_ticker(tk, pc)
+                    pa  = float(r["Precio"])
+                    pnl_e = round((pa - pc) / pc * 100, 2) if pc > 0 else 0
+
+                    # Días en posición
+                    try:
+                        import datetime as _dte
+                        _fd = pd.to_datetime(pos.get("Fecha",""), errors="coerce")
+                        _dias_e = (_dte.date.today() - _fd.date()).days if not pd.isna(_fd) else 0
+                    except Exception:
+                        _dias_e = 0
+
+                    # Etapa de la señal
+                    if _dias_e <= 1:
+                        _etapa = "M3 - Entrar Hoy"
+                    elif _dias_e <= 3:
+                        _etapa = "M2 - Entrada Valida"
+                    elif pnl_e < -3:
+                        _etapa = "M1 - Detectadas"
+                    else:
+                        _etapa = "M2 - Entrada Temprana"
+
+                    # Señal v12
+                    _sr_e = calcular_señales_salida_v12(
+                        pnl_pct=pnl_e, precio_compra=pc,
+                        precio_actual=pa, precio_max=max(pa, pc*1.1),
+                        dias_posicion=_dias_e,
+                        estrategia=str(pos.get("Estrategia","Swing")),
+                        tipo=str(pos.get("Tipo","Accion"))
+                    )
+
+                    export_rows.append({
+                        "Ticker":         tk,
+                        "Fase_Origen":    _ascii(str(pos.get("Fase_Origen",""))).replace("-","") if str(pos.get("Fase_Origen","")) in ("-","","nan") else _ascii(str(pos.get("Fase_Origen",""))),
+                        "Etapa_Senal":    _etapa,
+                        "Fecha_Compra":   str(pos.get("Fecha","-")),
+                        "Precio_Compra":  round(pc, 2),
+                        "Precio_Actual":  round(pa, 2),
+                        "Cantidad":       round(qty, 4),
+                        "PnL_Pct":        pnl_e,
+                        "PnL_USD":        round((pa - pc) * qty, 2),
+                        "Dias_Posicion":  _dias_e,
+                        "Score_Rebote":   r.get("Score_Rebote", 0),
+                        "Nivel_Rebote":   _ascii(str(r.get("Nivel_Rebote","-"))),
+                        "Prob_NBIS":      r.get("Prob_NBIS", 0),
+                        "RSI":            r.get("RSI", 0),
+                        "DD_pico":        r.get("DD_pico", 0),
+                        "Senal_v12":      _ascii(_sr_e["señal"]),
+                        "Urgencia":       _ascii(str(_sr_e["urgencia"])),
+                        "Tipo":           str(pos.get("Tipo","Accion")),
+                        "Estrategia":     str(pos.get("Estrategia","Swing")),
+                        "Cat_Fecha":      _ascii(str(pos.get("Cat_Fecha","-"))),
+                        "FLUJO_VALIDADO": "SI" if _dias_e > 0 else "NO",
+                    })
+                except Exception:
+                    continue
+
+            if export_rows:
+                _df_exp = pd.DataFrame(export_rows)
+                _csv_a  = df_to_csv_chile(_df_exp)
+                st.download_button(
+                    "⬇️ Exportar análisis posiciones (CSV)",
+                    _csv_a,
+                    f"analisis_posiciones_{pd.Timestamp.now().strftime('%Y-%m-%d_%H%M')}.csv",
+                    "text/csv",
+                    help="Análisis completo con PnL  - Señal v12  - Score  - Urgencia",
+                    key="dl_pos_greko_csv",
+                )
+
+                # ── Botón B: CSV posiciones actualizadas con salidas ─
+                # Simula que aplicaste las salidas T1/T2/Stop
+                # Recalcula cantidades y genera nuevo CSV para re-subir
+                rows_actualizado = []
+                for row_e in export_rows:
+                    señal = row_e["Senal_v12"].lower()
+                    qty_orig = float(row_e["Cantidad"])
+
+                    if "stop" in señal or "stop activado" in señal:
+                        continue  # posición cerrada - no incluir
+
+                    elif "t2 +12%" in señal or "t2" in señal:
+                        qty_nueva = round(qty_orig * 0.20, 6)
+                        nota = f"Vendido 80% (T1:40% + T2:40%). Queda 20% runner con trailing stop -5%"
+
+                    elif "t1 +8%" in señal or "t1" in señal:
+                        qty_nueva = round(qty_orig * 0.60, 6)
+                        nota = f"Vendido 40% en T1 (+8%). Queda 60% con stop en breakeven (precio compra)"
+
+                    elif "muerta" in señal or "reasignar" in señal:
+                        qty_nueva = qty_orig
+                        nota = f"Posicion muerta +5 dias en +-1%. Salir y reasignar a señal M3 activa"
+
+                    else:
+                        qty_nueva = qty_orig
+                        nota = ""
+
+                    qty_vender = round(qty_orig - qty_nueva, 6)
+                    rows_actualizado.append({
+                        "Ticker":           row_e["Ticker"],
+                        "Fecha":            row_e["Fecha_Compra"],
+                        "Precio_Compra":    row_e["Precio_Compra"],
+                        "Cantidad_Original": round(qty_orig, 4),
+                        "Cantidad_Vender":  qty_vender,
+                        "Cantidad_Mantener":qty_nueva,
+                        "Cat_Fecha":        row_e["Cat_Fecha"],
+                        "Tipo":             row_e["Tipo"],
+                        "Estrategia":       row_e["Estrategia"],
+                        "Fase_Origen":      row_e["Fase_Origen"],
+                        "Notas_Salida":     nota,
+                    })
+
+                if rows_actualizado:
+                    _df_act = pd.DataFrame(rows_actualizado)
+                    _csv_act = df_to_csv_chile(_df_act)
+                    st.download_button(
+                        "🔄 CSV posiciones actualizadas (re-subir para ver ganancia futura)",
+                        _csv_act,
+                        f"Activos_actualizado_{pd.Timestamp.now().strftime('%Y-%m-%d')}.csv",
+                        "text/csv",
+                        help="CSV listo para re-subir. T1 ejecutado -> 60% de cantidad. T2 ejecutado -> 20%. Stop -> posición eliminada.",
+                        key="dl_pos_greko_upd",
+                    )
+
+        if posiciones_greko_df is not None and len(posiciones_greko_df) > 0:
+            render_catalysts_section(posiciones_greko_df, "greko_pos")
+            # Noticias Mis Posiciones
+            st.markdown("---")
+            render_noticias_mini(posiciones_greko_df["Ticker"].tolist(), "Noticias Posiciones Greko")
+with tab6:
+    st.markdown(f'<div class="sec-header" style="background:{B_BG};border-color:{B_BOR}"><span style="font-size:20px">💼</span><div><span style="font-size:16px;font-weight:700;color:{B}">Mis posiciones abiertas</span><span style="font-size:12px;color:{TXT_MUT};margin-left:10px">Carga tu CSV  - señales de salida  - Prob. NBIS  - Similitud</span></div></div>',unsafe_allow_html=True)
+
+    # ── Instrucciones CSV ──────────────────────────────────
+    with st.expander("📋 Formato del CSV - cómo preparar el archivo", expanded=False):
+        st.markdown("""
+**El CSV debe tener exactamente estas 4 columnas (en cualquier orden):**
+
+| Ticker | Fecha_Compra | Precio_Compra | Cantidad |
+|--------|-------------|--------------|----------|
+| NBIS   | 2026-03-10  | 92.00        | 50       |
+| RGTI   | 2026-02-15  | 12.50        | 200      |
+| HOOD   | 2026-03-20  | 71.00        | 80       |
+
+- **Ticker**: debe coincidir con los tickers del universo del modelo
+- **Fecha_Compra**: formato YYYY-MM-DD
+- **Precio_Compra**: precio en USD con decimales (usar punto, no coma)
+- **Cantidad**: número entero de acciones
+
+También puedes descargar la plantilla de abajo y completarla.
+""")
+        # Plantilla descargable
+        template_df = pd.DataFrame({
+            "Ticker":["NBIS","RGTI","HOOD","APLD"],
+            "Fecha_Compra":["2026-03-10","2026-02-15","2026-03-20","2026-03-05"],
+            "Precio_Compra":[92.00,12.50,71.00,18.50],
+            "Cantidad":[50,200,80,150],
+        })
+        csv_template = template_df.to_csv(index=False, sep=";", decimal=",")
+        st.download_button(
+            "⬇️ Descargar plantilla CSV",
+            csv_template,
+            "posiciones_template.csv",
+            "text/csv",
+            key="dl_template",)
+
+    # ── v18: Cargar posiciones VIVAS desde Google Sheets ───────
+    _sheets_mauri = leer_posiciones_sheets(_SHEET_NAME_MAURI)
+    _sheets_error = st.session_state.get("sheets_error")
+
+    if _sheets_mauri is not None:
+        st.markdown(
+            f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+            f'border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:11px">'
+            f'<span style="font-weight:700;color:#16A34A">✅ Google Sheets conectado</span> — '
+            f'{len(_sheets_mauri)} posiciones cargadas desde <strong>{_SHEET_NAME_MAURI}</strong> · '
+            f'Ventas y retiros persisten automáticamente.</div>',
+            unsafe_allow_html=True)
+    elif _sheets_error:
+        # Mostrar diagnóstico específico del error
+        _error_msgs = {
+            "secrets_missing":
+                ("⚙️ Secrets no configurados",
+                 "Ve a Streamlit Cloud → Settings → Secrets y pega el bloque toml."),
+            "not_found:GrekoTrader_Posiciones_Mauri":
+                ("📄 Sheet no encontrado",
+                 f"El Sheet '{_SHEET_NAME_MAURI}' no existe o no está compartido. "
+                 f"Compártelo con el email del service account (ver guía)."),
+            "empty_sheet":
+                ("📋 Sheet vacío",
+                 f"El Sheet existe pero no tiene datos. Agrega tus posiciones en '{_SHEET_NAME_MAURI}'."),
+            "no_data_rows":
+                ("📋 Solo headers, sin posiciones",
+                 f"El Sheet tiene los headers pero no hay filas de datos. "
+                 f"Agrega tus posiciones bajo la fila 1."),
+            "no_ticker_column":
+                ("❌ Columna 'Ticker' no encontrada",
+                 "El Sheet no tiene una columna llamada 'Ticker'. "
+                 "Verifica que la primera fila tenga: Ticker | Precio_Compra | Cantidad | Fecha"),
+        }
+        _title, _detail = _error_msgs.get(
+            _sheets_error,
+            ("❌ Error de conexión",
+             f"Error: {_sheets_error}. Verifica las credenciales y que el Sheet esté compartido.")
+        )
+        st.markdown(
+            f'<div style="background:#FEF2F2;border:1px solid #FCA5A5;'
+            f'border-radius:8px;padding:10px 14px;margin-bottom:8px">'
+            f'<div style="font-size:12px;font-weight:700;color:#DC2626">'
+            f'🔴 Google Sheets: {_title}</div>'
+            f'<div style="font-size:11px;color:#7F1D1D;margin-top:4px">{_detail}</div>'
+            f'<div style="font-size:10px;color:#991B1B;margin-top:6px">'
+            f'Solución rápida: usa el CSV manual mientras resuelves la configuración.</div>'
+            f'</div>', unsafe_allow_html=True)
+
+        # Botón para limpiar cache y reintentar
+        if st.button("🔄 Reintentar conexión a Google Sheets",
+                     key="btn_retry_sheets", use_container_width=False):
+            limpiar_cache_sheets_only()
+            st.rerun()
+
+        # ── DEBUG LOG — muestra exactamente dónde falla ─────
+        _debug_log = st.session_state.get("sheets_debug_log", [])
+        if _debug_log:
+            with st.expander("🔍 Ver diagnóstico paso a paso", expanded=True):
+                for step in _debug_log:
+                    _ico = "✅" if step.startswith("P") and "FALLO" not in step else "❌" if "FALLO" in step else "ℹ️"
+                    color = "#16A34A" if _ico == "✅" else "#DC2626" if _ico == "❌" else "#374151"
+                    st.markdown(
+                        f'<div style="font-size:11px;color:{color};'
+                        f'font-family:monospace;padding:2px 0">{_ico} {step}</div>',
+                        unsafe_allow_html=True
+                    )
+    else:
+        st.markdown(
+            f'<div style="background:#FFFBEB;border:1px solid #FCD34D;'
+            f'border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:11px;color:#92400E">'
+            f'⚠️ <strong>Google Sheets no configurado</strong> — usando CSV manual. '
+            f'Configura los Secrets en Streamlit para persistencia.</div>',
+            unsafe_allow_html=True)
+
+    # ── Upload CSV manual (si no hay Sheets) ────────────────────
+    uploaded = st.file_uploader(
+        "📂 Subir archivo CSV con posiciones" + (" (opcional — ya cargado desde Sheets)" if _sheets_mauri is not None else ""),
+        type=["csv"],
+        help="Formato: Ticker, Fecha_Compra, Precio_Compra, Cantidad",
+        key="uploader_mauri",
+    )
+
+    posiciones_df = None
+
+    # v18: usar Sheets como fuente primaria si está disponible
+    if _sheets_mauri is not None:
+        posiciones_df = _sheets_mauri.copy()
+        # Normalizar columnas igual que el CSV
+        if "Fecha_Compra" in posiciones_df.columns and "Fecha" not in posiciones_df.columns:
+            posiciones_df = posiciones_df.rename(columns={"Fecha_Compra":"Fecha"})
+
+    if uploaded:
+        try:
+            # Auto-detectar separador (coma o punto y coma)
+            _raw_pos = uploaded.read()
+            _sep_pos = ";" if b";" in _raw_pos[:200] else ","
+            import io
+            posiciones_df = pd.read_csv(io.BytesIO(_raw_pos),
+                                        sep=_sep_pos,
+                                        encoding="utf-8-sig",
+                                        on_bad_lines="skip")
+            posiciones_df.columns = [c.strip() for c in posiciones_df.columns]
+            if "Fecha_Compra" in posiciones_df.columns and "Fecha" not in posiciones_df.columns:
+                posiciones_df = posiciones_df.rename(columns={"Fecha_Compra": "Fecha"})
+            required = ["Ticker","Precio_Compra","Cantidad","Fecha"]
+            missing = [c for c in required if c not in posiciones_df.columns]
+            if missing:
+                st.error(f"❌ Columnas faltantes en el CSV: {', '.join(missing)}")
+                posiciones_df = _sheets_mauri.copy() if _sheets_mauri is not None else None
+            else:
+                posiciones_df["Ticker"]        = posiciones_df["Ticker"].str.upper().str.strip()
+                posiciones_df["Precio_Compra"] = pd.to_numeric(posiciones_df["Precio_Compra"], errors="coerce")
+                posiciones_df["Cantidad"]      = pd.to_numeric(posiciones_df["Cantidad"], errors="coerce")
+                posiciones_df = posiciones_df.dropna(subset=["Precio_Compra","Cantidad"])
+                for _fcol in ["Fecha","Cat_Fecha"]:
+                    if _fcol in posiciones_df.columns:
+                        posiciones_df[_fcol] = pd.to_datetime(
+                            posiciones_df[_fcol], dayfirst=True, errors="coerce"
+                        ).dt.strftime("%Y-%m-%d").fillna("-")
+                if "Cat_Fecha" not in posiciones_df.columns:
+                    posiciones_df["Cat_Fecha"] = "-"
+                if "Tipo" not in posiciones_df.columns:
+                    posiciones_df["Tipo"] = "Accion"
+                if "Estrategia" not in posiciones_df.columns:
+                    posiciones_df["Estrategia"] = "Swing"
+                if posiciones_df["Ticker"].duplicated().any():
+                    n_dup = posiciones_df["Ticker"].duplicated().sum()
+                    tickers_dup = posiciones_df[posiciones_df["Ticker"].duplicated(keep=False)]["Ticker"].unique().tolist()
+                    st.info(f"ℹ️ {tickers_dup} tienen múltiples compras - se muestran como filas separadas.")
+                st.success(f"✅ CSV cargado — {len(posiciones_df)} posiciones encontradas")
+        except Exception as e:
+            st.error(f"❌ Error leyendo el CSV: {e}")
+            posiciones_df = _sheets_mauri.copy() if _sheets_mauri is not None else None
+    elif _sheets_mauri is not None:
+        # ── v18 fix: usar Sheets si no hay CSV subido ─────────
+        posiciones_df = _sheets_mauri.copy()  # ← asignación que faltaba
+        # Normalizar columnas necesarias
+        posiciones_df["Ticker"]        = posiciones_df["Ticker"].str.upper().str.strip()
+        posiciones_df["Precio_Compra"] = pd.to_numeric(posiciones_df["Precio_Compra"], errors="coerce")
+        posiciones_df["Cantidad"]      = pd.to_numeric(posiciones_df["Cantidad"], errors="coerce")
+        posiciones_df = posiciones_df.dropna(subset=["Precio_Compra","Cantidad"])
+        for _fcol in ["Fecha","Cat_Fecha","Fecha_Compra"]:
+            if _fcol in posiciones_df.columns:
+                posiciones_df[_fcol] = pd.to_datetime(
+                    posiciones_df[_fcol], dayfirst=True, errors="coerce"
+                ).dt.strftime("%Y-%m-%d").fillna("-")
+        if "Cat_Fecha" not in posiciones_df.columns:
+            posiciones_df["Cat_Fecha"] = "-"
+        if "Tipo" not in posiciones_df.columns:
+            posiciones_df["Tipo"] = "Accion"
+        if "Estrategia" not in posiciones_df.columns:
+            posiciones_df["Estrategia"] = "Swing"
+        # No mostrar mensaje de éxito — ya lo muestra el badge verde de arriba
+    else:
+        # Sin Sheets ni CSV — mostrar instrucciones
+        posiciones_df = None
+        st.markdown(
+            f'<div style="background:{B_BG};border:1px solid {B_BOR};border-radius:12px;'
+            f'padding:32px;text-align:center;margin-top:16px">'
+            f'<div style="font-size:36px;margin-bottom:10px">💼</div>'
+            f'<div style="font-size:15px;font-weight:700;color:{B};margin-bottom:8px">'
+            f'Sube tu archivo CSV para ver tus posiciones</div>'
+            f'<div style="font-size:12px;color:{TXT_MUT};margin-bottom:16px;line-height:1.7">'
+            f'Formato requerido:<br>'
+            f'<code style="background:{BG_HEAD};padding:2px 8px;border-radius:4px;font-size:11px">'
+            f'Ticker, Precio_Compra, Cantidad, Fecha</code><br><br>'
+            f'Ejemplo:<br>'
+            f'<code style="background:{BG_HEAD};padding:4px 8px;border-radius:4px;font-size:11px;display:inline-block;text-align:left">'
+            f'NBIS,129.90,3,2026-04-09<br>MRNA,42.58,15,2026-02-17<br>CROX,78.72,4,2026-02-17</code>'
+            f'</div>'
+            f'<div style="font-size:11px;color:{TXT_SOFT}">'
+            f'Usa el botón "Browse files" del sidebar para subir tu archivo</div>'
+            f'</div>', unsafe_allow_html=True)
+
+    # ── Análisis de posiciones ──────────────────────────────
+    if posiciones_df is not None and len(posiciones_df) > 0:
+        total_inv=0; total_act=0; total_pnl=0; n_ok=0
+
+        # Barra de progreso mientras carga tickers externos
+        tickers_csv = posiciones_df["Ticker"].str.upper().str.strip().tolist()
+        externos = tickers_csv  # v8: todos son externos
+        if externos:
+            st.info(f"🔄 Cargando datos para: {', '.join(externos)} - puede tomar unos segundos si hay internet...")
+
+        # ── v18: Ordenar posiciones por prioridad de acción ──────
+        # 1° Urgentes (stop cerca / earnings próximos)
+        # 2° Ganadoras con piramidación
+        # 3° Ganadoras en tendencia
+        # 4° Neutras
+        # 5° Pérdidas moderadas
+        # 6° Pérdidas fuertes
+        def _prioridad_pos(row):
+            try:
+                import yfinance as _yf_ord
+                _pc = float(row.get("Precio_Compra", 0))
+                _pa = float(_yf_ord.Ticker(str(row["Ticker"]).upper()).fast_info.last_price or _pc)
+                _pnl = (_pa - _pc) / _pc * 100 if _pc > 0 else 0
+                _cat = str(row.get("Cat_Fecha", "-"))
+                _dias_cat = 999
+                try:
+                    import datetime as _dtt_ord
+                    _dias_cat = (_dtt_ord.date.fromisoformat(_cat[:10]) - _dtt_ord.date.today()).days
+                except Exception:
+                    pass
+                # Urgente: stop cerca o earnings en 1-3 días
+                if _pnl <= -8 or (0 <= _dias_cat <= 3):
+                    return 0
+                # Ganadora con piramidación (earnings próximos)
+                if _pnl >= 5 and 1 <= _dias_cat <= 15:
+                    return 1
+                # Ganadora en tendencia
+                if _pnl >= 5:
+                    return 2
+                # Neutra
+                if -3 <= _pnl < 5:
+                    return 3
+                # Pérdida moderada
+                if -8 < _pnl < -3:
+                    return 4
+                return 5
+            except Exception:
+                return 3
+
+        try:
+            posiciones_df = posiciones_df.copy()
+            posiciones_df["_orden"] = posiciones_df.apply(_prioridad_pos, axis=1)
+            posiciones_df = posiciones_df.sort_values("_orden").drop(columns=["_orden"])
+            posiciones_df = posiciones_df.reset_index(drop=True)
+        except Exception:
+            pass  # Si falla el sort, usar orden original
+
+        for _loop_idx_6a, (_,pos) in enumerate(posiciones_df.iterrows()):
+            tk  = str(pos["Ticker"]).upper()
+            # v18 fix: unique key suffix per row to avoid duplicate widget keys
+            _tk_key_6a = f"{tk}_{_loop_idx_6a}"
+            pc  = float(pos["Precio_Compra"])
+            qty = float(str(pos["Cantidad"]).replace(",","."))  # v18: float para acciones fraccionarias
+            fch = str(pos.get("Fecha","-"))
+
+            r = get_row_for_ticker(tk, pc)
+            source = r.get("_source","universo")
+            pa  = r["Precio"]
+            inv = pc*qty; act=pa*qty
+            pnl_usd=act-inv; pnl_pct=(pa-pc)/pc*100
+            total_inv+=inv; total_act+=act; total_pnl+=pnl_usd; n_ok+=1
+
+            _dias_pos = (pd.Timestamp.now()-pd.to_datetime(fch,errors="coerce")).days if fch not in ("-","","nan") else 0
+            # Usar Cat_Fecha del CSV si existe, sino del scanner
+            _cat_fecha_csv = str(pos.get("Cat_Fecha","-")) if "Cat_Fecha" in pos else "-"
+            _cat_fecha_use = _cat_fecha_csv if _cat_fecha_csv not in ("-","","nan") else str(r.get("Cat_Fecha","-"))
+            _tipo_pos = str(pos.get("Tipo","Accion")) if "Tipo" in pos else "Accion"
+            _estrategia_pos = str(pos.get("Estrategia","Swing")) if "Estrategia" in pos else "Swing"
+            # Auto-detectar cripto ETFs por ticker si Tipo no está definido
+            _crypto_etfs   = ["IBIT","ETHA","GBTC","FBTC","ETHW","BITB","ARKB","BRRR","BTCO","DEFI"]
+            _index_etfs    = ["VOO","SPY","IVV","QQQ","VTI","SCHB","ITOT","VEA","VWO","AGG","BND"]
+            _sector_etfs   = ["XLK","XLF","XLV","XLE","XLI","XLU","XLB","XLRE","XLC","XLP","XLY",
+                               "TAN","ARKK","ARKG","ARKF","SMH","SOXX","IBB","GDX","GDXJ"]
+            _latam_etfs    = ["EWZ","EWW","ILF","ARGT","ECH","GXG","EPU"]
+
+            if _tipo_pos in ("Accion", "", "nan", "-"):
+                if tk in _crypto_etfs:
+                    _tipo_pos = "ETF_Cripto"
+                elif tk in _index_etfs:
+                    _tipo_pos = "ETF_Indice"
+                elif tk in _sector_etfs:
+                    _tipo_pos = "ETF_Sectorial"
+                elif tk in _latam_etfs:
+                    _tipo_pos = "ETF_LatAm"
+                else:
+                    # Auto-detectar via yfinance si el ticker termina en ETF-like pattern
+                    try:
+                        import yfinance as _yf_tipo
+                        _info_tipo = _yf_tipo.Ticker(tk).info or {}
+                        _qt = str(_info_tipo.get("quoteType","")).upper()
+                        if _qt == "ETF":
+                            # Subclasificar por nombre
+                            _long_name = str(_info_tipo.get("longName","")).lower()
+                            if any(x in _long_name for x in ["bitcoin","ethereum","crypto","blockchain"]):
+                                _tipo_pos = "ETF_Cripto"
+                            elif any(x in _long_name for x in ["s&p","nasdaq","index","total market"]):
+                                _tipo_pos = "ETF_Indice"
+                            else:
+                                _tipo_pos = "ETF_Sectorial"
+                    except Exception:
+                        pass
+            # Score de rebote v11
+            _tiene_cat = _cat_fecha_use not in ("-","","nan")
+            _dias_cat  = 999
+            try:
+                import datetime as _dtt
+                if _tiene_cat:
+                    _fc = pd.to_datetime(_cat_fecha_use, errors="coerce")
+                    if not pd.isna(_fc):
+                        _dias_cat = (_fc.date() - _dtt.date.today()).days
+            except Exception: pass
+            _score_rebote = calcular_score_rebote(
+                dd=float(r.get("DD_pico",0)),
+                rsi=float(r["RSI"]),
+                vol_ratio=float(r.get("Volumen",100)),
+                dias_alcistas=0,
+                momentum_3d=float(r.get("MACD",0)),
+                tiene_catalizador=_tiene_cat,
+                dias_para_cat=_dias_cat,
+                beta=float(r.get("Beta",1.5))
+            )
+            _vix_val = float(vix.get("valor",20)) if vix.get("_ok") else 20
+            _sizing  = clasificar_sizing(_score_rebote["score"], _vix_val)
+            # v12: usar nuevas señales de salida
+            # Calcular precio máximo real desde fecha de compra
+            try:
+                import yfinance as _yf_pm
+                _hist_pm = _yf_pm.Ticker(tk).history(period="3mo")
+                if not _hist_pm.empty and len(_hist_pm) > 0:
+                    # Filtrar desde fecha de compra
+                    _fc_pm = pd.to_datetime(_cat_fecha_use if _cat_fecha_use not in ("-","","nan") else "2026-01-01", errors="coerce")
+                    try:
+                        _fc_pm2 = pd.to_datetime(str(row_pos.get("Fecha","2026-01-01")), errors="coerce")
+                        _hist_filtrada = _hist_pm[_hist_pm.index >= _fc_pm2] if not pd.isna(_fc_pm2) else _hist_pm
+                        _precio_max = float(_hist_filtrada["High"].max()) if not _hist_filtrada.empty else max(pa, pc)
+                    except Exception:
+                        _precio_max = max(pa, pc * (1 + pnl_pct/100))
+                else:
+                    _precio_max = max(pa, pc * (1 + pnl_pct/100))
+            except Exception:
+                _precio_max = max(pa, pc * (1 + pnl_pct/100))
+            analisis_v12 = calcular_señales_salida_v12(
+                pnl_pct=pnl_pct,
+                precio_compra=pc,
+                precio_actual=pa,
+                precio_max=_precio_max,
+                dias_posicion=_dias_pos,
+                estrategia=_estrategia_pos,
+                tipo=_tipo_pos
+            )
+            analisis = analizar_posicion(
+                pc,pa,r["RSI"],r["MACD"],
+                abs(r["EMA50"]) if r["EMA50"]>0 else 0,
+                r["Score"],pnl_pct,r["Prob_NBIS"],r["Sim_NBIS"],r["Beta"],
+                cat_fecha=_cat_fecha_use,
+                dias_posicion=_dias_pos,
+                tipo=_tipo_pos,
+                estrategia=_estrategia_pos)
+            # v13: usar señales v12 como fuente principal
+            # La lógica v12 tiene T1/T2/Trailing/Stop correctos
+            señal    = analisis_v12["señal"]
+            razon    = analisis_v12["accion"]
+            s_color  = "#" + analisis_v12["color"]
+            urgencia = analisis_v12["urgencia"]
+            tramos   = [(t[0], t[1]) for t in analisis_v12.get("tramos", [])]
+
+            # Solo usar analisis legacy para campos que v12 no cubre
+            if urgencia == "-" or not señal:
+                señal    = analisis["señal"]
+                razon    = analisis["razon"]
+                s_color  = analisis["color"]
+                urgencia = analisis["urgencia"]
+                tramos   = analisis["tramos"]
+
+            pnl_color=G if pnl_pct>0 else R
+            urg_cls={"URGENTE":"bg-r","HOY":"bg-or","ESTA SEMANA":"bg-a","AJUSTAR":"bg-a","REVISAR":"bg-r","HOLD":"bg-g","MONITOR":"bg-b"}.get(urgencia,"bg-gr")
+            borde=s_color
+            sec_c=SECTOR_COLORS.get(r["Area"],TXT_MUT)
+
+            # ── Tarjeta posición ──
+            st.markdown(f'<div class="pos-card" style="border-left:5px solid {borde}">',unsafe_allow_html=True)
+
+            # Fila 1: identificación + resumen
+            ci1,ci2,ci3,ci4,ci5 = st.columns([2,1,1,1,2])
+            with ci1:
+                # Badge Tipo (Acción/ETF) v18
+                _tipo_cfg = {
+                    "Accion":        ("🔷","#1D4ED8","#DBEAFE"),
+                    "ETF_Indice":    ("📊","#16A34A","#F0FDF4"),
+                    "ETF_Cripto":    ("₿", "#D97706","#FFFBEB"),
+                    "ETF_Sectorial": ("🏭","#7C3AED","#F5F3FF"),
+                    "ETF_LatAm":     ("🌎","#DC2626","#FEF2F2"),
+                }
+                _t_icon, _t_color, _t_bg = _tipo_cfg.get(_tipo_pos, ("🔷","#1D4ED8","#DBEAFE"))
+                _tipo_badge = (f'<span style="background:{_t_bg};color:{_t_color};'
+                               f'border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700">'
+                               f'{_t_icon} {_tipo_pos.replace("ETF_","ETF ")}</span>')
+
+                source_badge = ""
+                if source == "yfinance":
+                    source_badge = f'<span style="background:{G_BG};color:{G};border:1px solid {G_BOR};border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;margin-left:6px">● live</span>'
+                elif source == "estimado":
+                    source_badge = f'<span style="background:{A_BG};color:{A};border:1px solid {A_BOR};border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;margin-left:6px">⚠ estimado</span>'
+                st.markdown(f'<div><span style="font-size:22px;font-weight:800;color:{B}">{tk}</span>{source_badge}<span style="color:{sec_c};font-size:11px;font-weight:700;margin-left:8px">{r["Area"]}</span><br>'
+                    f'<span style="color:{TXT_MUT};font-size:11px">'
+                    f'{"%.4g" % qty} acciones · compra ${pc:.2f} · '
+                    f'{"Fecha: " + str(fch)[:10] if fch not in ("-","","nan","NaT","None","nat") else "Sin fecha"}'
+                    f'</span></div>',unsafe_allow_html=True)
+            with ci2:
+                # Determinar fuente del precio
+                es_live_pos = r.get("_precio_live", False) or source == "yfinance"
+                precio_badge = (
+                    f'<div style="font-size:9px;color:{G};font-weight:600;margin-top:2px">● live</div>'
+                    if es_live_pos else
+                    f'<div style="font-size:9px;color:{A};font-weight:600;margin-top:2px">⚠ estático</div>'
+                )
+                st.markdown(
+                    f'<div style="text-align:center">'
+                    f'<div style="font-size:11px;color:{TXT_MUT};font-weight:600">Precio actual</div>'
+                    f'<div style="font-size:20px;font-weight:800;color:{TXT}">${pa:.2f}</div>'
+                    f'{precio_badge}'
+                    f'</div>', unsafe_allow_html=True)
+            with ci3:
+                st.markdown(f'<div style="text-align:center"><div style="font-size:11px;color:{TXT_MUT};font-weight:600">P&L</div><div style="font-size:20px;font-weight:800;color:{pnl_color}">{pnl_pct:+.1f}%</div><div style="font-size:11px;color:{pnl_color};font-weight:600">${pnl_usd:+,.0f}</div></div>',unsafe_allow_html=True)
+            with ci4:
+                sc_c=G if _score_rebote["score"]>=75 else A if _score_rebote["score"]>=55 else R
+                st.markdown(
+                    f'<div style="text-align:center">'
+                    f'<div style="font-size:11px;color:{TXT_MUT};font-weight:600">Score Rebote</div>'
+                    f'<div style="font-size:20px;font-weight:800;color:{sc_c}">{_score_rebote["score"]}</div>'
+                    f'<div style="font-size:10px;color:{sc_c}">{_score_rebote["nivel"]}</div>'
+                    f'</div>',unsafe_allow_html=True)
+            with ci5:
+                # Barra visual de tramos
+                tramo_html = ""
+                for _t in tramos:
+                    pct   = _t[0] if len(_t) > 0 else 0
+                    etiq  = _t[1] if len(_t) > 1 else ""
+                    color = _t[2] if len(_t) > 2 else (
+                        R if "VENDER" in str(etiq) or "STOP" in str(etiq)
+                        else G if "RUNNER" in str(etiq) or "MANT" in str(etiq)
+                        else A
+                    )
+                    if pct > 0:
+                        tramo_html += (
+                            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">'
+                            f'<div style="width:{max(pct,8)*1.4:.0f}px;height:10px;border-radius:5px;background:{color}"></div>'
+                            f'<span style="font-size:11px;font-weight:700;color:{color}">{pct}%</span>'
+                            f'<span style="font-size:10px;color:{TXT_MUT}">{etiq}</span>'
+                            f'</div>'
+                        )
+                st.markdown(
+                    f'<div>'
+                    f'<div style="font-size:10px;color:{TXT_MUT};font-weight:600;margin-bottom:6px">GESTIÓN DE POSICIÓN</div>'
+                    f'{tramo_html}'
+                    f'<span class="badge {urg_cls}" style="margin-top:4px;display:inline-block">{urgencia}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+
+            st.markdown(f'<hr style="border:none;border-top:1px solid {BOR};margin:12px 0">',unsafe_allow_html=True)
+
+            # Tren de Arrastre — disponible cuando se configure GrekoTrader_Sympathy
+
+            # Fila 2: indicadores + NBIS + objetivos + lectura
+            cd1,cd2,cd3,cd4 = st.columns(4)
+            with cd1:
+                st.markdown(
+                    f'<div style="background:{BG_HEAD};border-radius:10px;padding:12px">'
+                    f'<div style="font-size:11px;font-weight:700;color:{TXT};margin-bottom:8px">Indicadores actuales</div>'
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:11px">'
+                    f'<span style="color:{TXT_MUT}">RSI</span><span style="color:{c_rsi(r["RSI"])};font-weight:700">{r["RSI"]}</span>'
+                    f'<span style="color:{TXT_MUT}">MACD</span><span style="color:{G if r["MACD"]>0 else R};font-weight:700">{r["MACD"]:+.2f}</span>'
+                    f'<span style="color:{TXT_MUT}">Volumen</span><span style="color:{c_vol(r["Volumen"]/100)};font-weight:700">{r["Volumen"]}%</span>'
+                    f'<span style="color:{TXT_MUT}">Beta</span><span style="color:{TXT};font-weight:700">{r["Beta"]}</span>'
+                    f'<span style="color:{TXT_MUT}">Pre-Mkt</span><span style="color:{c_pre(r["Pre_Move"])};font-weight:700">+{r["Pre_Move"]:.1f}%</span>'
+                    f'<span style="color:{TXT_MUT}">Vol Pre</span><span style="color:{c_vol(r["Pre_Vol"])};font-weight:700">{r["Pre_Vol"]:.1f}x</span>'
+                    f'</div></div>',unsafe_allow_html=True)
+            with cd2:
+                # Señal de gestión de posición - no score de entrada
+                rsi_pos = r["RSI"]
+                pnl_pos = pnl_pct
+
+                # Determinar semáforo de gestión
+                if pnl_pos >= 40:
+                    gest_color = G; gest_emoji = "🟢"
+                    gest_titulo = "Ganancia sólida"
+                    gest_msg = f"Tramo 1 ejecutado? Si no, vender 30% ahora. Dejar runner."
+                elif pnl_pos >= 20:
+                    gest_color = G; gest_emoji = "🟢"
+                    gest_titulo = "Objetivo 1 alcanzado"
+                    gest_msg = "Vender 30% para asegurar ganancia. Mantener 70% con stop."
+                elif pnl_pos >= 10:
+                    gest_color = A; gest_emoji = "🟡"
+                    gest_titulo = "En camino"
+                    gest_msg = "Mantener. Vigilar RSI y catalizador próximo."
+                elif pnl_pos >= 0:
+                    gest_color = A; gest_emoji = "🟡"
+                    gest_titulo = "Break even"
+                    gest_msg = "Sin ganancia aún. Confirmar que el catalizador sigue activo."
+                elif pnl_pos >= -15:
+                    gest_color = R; gest_emoji = "🔴"
+                    gest_titulo = "En pérdida moderada"
+                    gest_msg = "Revisar catalizador. ¿Sigue válido? Si no, evaluar salida."
+                else:
+                    gest_color = R; gest_emoji = "🔴"
+                    gest_titulo = "Pérdida alta - acción requerida"
+                    gest_msg = "Stop loss cercano. Evaluar salida inmediata."
+
+                # RSI de la posición
+                rsi_gest = "RSI alto - zona salida" if rsi_pos > 65 else \
+                           "RSI medio - mantener" if rsi_pos > 45 else \
+                           "RSI bajo - posición sana"
+                rsi_gest_c = R if rsi_pos > 65 else A if rsi_pos > 45 else G
+
+                st.markdown(
+                    f'<div style="background:{BG_HEAD};border-radius:10px;padding:12px">'
+                    f'<div style="font-size:11px;font-weight:700;color:{TXT};margin-bottom:8px">📊 Estado de la posición</div>'
+                    f'<div style="background:{gest_color}18;border:1px solid {gest_color}44;border-radius:8px;padding:8px;margin-bottom:10px">'
+                    f'  <div style="font-size:12px;font-weight:700;color:{gest_color}">{gest_emoji} {gest_titulo}</div>'
+                    f'  <div style="font-size:11px;color:{TXT_MUT};margin-top:4px;line-height:1.5">{gest_msg}</div>'
+                    f'</div>'
+                    f'<div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px">'
+                    f'  <span style="color:{TXT_MUT}">RSI actual</span>'
+                    f'  <span style="color:{rsi_gest_c};font-weight:700">{rsi_pos:.0f} - {rsi_gest}</span>'
+                    f'</div>'
+                    f'<div style="display:flex;justify-content:space-between;font-size:11px">'
+                    f'  <span style="color:{TXT_MUT}">Días en posición</span>'
+                    f'  <span style="color:{TXT};font-weight:700">'
+                    f'{(pd.Timestamp.now()-pd.to_datetime(pos["Fecha"],errors="coerce")).days if "Fecha" in pos else "-"} días</span>'
+                    f'</div>'
+                    f'</div>', unsafe_allow_html=True)
+            with cd3:
+                # Objetivos - usar _tipo_pos ya calculado arriba
+                _beta_p = float(r.get("Beta", 1.5))
+                if _tipo_pos=="ETF_Cripto":   stop_val=pc*0.80; obj1=pc*1.30; obj2=pc*1.60; obj3=pc*2.00
+                elif _tipo_pos=="ETF_Indice": stop_val=pc*0.88; obj1=pc*1.15; obj2=pc*1.25; obj3=pc*1.40
+                elif _tipo_pos=="ETF_Sectorial": stop_val=pc*0.90; obj1=pc*1.20; obj2=pc*1.40; obj3=pc*1.60
+                elif _beta_p < 1.5:           stop_val=pc*0.88; obj1=pc*1.15; obj2=pc*1.25; obj3=pc*1.40
+                elif _beta_p < 2.5:           stop_val=pc*0.90; obj1=pc*1.20; obj2=pc*1.40; obj3=pc*1.60
+                else:                         stop_val=pc*0.82; obj1=pc*1.25; obj2=pc*1.50; obj3=pc*1.80
+                stop_pct = (stop_val/pa-1)*100 if pa>0 else 0
+                obj1_pct  = (obj1/pa-1)*100 if pa>0 else 0
+                obj2_pct  = (obj2/pa-1)*100 if pa>0 else 0
+                obj3_pct  = (obj3/pa-1)*100 if pa>0 else 0
+
+                def obj_color(pct):
+                    return G if pct <= 0 else A if pct <= 20 else C
+
+                def tramo_badge(label, color):
+                    return (f'<span style="background:{color}22;color:{color};border:1px solid {color}55;'
+                            f'border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700">{label}</span>')
+
+                st.markdown(
+                    f'<div style="background:{BG_HEAD};border-radius:10px;padding:12px">'
+                    f'<div style="font-size:11px;font-weight:700;color:{TXT};margin-bottom:10px">🎯 Plan de salida - 3 tramos</div>'
+
+                    # Stop loss
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid {BOR}">'
+                    f'<div>'
+                    f'  <span style="font-size:13px;font-weight:700;color:{R}">${stop_val:.2f}</span>'
+                    f'  <span style="font-size:10px;color:{R}"> ({stop_pct:+.1f}%)</span>'
+                    f'</div>'
+                    f'<div>{tramo_badge("🛑 STOP LOSS", R)}</div>'
+                    f'</div>'
+
+                    # Tramo 1
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid {BOR}">'
+                    f'<div>'
+                    f'  <span style="font-size:13px;font-weight:700;color:{obj_color(obj1_pct)}">${obj1:.2f}</span>'
+                    f'  <span style="font-size:10px;color:{obj_color(obj1_pct)}"> ({obj1_pct:+.1f}%)</span>'
+                    f'</div>'
+                    f'<div>{tramo_badge("VENDER 30%", A)}</div>'
+                    f'</div>'
+
+                    # Tramo 2
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid {BOR}">'
+                    f'<div>'
+                    f'  <span style="font-size:13px;font-weight:700;color:{obj_color(obj2_pct)}">${obj2:.2f}</span>'
+                    f'  <span style="font-size:10px;color:{obj_color(obj2_pct)}"> ({obj2_pct:+.1f}%)</span>'
+                    f'</div>'
+                    f'<div>{tramo_badge("VENDER 40%", G)}</div>'
+                    f'</div>'
+
+                    # Tramo 3
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0">'
+                    f'<div>'
+                    f'  <span style="font-size:13px;font-weight:700;color:{obj_color(obj3_pct)}">${obj3:.2f}</span>'
+                    f'  <span style="font-size:10px;color:{obj_color(obj3_pct)}"> ({obj3_pct:+.1f}%)</span>'
+                    f'</div>'
+                    f'<div>{tramo_badge("RUNNER 30%", C)}</div>'
+                    f'</div>'
+
+                    f'<div style="font-size:9px;color:{TXT_SOFT};margin-top:6px;border-top:1px solid {BOR};padding-top:5px">'
+                    f'% = cuánto falta desde precio actual  - Verde = ya alcanzado</div>'
+                    f'</div>', unsafe_allow_html=True)
+            with cd4:
+                tramos_resumen = "  - ".join([
+                    f'<span style="color:{(_t[2] if len(_t)>2 else (R if "VENDER" in str(_t[1]) else G))};font-weight:700">{_t[0]}% {_t[1]}</span>'
+                    for _t in tramos if _t[0] > 0
+                ])
+                # v15: earnings badge urgencia + live fetch si falta
+                import datetime as _dttC4
+                _cat_c4 = _cat_fecha_use if _cat_fecha_use not in ("-","","nan") else get_earnings_single(tk)
+                try:
+                    _dias_c4 = (_dttC4.date.fromisoformat(_cat_c4[:10]) - _dttC4.date.today()).days
+                    if _dias_c4 < 0:
+                        _earn_html_c4 = f'<div style="font-size:10px;color:{TXT_SOFT}">✅ Earnings {_cat_c4[:10]} (ya reportó)</div>'
+                    elif _dias_c4 <= 2:
+                        _earn_html_c4 = (f'<div style="background:#FEF2F2;border:2px solid #EF4444;border-radius:8px;padding:7px 10px;margin-top:6px">'
+                            f'<div style="font-size:12px;font-weight:800;color:#DC2626">🚫 Earnings en {_dias_c4}d - NO agregar</div>'
+                            f'<div style="font-size:10px;color:#7F1D1D">Riesgo binario. Esperar resultado.</div></div>')
+                    elif _dias_c4 <= 6:
+                        _earn_html_c4 = (f'<div style="background:#FFFBEB;border:1px solid #FCD34D;border-radius:8px;padding:7px 10px;margin-top:6px">'
+                            f'<div style="font-size:12px;font-weight:700;color:#D97706">⚠️ Earnings en {_dias_c4}d - Cuidado</div>'
+                            f'<div style="font-size:10px;color:#92400E">Definir plan antes del reporte.</div></div>')
+                    elif _dias_c4 <= 15:
+                        _earn_html_c4 = (f'<div style="background:#F0FDF4;border:1px solid #86EFAC;border-radius:8px;padding:7px 10px;margin-top:6px">'
+                            f'<div style="font-size:12px;font-weight:700;color:#16A34A">🎯 Earnings en {_dias_c4}d - Zona NBIS</div>'
+                            f'<div style="font-size:10px;color:#14532D">{_cat_c4[:10]}  - Catal. activo.</div></div>')
+                    elif _dias_c4 <= 30:
+                        _earn_html_c4 = (f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:7px 10px;margin-top:6px">'
+                            f'<div style="font-size:12px;font-weight:700;color:#2563EB">📅 Earnings en {_dias_c4}d</div>'
+                            f'<div style="font-size:10px;color:#1E3A8A">{_cat_c4[:10]}  - Monitorear.</div></div>')
+                    else:
+                        _earn_html_c4 = f'<div style="font-size:10px;color:{TXT_MUT}">📅 {_cat_c4[:10]}</div>'
+                except Exception:
+                    _earn_html_c4 = f'<div style="font-size:10px;color:{TXT_SOFT}">{"Sin earnings detectados" if _cat_c4 in ("-","","nan") else _cat_c4[:10]}</div>'
+                st.markdown(
+                    f'<div style="background:{BG_HEAD};border-radius:10px;padding:12px">'
+                    f'<div style="font-size:11px;font-weight:700;color:{TXT};margin-bottom:8px">Lectura del trader</div>'
+                    f'<div style="font-size:12px;margin-bottom:8px">{tramos_resumen}</div>'
+                    f'<div style="font-size:11px;color:{TXT_MUT};line-height:1.7">{razon}</div>'
+                    f'{_earn_html_c4}'
+                    f'</div>',unsafe_allow_html=True)
+
+            # ── POST-EARNINGS DETECTOR v15 ────────────────────
+            # Detecta si el earning ya ocurrió y da decisión concreta
+            _peg = detect_post_earning_gap(tk, _cat_c4)
+            if _peg["ocurrio"]:
+                _peg_bg = {"positivo_fuerte":"#F0FDF4","positivo_moderado":"#F0FDF4",
+                           "neutral":"#FFFBEB","negativo_moderado":"#FEF2F2",
+                           "negativo_fuerte":"#FFF1F2"}.get(_peg["clasificacion"],"#F8FAFC")
+                _peg_bor = {"positivo_fuerte":"#86EFAC","positivo_moderado":"#86EFAC",
+                            "neutral":"#FCD34D","negativo_moderado":"#FCA5A5",
+                            "negativo_fuerte":"#FDA4AF"}.get(_peg["clasificacion"],"#E2E8F0")
+                st.markdown(
+                    f'<div style="background:{_peg_bg};border:2px solid {_peg_bor};'
+                    f'border-radius:10px;padding:12px 16px;margin-top:8px">'
+                    f'<div style="font-size:12px;font-weight:800;color:{_peg["color"]};margin-bottom:6px">'
+                    f'{_peg["emoji"]} RESULTADO EARNING - Gap {_peg["gap_pct"]:+.1f}%  - Vol {_peg["vol_ratio"]:.1f}x promedio</div>'
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px">'
+                    f'  <div style="background:rgba(255,255,255,0.6);border-radius:7px;padding:8px">'
+                    f'    <div style="font-size:9px;font-weight:700;color:{_peg["color"]};margin-bottom:3px">💼 YA TIENES POSICIÓN</div>'
+                    f'    <div style="font-size:11px;color:#1E293B;line-height:1.5">{_peg["decision_tiene"]}</div>'
+                    f'  </div>'
+                    f'  <div style="background:rgba(255,255,255,0.6);border-radius:7px;padding:8px">'
+                    f'    <div style="font-size:9px;font-weight:700;color:#2563EB;margin-bottom:3px">🔍 SIN POSICIÓN / RECOMPRA</div>'
+                    f'    <div style="font-size:11px;color:#1E293B;line-height:1.5">{_peg["decision_notiene"]}</div>'
+                    f'  </div>'
+                    f'</div>'
+                    f'{"<div style=margin-top:8px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:7px;padding:8px>" + "<div style=font-size:10px;font-weight:700;color:#EA580C>🎯 SETUP RECOMPRA NBIS ACTIVO</div>" + "<div style=font-size:11px;color:#7C2D12>Caída post-earning = mercado sobrereaccionó. Monitorear RSI + Volumen + Soporte los próximos 3 días.</div></div>" if _peg["recompra_activa"] else ""}'
+                    f'</div>', unsafe_allow_html=True)
+            # ── NBIS Panel + Pre/Post Market ─────────────────
+            st.markdown(
+                render_nbis_panel(
+                    r.get("Prob_NBIS", 0), r.get("Sim_NBIS", 0),
+                    G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR
+                ), unsafe_allow_html=True)  # v18: Pre/Post Market removido de posiciones
+
+            # ── PIRAMIDACIÓN v18 — agregar a posición ganadora ──
+            _pir = analisis.get("piramidar") if analisis else None
+            if _pir:
+                _pir_bg  = {"#16A34A":"#F0FDF4","#0891B2":"#ECFEFF","#7C3AED":"#F5F3FF"}.get(_pir["color"],"#F8FAFC")
+                _pir_bor = {"#16A34A":"#86EFAC","#0891B2":"#A5F3FC","#7C3AED":"#C4B5FD"}.get(_pir["color"],"#E2E8F0")
+                st.markdown(
+                    f'<div style="background:{_pir_bg};border:2px solid {_pir_bor};'
+                    f'border-radius:10px;padding:12px 16px;margin-top:8px">'
+                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+                    f'  <span style="font-size:14px;font-weight:800;color:{_pir["color"]}">'
+                    f'  {_pir["accion"]}</span>'
+                    f'  <span style="background:{_pir["color"]};color:white;border-radius:5px;'
+                    f'  padding:2px 8px;font-size:10px;font-weight:700">{_pir["urgencia"]}</span>'
+                    f'</div>'
+                    f'<div style="font-size:11px;color:#374151;line-height:1.6">{_pir["razon"]}</div>'
+                    f'</div>', unsafe_allow_html=True)
+
+            # ── v18: Botón de salida / T1 / Stop ─────────────
+            with st.expander(f"🏁 Registrar salida / T1 / Stop — {tk}", expanded=False):
+                _tipo_sal = st.radio("Tipo de cierre",
+                    ["T1 — venta parcial","SALIDA — cierre total","STOP — stop loss"],
+                    horizontal=True, key=f"gtipo_sal_{_tk_key_6a}")
                 _tipo_map = {"T1 — venta parcial":"T1","SALIDA — cierre total":"SALIDA","STOP — stop loss":"STOP"}
                 render_boton_registro(
                     ticker=tk, fase=str(r.get("Etapa_v12","-")),
@@ -8651,7 +9730,8 @@ También puedes descargar la plantilla de abajo y completarla.
                     _csv_a,
                     f"analisis_posiciones_{pd.Timestamp.now().strftime('%Y-%m-%d_%H%M')}.csv",
                     "text/csv",
-                    help="Análisis completo con PnL  - Señal v12  - Score  - Urgencia"
+                    help="Análisis completo con PnL  - Señal v12  - Score  - Urgencia",
+                    key="dl_pos_mauri_exp",
                 )
 
                 # ── Botón B: CSV posiciones actualizadas con salidas ─
@@ -8704,7 +9784,8 @@ También puedes descargar la plantilla de abajo y completarla.
                         _csv_act,
                         f"Activos_actualizado_{pd.Timestamp.now().strftime('%Y-%m-%d')}.csv",
                         "text/csv",
-                        help="CSV listo para re-subir. T1 ejecutado -> 60% de cantidad. T2 ejecutado -> 20%. Stop -> posición eliminada."
+                        help="CSV listo para re-subir. T1 ejecutado -> 60% de cantidad. T2 ejecutado -> 20%. Stop -> posición eliminada.",
+                        key="dl_pos_mauri_upd",
                     )
 
         if posiciones_df is not None and len(posiciones_df) > 0:
@@ -8813,11 +9894,20 @@ with tab7:
     if amp_df is not None and len(amp_df) > 0:
         total_inv_a=0; total_act_a=0; total_pnl_a=0; n_ok_a=0
 
+        # ── v18: Ordenar posiciones Amparito por prioridad ───────
+        try:
+            amp_df = amp_df.copy()
+            amp_df["_orden_a"] = amp_df.apply(_prioridad_pos, axis=1)
+            amp_df = amp_df.sort_values("_orden_a").drop(columns=["_orden_a"])
+            amp_df = amp_df.reset_index(drop=True)
+        except Exception:
+            pass
+
         for _idx_t7, (_,pos) in enumerate(amp_df.iterrows()):
             tk  = str(pos["Ticker"]).upper()
             _tk_key_t7 = f"{tk}_t7{_idx_t7}"  # v18: "t7" prefix avoids collision with Tab6 per row
             pc  = float(pos["Precio_Compra"])
-            qty = float(pos["Cantidad"])
+            qty = float(str(pos["Cantidad"]).replace(",","."))  # v18: float para fraccionarias
             fch = str(pos.get("Fecha","-"))
 
             r = get_row_for_ticker(tk, pc)
@@ -8901,7 +9991,7 @@ with tab7:
                 f'<div style="display:flex;align-items:center;gap:10px">'
                 f'  <span style="font-size:20px;font-weight:800;color:{P}">{tk}</span>'
                 f'  <span class="badge {urg_cls}">{urgencia}</span>'
-                f'  <span style="font-size:11px;color:{TXT_SOFT}">{qty:.4f} acc  - compra ${pc:.2f}  - {fch}</span>'
+                f'  <span style="font-size:11px;color:{TXT_SOFT}">{qty:.4g} acc · compra ${pc:.2f} · {str(fch)[:10] if fch not in ("-","","nan","NaT","None") else "Sin fecha"}</span>'
                 f'</div>'
                 f'<div style="display:flex;gap:20px;align-items:center">'
                 f'  <div style="text-align:center">'
@@ -8992,44 +10082,13 @@ with tab7:
                     f'{"<div style=margin-top:8px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:7px;padding:8px><div style=font-size:10px;font-weight:700;color:#EA580C>🎯 SETUP RECOMPRA NBIS ACTIVO</div><div style=font-size:11px;color:#7C2D12>Caída post-earning = mercado sobrereaccionó. Monitorear RSI + Volumen + Soporte 3 días.</div></div>" if _peg_a["recompra_activa"] else ""}'
                     f'</div>', unsafe_allow_html=True)
 
-            # ── TREN DE ARRASTRE v18 (Amparito) ──────────────
-            _symp_pos_a = get_sympathy(tk)
-            _arr_pos_a  = _symp_pos_a["arrastradas"]
-            _lid_pos_a  = _symp_pos_a["lider"]
-            if _arr_pos_a not in ("-","","nan") or _lid_pos_a not in ("-","","nan"):
-                _arr_ch_a = " ".join([
-                    f'<span style="background:#0891B2;color:white;border-radius:6px;'
-                    f'padding:3px 10px;font-weight:700;font-size:11px;margin:2px;display:inline-block">'
-                    f'🔗 {a.strip()}</span>'
-                    for a in _arr_pos_a.split(",") if a.strip() and a.strip() != "-"
-                ]) if _arr_pos_a not in ("-","","nan") else ""
-                _lid_ch_a = (
-                    f'<span style="background:#7C3AED;color:white;border-radius:6px;'
-                    f'padding:3px 10px;font-weight:700;font-size:11px">🏆 {_lid_pos_a}</span>'
-                    if _lid_pos_a not in ("-","","nan") else ""
-                )
-                _tren_desc_a = (
-                    f"<strong>{tk}</strong> arrastra a {_arr_pos_a}. Candidatas para entrada escalonada 3-7d después."
-                    if _arr_pos_a not in ("-","","nan")
-                    else f"Arrastrada por {_lid_pos_a} — verificar que el líder sigue subiendo."
-                )
-                st.markdown(
-                    f'<div style="background:linear-gradient(135deg,#EFF6FF,#F0FDF4);'
-                    f'border:1px solid #BFDBFE;border-radius:10px;padding:10px 14px;margin-bottom:8px">'
-                    f'<div style="font-size:11px;font-weight:800;color:#1D4ED8;margin-bottom:6px">🚂 Tren de Arrastre</div>'
-                    f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
-                    + (_lid_ch_a + ' <span style="color:#9CA3AF;font-size:10px">→ líder</span> · ' if _lid_ch_a else "")
-                    + f'<span style="background:#16A34A;color:white;border-radius:6px;padding:3px 10px;font-weight:800;font-size:12px">{tk}</span>'
-                    + (f' <span style="color:#9CA3AF;font-size:10px">arrastra →</span> {_arr_ch_a}' if _arr_ch_a else "")
-                    + f'</div>'
-                    f'<div style="font-size:10px;color:#374151">{_tren_desc_a}</div>'
-                    f'</div>', unsafe_allow_html=True)
+
+            # Tren de Arrastre — datos en Sheet GrekoTrader_Sympathy (próximamente)
 
             st.markdown(
                 render_nbis_panel(r.get("Prob_NBIS",0), r.get("Sim_NBIS",0),
-                    G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR) +
-                render_pre_post_bar(tk, pa, G, A, R, TXT_MUT, TXT_SOFT, BG_HEAD, BOR),
-                unsafe_allow_html=True)
+                    G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR),
+                unsafe_allow_html=True)  # v18: Pre/Post Market removido
 
             # ── REGISTRO EN GOOGLE SHEETS (Amparito) v18 ────
             _col_reg_a1, _col_reg_a2 = st.columns(2)
@@ -9164,7 +10223,8 @@ with tab7:
                     df_to_csv_chile(_df_exp_a),
                     f"analisis_amparito_{pd.Timestamp.now().strftime('%Y-%m-%d_%H%M')}.csv",
                     "text/csv",
-                    help="Análisis completo con PnL  - Señal v12  - Score  - Urgencia"
+                    help="Análisis completo con PnL  - Señal v12  - Score  - Urgencia",
+                    key="dl_pos_amp_csv",
                 )
 
                 # CSV actualizado con salidas aplicadas
@@ -9203,7 +10263,8 @@ with tab7:
                         df_to_csv_chile(pd.DataFrame(rows_act_amp)),
                         f"Activos_Amparito_actualizado_{pd.Timestamp.now().strftime('%Y-%m-%d')}.csv",
                         "text/csv",
-                        help="CSV listo para re-subir. T1->60% cantidad. T2->20%. Stop->eliminada."
+                        help="CSV listo para re-subir. T1->60% cantidad. T2->20%. Stop->eliminada.",
+                        key="dl_pos_amp_upd",
                     )
             # Noticias Amparito
             st.markdown("---")
@@ -9653,7 +10714,7 @@ with tab9:
                 st.download_button("⬇️ Descargar CSV de señales",
                     ("Ticker,Fecha,Entrada,Salida,Stop,Resultado%,Ganadora,Dias\n" + _csv_bt).encode(),
                     f"backtesting_v18_{datetime.date.today()}.csv", "text/csv",
-                    use_container_width=True)
+                    use_container_width=True, key="dl_senales_csv")
 
     # ════════════════════════════════════════════════════════
     # SECCIÓN EXPORTACIÓN SEMANAL — memoria de trades
@@ -9677,7 +10738,8 @@ with tab9:
                 _csv_exp,
                 f"senales_modelo_{_dt_exp.date.today()}.csv",
                 "text/csv", use_container_width=True,
-                help="Señales M2/M3 que guardaste como candidatos esta semana"
+                help="Señales M2/M3 que guardaste como candidatos esta semana",
+                key="dl_senales_local",
             )
         else:
             st.info("Sin señales registradas aún")
@@ -9700,7 +10762,8 @@ with tab9:
                     _df_pos_exp.to_csv(index=False).encode("utf-8"),
                     f"posiciones_{_dt_pos.date.today()}.csv",
                     "text/csv", use_container_width=True,
-                    help="Estado actual de todas tus posiciones con P&L"
+                    help="Estado actual de todas tus posiciones con P&L",
+                    key="dl_pos_act",
                 )
         else:
             st.info("Carga tus posiciones primero")
