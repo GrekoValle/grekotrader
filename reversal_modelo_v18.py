@@ -1251,6 +1251,158 @@ def render_pre_post_bar(ticker: str, precio_actual: float,
 # ─────────────────────────────────────────────────────────────
 #  PANEL PROBABILIDAD NBIS - para todas las tarjetas del scanner
 # ─────────────────────────────────────────────────────────────
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
+def leer_watchlist_sheets() -> "pd.DataFrame | None":
+    """
+    v18: Lee GrekoTrader_Watchlist desde Google Sheets.
+    Columnas: Ticker | Nombre | Area | Nota
+    """
+    try:
+        svc = _get_sheets_service()
+        if not svc:
+            st.session_state["_wl_sheets_error"] = "P1_FAIL: sin credenciales gcp_service_account"
+            return None
+
+        sheet_id = _get_sheet_id_from_secrets("watchlist_id")
+        if not sheet_id:
+            st.session_state["_wl_sheets_error"] = "P2_FAIL: watchlist_id no encontrado en st.secrets[sheets]"
+            return None
+
+        rows = []
+        for _nombre_hoja in ["Hoja 1", "Sheet1", "Watchlist", "Hoja1", "Sheet 1"]:
+            try:
+                _result = svc.spreadsheets().values().get(
+                    spreadsheetId=sheet_id,
+                    range=f"'{_nombre_hoja}'!A1:Z500"
+                ).execute()
+                _vals = _result.get("values", [])
+                if _vals:
+                    rows = _vals
+                    st.session_state["_wl_sheets_error"] = ""
+                    st.session_state["_wl_sheets_hoja"] = _nombre_hoja
+                    break
+            except Exception:
+                continue
+
+        if not rows:
+            try:
+                _result = svc.spreadsheets().values().get(
+                    spreadsheetId=sheet_id, range="A1:Z500"
+                ).execute()
+                rows = _result.get("values", [])
+                st.session_state["_wl_sheets_hoja"] = "rango genérico"
+            except Exception as _e3:
+                st.session_state["_wl_sheets_error"] = f"P3_FAIL: {str(_e3)[:100]}"
+                return None
+
+        if len(rows) < 2:
+            st.session_state["_wl_sheets_error"] = "P4_WARN: Sheet vacío o solo tiene headers — agrega tickers en filas 2+"
+            return pd.DataFrame(columns=["Ticker","Nombre","Area","Nota"])
+
+        headers = [h.strip() for h in rows[0]]
+        st.session_state["_wl_sheets_error"] = f"P5_OK: {len(rows)-1} filas · headers={headers[:4]}"
+        wl_data = []
+        for row in rows[1:]:
+            if not row: continue
+            d = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
+            tk = str(d.get("Ticker","")).upper().strip().replace("$","")
+            if not tk: continue
+            wl_data.append({
+                "Ticker": tk,
+                "Nombre": str(d.get("Nombre", tk)).strip(),
+                "Area":   str(d.get("Area", d.get("Área", d.get("Sector", "-")))).strip(),
+                "Nota":   str(d.get("Nota",  d.get("Notas", ""))).strip(),
+            })
+        return pd.DataFrame(wl_data) if wl_data else pd.DataFrame(columns=["Ticker","Nombre","Area","Nota"])
+    except Exception as _e:
+        try:
+            st.session_state["_wl_sheets_error"] = f"EXCEPTION: {str(_e)[:120]}"
+        except Exception:
+            pass
+        return None
+
+@st.cache_data(ttl=1800, show_spinner=False)  # cache 30 min
+def get_noticia_top(ticker: str) -> dict:
+    """
+    v18: Obtiene la noticia más relevante del día para un ticker.
+    Retorna dict con titulo, sentimiento, dias, impacto, link.
+    Usado inline en cards de Watchlist, Sympathy y Posiciones.
+    """
+    try:
+        noticias = fetch_noticias_ticker(ticker)
+        if not noticias:
+            return {}
+        # La primera noticia es la más reciente
+        top = noticias[0]
+        return {
+            "titulo":      top.get("titulo","")[:90],
+            "sentimiento": top.get("sentimiento","neutral"),
+            "impacto":     top.get("impacto", 0),
+            "dias":        top.get("dias_atras", 0),
+            "link":        top.get("link",""),
+            "fuente":      top.get("fuente",""),
+        }
+    except Exception:
+        return {}
+
+
+def render_noticia_inline(ticker: str,
+                           G: str, R: str, A: str,
+                           TXT_MUT: str, BOR: str) -> str:
+    """
+    v18: Renderiza el titular más importante como HTML inline.
+    Para usar dentro de cards de Watchlist, Sympathy y Posiciones.
+    """
+    # Primero buscar en caché existente
+    cache = st.session_state.get("noticias_cache", {})
+    if ticker in cache and cache[ticker].get("noticias"):
+        top = cache[ticker]["noticias"][0]
+        titulo    = top.get("titulo","")[:85]
+        sent      = top.get("sentimiento","neutral")
+        impacto   = top.get("impacto", 0)
+        dias      = top.get("dias_atras", top.get("dias", 0))
+        link      = top.get("link","#")
+    else:
+        # Fetch directo si no está en caché
+        data = get_noticia_top(ticker)
+        if not data:
+            return ""
+        titulo  = data.get("titulo","")[:85]
+        sent    = data.get("sentimiento","neutral")
+        impacto = data.get("impacto", 0)
+        dias    = data.get("dias", 0)
+        link    = data.get("link","#")
+
+    if not titulo:
+        return ""
+
+    # Color por sentimiento
+    if sent == "positivo" or impacto > 3:
+        _nc, _nbg = G, "#F0FDF4"
+        _icon = "📈"
+    elif sent == "negativo" or impacto < -3:
+        _nc, _nbg = R, "#FEF2F2"
+        _icon = "📉"
+    else:
+        _nc, _nbg = A, "#FFFBEB"
+        _icon = "📰"
+
+    _dias_str = "hoy" if dias == 0 else f"hace {dias}d"
+    _imp_str  = f"{impacto:+d}" if impacto != 0 else ""
+
+    return (
+        f'<div style="background:{_nbg};border-left:3px solid {_nc};'
+        f'border-radius:0 6px 6px 0;padding:5px 10px;margin-top:5px;font-size:10px">'
+        f'<span style="font-weight:700;color:{_nc}">{_icon} </span>'
+        f'<span style="color:#374151">{titulo}</span>'
+        f'<span style="color:{_nc};font-weight:600;margin-left:6px">{_imp_str}</span>'
+        f'<span style="color:#9CA3AF;margin-left:6px">{_dias_str}</span>'
+        f'</div>'
+    )
+
 def render_nbis_panel(prob: float, sim: float,
                       G: str, A: str, R: str, C: str,
                       TXT: str, TXT_MUT: str, TXT_SOFT: str,
@@ -3684,13 +3836,12 @@ def scan_tab(rsi_max: float, dd_min: float,
                     sc = min(100, int(sc * vix_mult))
                 if sc < score_min:
                     continue
-                # v18 mejora: Score máximo 55 (semana 27abr-08may)
-                # Score 40-55: WR 70%, avg +3.1%
-                # Score > 55: WR 25%, avg -0.3% — señal tardía, precio ya se movió
-                _score_max = getattr(st.session_state, "score_max_filtro", 55)
-                if sc > _score_max and decisions and "M3" in str(decisions):
-                    pass  # M3 puede tener score alto — es breakout confirmado
-                elif sc > _score_max:
+                # v18: Score máximo 55 — señal tardía si score > 55
+                # Excepción: si score_min ya es 40+ el rango 40-55 es el objetivo
+                # Para Tab3 (score_min=40): filtrar score > 55
+                # Para otros tabs con score_min=55: el techo no aplica
+                _score_max = 55 if score_min <= 45 else 999
+                if sc > _score_max:
                     continue
                 # v12: calcular Prob NBIS con datos reales del yfinance loop
                 _mom_s     = round((close[-1]/close[-4]-1)*100, 2) if len(close)>=4 else 0
@@ -3711,7 +3862,8 @@ def scan_tab(rsi_max: float, dd_min: float,
                 if prob_nbis_min > 0 and _prob_nbis < prob_nbis_min:
                     continue
 
-                dec, fase, trig, col, bg = get_decision(sc, 0, 1.0, macd_h, rsi, "-")
+                dec, fase, trig, col, bg = get_decision(sc, 0, 1.0, macd_h, rsi, "-",
+                                                         prob_nbis=_prob_nbis)
                 if decisions and dec not in decisions:
                     continue
 
@@ -3772,20 +3924,27 @@ def _count(key):
 
 
 
-def get_decision(score, pre_move, pre_vol, macd, rsi, lider):
+def get_decision(score, pre_move, pre_vol, macd, rsi, lider, prob_nbis=0):
+    # v18: asegurar que prob_nbis sea número (puede llegar como función por error)
+    try:
+        _prob_val = float(prob_nbis) if not callable(prob_nbis) else 0.0
+    except Exception:
+        _prob_val = 0.0
+    _prob_ok = _prob_val >= 25
+
     # ── ENTRAR - señal M3 confirmada ──────────────────────────
-    if score>=55 and pre_move>=3 and pre_vol>=1.3 and macd>0:
+    if score>=55 and pre_move>=3 and pre_vol>=1.3 and macd>0 and _prob_ok:
         return "ENTRAR","Fase 3","RUPTURA ACTIVA",G,G_BG
     # ── ANTICIPAR - pre-señal activa ──────────────────────────
-    elif score>=42 and pre_move>=1.5 and macd>0:
+    elif score>=42 and pre_move>=1.5 and macd>0 and _prob_ok:
         return "ANTICIPAR","Fase 3","PRE-SEÑAL ACTIVA",C,C_BG
+    # ── ANTICIPAR sin Prob suficiente → bajar a SEGUIR Fase 2 ─
+    elif score>=42 and pre_move>=1.5 and macd>0 and not _prob_ok:
+        return "SEGUIR","Fase 2","SEÑAL TÉCNICA · Prob NBIS baja",A,A_BG
     # ── SEGUIR Fase 2 - radar, fondo formando ─────────────────
     elif score>=40:
         return "SEGUIR","Fase 2","FONDO FORMANDO",A,A_BG
-    # ── v17 Fix AMD-F1: M1 en BAJADA ACTIVA - MACD negativo es esperado
-    # Antes: M1 solo con score>=20 pero sin distinción entre caída normal y oportunidad
-    # Ahora: si RSI<45 + dd<-8% + score>=20 → detectar como "Corrección - Vigilar"
-    # El MACD negativo NO bloquea M1 — en plena corrección siempre es negativo
+    # ── v17 Fix AMD-F1: M1 en BAJADA ACTIVA
     elif score>=20 and rsi < 50 and macd > -3:
         return "SEGUIR","Fase 1","CORRECCIÓN - VIGILAR",A,A_BG
     elif score>=20:
@@ -4065,7 +4224,9 @@ def build_df():
         # pero además limitamos la decisión
         es_iliquida = vol_k < 500
 
-        dec, fase, trig, col, bg = get_decision(sc, pm, pv, macd, rsi, lider)
+        dec, fase, trig, col, bg = get_decision(sc, pm, pv, macd, rsi, lider, prob_nbis=0)
+        # prob_nbis se calcula después — get_decision usa 0 por defecto aquí
+        # El valor real se aplica cuando se recalcula abajo si aplica
 
         # Ilíquidas no pueden pasar de Bajada F1
         if es_iliquida and dec in ["ENTRAR","ANTICIPAR","SEGUIR"]:
@@ -4079,6 +4240,10 @@ def build_df():
         prob = prob_nbis(sc, pv, si, dd, mes)
         sim  = sim_nbis(rsi, vol, ema, macd, sop, dd)
         mot  = motivo(row["Cat_Tipo"], pm, lider)
+
+        # v18: recalcular decisión con prob real ahora que está disponible
+        dec, fase, trig, col, bg = get_decision(sc, pm, pv, macd, rsi, lider,
+                                                 prob_nbis=float(prob))
 
         # v15: earnings live - si Cat_Fecha es "-", buscar en yfinance
         _cat_fecha_row = str(row.get("Cat_Fecha", "-"))
@@ -4254,8 +4419,20 @@ def fetch_ticker_data(ticker: str, precio_compra: float) -> dict:
 
         sc = calc_score(rsi, vol_r, ema_d, macd_hist, sop, dd,
                         pre_move_calc, 0.0, max(pre_vol_calc, 1.0), 1.0, rsi_tend)
+        # v18 fix: calcular el VALOR de prob_nbis antes de get_decision
+        # prob_nbis es una función — necesitamos llamarla primero
+        try:
+            _prob_val = float(prob_nbis(sc, max(pre_vol_calc,1.0), 0.0, dd, 3))
+        except Exception as _ep:
+            # Guardar el error para diagnóstico
+            try:
+                st.session_state["_prob_debug"] = f"{ticker}: sc={sc} pre_vol={pre_vol_calc} dd={dd} err={str(_ep)[:60]}"
+            except Exception:
+                pass
+            _prob_val = 0.0
         dec,fase,trig,col,bg = get_decision(sc, pre_move_calc,
-                                            max(pre_vol_calc, 1.0), macd_hist, rsi, "")
+                                            max(pre_vol_calc, 1.0), macd_hist, rsi, "",
+                                            prob_nbis=_prob_val)
 
         return {
             "Ticker":ticker,"Nombre":nombre,"Area":area,
@@ -4270,7 +4447,7 @@ def fetch_ticker_data(ticker: str, precio_compra: float) -> dict:
             "Arrastradas": get_sympathy(ticker)["arrastradas"],"Lider": get_sympathy(ticker)["lider"],
             "Score":sc,"Decision":dec,"Fase":fase,"Trigger":trig,
             "Color":col,"Bg":bg,
-            "Prob_NBIS":round(prob_nbis(sc,1.0,0.0,dd,3),1),
+            "Prob_NBIS":round(_prob_val, 1),
             "Sim_NBIS":round(sim_nbis(rsi,vol_r,ema_d,macd_hist,sop,dd),1),
             "Motivo":"Datos en tiempo real","Lectura":"Calculado desde yfinance.",
             "_source":"yfinance",
@@ -4285,7 +4462,8 @@ def fetch_ticker_data(ticker: str, precio_compra: float) -> dict:
         dd_est   = -10.0
         sop_est  = 2.0
         sc = calc_score(rsi_est,vol_est,ema_est,macd_est,sop_est,dd_est,0.0,0.0,1.0,1.0,0)
-        dec,fase,trig,col,bg = get_decision(sc,0.0,1.0,macd_est,rsi_est,"")
+        dec,fase,trig,col,bg = get_decision(sc,0.0,1.0,macd_est,rsi_est,"",
+                                            prob_nbis=30)  # estimado: prob neutral
         return {
             "Ticker":ticker,"Nombre":ticker,"Area":"-",
             "Precio":precio_compra,
@@ -4493,6 +4671,37 @@ def analizar_posicion(precio_compra, precio_actual, rsi, macd,
     except Exception:
         pass
     tiene_cat_proximo = 0 <= dias_para_cat <= 15  # earnings en próximos 15 días
+
+    # ── v18: Earnings CONSUMIDOS (0-3 días PASADOS) ──────────────
+    # Si el earning ya ocurrió, el catalizador está consumido
+    # El movimiento actual ya refleja la reacción post-earnings
+    try:
+        if cat_fecha and cat_fecha not in ("-","","nan","NaT"):
+            _cat_date = pd.to_datetime(cat_fecha, errors="coerce")
+            if _cat_date and not pd.isna(_cat_date):
+                _dias_desde_earn = (datetime.date.today() - _cat_date.date()).days
+                if 0 <= _dias_desde_earn <= 3 and dias_posicion <= 5:
+                    _earn_msg = (
+                        "Momentum post-earnings es efímero — considerar tomar ganancias."
+                        if pnl_pct > 5 else
+                        "Si es sympathy play, revisar estado del líder antes de salir."
+                        if pnl_pct < -5 else
+                        "Mantener y monitorear 2-3 días más."
+                    )
+                    return {
+                        "señal": f"📅 Post-Earnings ({_dias_desde_earn}d) — catalizador consumido",
+                        "accion": (
+                            f"El earning fue hace {_dias_desde_earn} día(s). "
+                            f"El movimiento actual ({pnl_pct:+.1f}%) refleja la reacción. "
+                            f"{_earn_msg}"
+                        ),
+                        "urgencia": "VIGILAR",
+                        "tramos": [(100, "MONITOREAR")],
+                        "color": "D97706",
+                        "piramidar": None,
+                    }
+    except Exception:
+        pass
 
     # ── v18: PIRAMIDACIÓN — agregar a posiciones ganadoras ───────
     # Detecta 3 zonas donde tiene sentido agregar más acciones:
@@ -4865,6 +5074,8 @@ _SHEET_NAME_TRADES    = "GrekoTrader_Trades_Reales"
 _SHEET_NAME_MAURI     = "GrekoTrader_Posiciones_Mauri"
 _SHEET_NAME_AMPARITO  = "GrekoTrader_Posiciones_Amparito"
 _SHEET_NAME_GREKO     = "GrekoTrader_Posiciones_Greko"  # Tab C — paper trading
+_SHEET_NAME_WATCHLIST = "GrekoTrader_Watchlist"           # v18: Watchlist desde Google Sheets
+_SHEET_NAME_SYMPATHY  = "GrekoTrader_Sympathy"           # v18: relaciones tren de arrastre
 
 # v18: leer Sheet IDs desde Streamlit secrets si están configurados
 def _get_sheet_id_from_secrets(key: str) -> str:
@@ -4932,6 +5143,8 @@ def _buscar_sheet_id(nombre: str) -> str:
         _SHEET_NAME_SENALES:  "senales_modelo_id",
         _SHEET_NAME_TRADES:   "trades_reales_id",
         _SHEET_NAME_GREKO:    "posiciones_greko_id",
+        _SHEET_NAME_WATCHLIST:"watchlist_id",             # v18: watchlist sheets
+        _SHEET_NAME_SYMPATHY: "sympathy_id",            # v18: tren de arrastre
     }
     if nombre in _secrets_map:
         _id = _get_sheet_id_from_secrets(_secrets_map[nombre])
@@ -5186,6 +5399,14 @@ def limpiar_cache_sheets_only():
     """
     leer_posiciones_sheets.clear()
     try:
+        leer_watchlist_sheets.clear()  # v18: limpiar cache watchlist también
+    except Exception:
+        pass
+    try:
+        leer_sympathy_sheets.clear()   # v18: limpiar cache sympathy también
+    except Exception:
+        pass
+    try:
         _buscar_sheet_id.clear()
     except Exception:
         pass
@@ -5328,13 +5549,27 @@ def escribir_greko_sheets(
     import datetime as _dtg
     hoy = _dtg.date.today().isoformat()
 
-    # SPY RSI del día
+    # SPY RSI del día — intentar desde mercado_data primero, luego calcular directo
     spy_rsi = "-"
     try:
         _mkt_g = st.session_state.get("mercado_data", {})
-        spy_rsi = round(float(_mkt_g.get("spy", {}).get("rsi", 0)), 1)
+        _spy_rsi_cached = _mkt_g.get("spy", {}).get("rsi", 0)
+        if _spy_rsi_cached and float(_spy_rsi_cached) > 0:
+            spy_rsi = round(float(_spy_rsi_cached), 1)
+        else:
+            # Fallback: calcular RSI de SPY directamente desde yfinance
+            import yfinance as _yf_spy
+            import pandas as _pd_spy
+            import numpy as _np_spy
+            _spy_hist = _yf_spy.Ticker("SPY").history(period="1mo")
+            if not _spy_hist.empty:
+                _s = _pd_spy.Series(_spy_hist["Close"].values)
+                _d = _s.diff()
+                _g = _d.clip(lower=0).rolling(14).mean()
+                _l = (-_d.clip(upper=0)).rolling(14).mean()
+                spy_rsi = round(float(100 - 100/(1 + _g.iloc[-1]/(_l.iloc[-1]+1e-9))), 1)
     except Exception:
-        pass
+        spy_rsi = "-"
 
     # Precio Max y Min histórico desde hoy (al entrar son iguales al precio)
     fila_greko = [
@@ -5379,6 +5614,281 @@ def escribir_greko_sheets(
         return True, f"✅ {ticker} agregado a Posiciones Greko"
     except Exception as e:
         return False, f"❌ Error: {str(e)[:80]}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def leer_sympathy_sheets() -> dict:
+    """
+    v18: Lee GrekoTrader_Sympathy directamente por ID desde secrets.
+    Intenta primero "Hoja 1", luego "Sheet1", luego via metadata.
+    """
+    _diag = []
+    try:
+        # PASO 1: Servicio
+        svc = _get_sheets_service()
+        if not svc:
+            _diag.append("P1_FAIL: sin credenciales gcp_service_account")
+            st.session_state["_sympathy_error"] = " | ".join(_diag)
+            return {}
+        _diag.append("P1_OK: Sheets service conectado")
+
+        # PASO 2: Sheet ID
+        sheet_id = _get_sheet_id_from_secrets("sympathy_id")
+        if not sheet_id:
+            _diag.append("P2_FAIL: sympathy_id no encontrado en st.secrets[sheets]")
+            st.session_state["_sympathy_error"] = " | ".join(_diag)
+            return {}
+        _diag.append(f"P2_OK: sheet_id={sheet_id[:12]}...")
+
+        # PASO 3: Intentar leer directamente con nombres comunes
+        # Evita el metadata que puede fallar por permisos
+        rows = []
+        _hoja_usada = ""
+        for _nombre_hoja in ["Hoja 1", "Sheet1", "Hoja1", "Sheet 1", "Sympathy"]:
+            try:
+                _result = svc.spreadsheets().values().get(
+                    spreadsheetId=sheet_id,
+                    range=f"'{_nombre_hoja}'!A1:Z500"
+                ).execute()
+                _vals = _result.get("values", [])
+                if _vals:
+                    rows = _vals
+                    _hoja_usada = _nombre_hoja
+                    _diag.append(f"P3_OK: hoja='{_nombre_hoja}' → {len(rows)} filas")
+                    break
+            except Exception:
+                continue
+
+        # Si ninguno funcionó, intentar sin nombre de hoja
+        if not rows:
+            try:
+                _result = svc.spreadsheets().values().get(
+                    spreadsheetId=sheet_id,
+                    range="A1:Z500"
+                ).execute()
+                rows = _result.get("values", [])
+                _hoja_usada = "sin nombre"
+                _diag.append(f"P3_OK: rango genérico → {len(rows)} filas")
+            except Exception as _e3:
+                _diag.append(f"P3_FAIL: {str(_e3)[:100]}")
+                st.session_state["_sympathy_error"] = " | ".join(_diag)
+                return {}
+
+        if len(rows) < 2:
+            _diag.append(f"P3_WARN: Sheet '{_hoja_usada}' vacío o solo headers — agrega datos en filas 2+")
+            st.session_state["_sympathy_error"] = " | ".join(_diag)
+            return {}
+
+        # PASO 4: Parsear
+        headers = [h.strip() for h in rows[0]]
+        _diag.append(f"P4_OK: headers={headers[:5]}")
+        sympathy = {}
+        for row in rows[1:]:
+            if not row: continue
+            d = {headers[i]: row[i] if i < len(row) else ""
+                 for i in range(len(headers))}
+            tk = str(d.get("Ticker", "")).upper().strip()
+            if not tk: continue
+            sympathy[tk] = {
+                "lider":       str(d.get("Lider", "-")).upper().strip(),
+                "arrastradas": str(d.get("Arrastradas", "-")).strip(),
+                "sector":      str(d.get("Sector", "-")).strip(),
+                "correlacion": str(d.get("Correlacion", "-")).strip(),
+                "tipo":        str(d.get("Tipo_Relacion", "-")).strip(),
+                "notas":       str(d.get("Notas", "")).strip(),
+            }
+        _diag.append(f"P4_OK: {len(sympathy)} tickers parseados")
+        st.session_state["_sympathy_error"] = ""
+        st.session_state["_sympathy_diag"] = " | ".join(_diag)
+        return sympathy
+
+    except Exception as _e_symp:
+        _diag.append(f"EXCEPTION: {str(_e_symp)[:150]}")
+        try:
+            st.session_state["_sympathy_error"] = " | ".join(_diag)
+        except Exception:
+            pass
+        return {}
+
+
+def get_sympathy_v18(ticker: str) -> dict:
+    """
+    v18: Obtiene relaciones de arrastre desde Google Sheet primero,
+    luego fallback al RAW hardcodeado.
+    """
+    _default = {"lider": "-", "arrastradas": "-", "sector": "-",
+                "correlacion": "-", "tipo": "-", "notas": ""}
+    # Intentar desde Sheet primero
+    try:
+        _sheet_symp = leer_sympathy_sheets()
+        if _sheet_symp and ticker.upper() in _sheet_symp:
+            return _sheet_symp[ticker.upper()]
+    except Exception:
+        pass
+    # Fallback al RAW
+    _raw_symp = _SYMPATHY_LOOKUP.get(ticker.upper(), {})
+    if _raw_symp:
+        return {
+            "lider":        _raw_symp.get("lider", "-"),
+            "arrastradas":  _raw_symp.get("arrastradas", "-"),
+            "sector":       _raw_symp.get("area", "-"),
+            "correlacion":  "-",
+            "tipo":         "peer",
+            "notas":        "",
+        }
+    return _default
+
+
+def get_lider_status(lider_ticker: str) -> dict:
+    """
+    v18: Obtiene el estado actual del ticker líder para evaluar si el tren sigue activo.
+    Retorna precio, RSI, EMA20>EMA50, tendencia.
+    """
+    if not lider_ticker or lider_ticker in ("-", "", "nan"):
+        return {"activo": False, "precio": 0, "rsi": 0, "tendencia": "-"}
+    try:
+        import yfinance as _yf_lid
+        import pandas as _pd_lid
+        import numpy as _np_lid
+        hist = _yf_lid.Ticker(lider_ticker).history(period="3mo")
+        if hist.empty or len(hist) < 20:
+            return {"activo": False, "precio": 0, "rsi": 0, "tendencia": "-"}
+        close = hist["Close"].values
+        s = _pd_lid.Series(close)
+        delta = s.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi   = round(float(100-100/(1+gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
+        ema20 = float(s.ewm(span=20).mean().iloc[-1])
+        ema50 = float(s.ewm(span=50).mean().iloc[-1])
+        precio = round(float(close[-1]), 2)
+        mom3  = round((close[-1]/close[-4]-1)*100, 1) if len(close)>=4 else 0
+        tendencia_ok = ema20 > ema50 and rsi > 50
+        return {
+            "activo":    tendencia_ok,
+            "precio":    precio,
+            "rsi":       rsi,
+            "ema20":     round(ema20, 2),
+            "ema50":     round(ema50, 2),
+            "ema_ok":    ema20 > ema50,
+            "mom3":      mom3,
+            "tendencia": "✅ Alcista" if tendencia_ok else "⚠️ Debilitando",
+        }
+    except Exception:
+        return {"activo": False, "precio": 0, "rsi": 0, "tendencia": "Sin datos"}
+
+
+def render_sympathy_panel(ticker: str, pc: float, pa: float,
+                          pnl_pct: float,
+                          G: str, A: str, R: str,
+                          TXT_MUT: str, BOR: str) -> str:
+    """
+    v18: Renderiza el panel de Sympathy Play en la card de posición.
+    Muestra estado del líder y recomendación basada en su tendencia.
+    """
+    symp = get_sympathy_v18(ticker)
+    lider = symp["lider"]
+    if lider in ("-", "", "nan"):
+        return ""  # No es sympathy play
+
+    lider_st = get_lider_status(lider)
+    lider_color = "#16A34A" if lider_st["activo"] else "#D97706"
+    rsi_l  = lider_st.get("rsi", 0)
+    mom_l  = lider_st.get("mom3", 0)
+    ema_ok = lider_st.get("ema_ok", False)
+
+    # Recomendación basada en estado del líder
+    if lider_st["activo"] and rsi_l >= 50:
+        rec_color = "#16A34A"
+        rec_text  = f"MANTENER — {lider} sigue alcista. Esperar recuperación de {ticker}."
+        rec_icon  = "✅"
+    elif rsi_l >= 45 and ema_ok:
+        rec_color = "#D97706"
+        rec_text  = f"VIGILAR — {lider} desacelerando. Monitorear 1-2 días más."
+        rec_icon  = "⚠️"
+    else:
+        rec_color = "#DC2626"
+        rec_text  = f"SALIR — {lider} perdió tendencia. El tren de arrastre se interrumpió."
+        rec_icon  = "🛑"
+
+    corr = symp.get("correlacion", "-")
+    tipo = symp.get("tipo", "-")
+
+    _corr_html = f'<span style="font-size:10px;color:#6B7280">Corr {corr}</span>' if corr != "-" else ""
+    return (
+        f'<div style="background:#F5F3FF;border:1px solid #C4B5FD;'
+        f'border-radius:8px;padding:8px 12px;margin-top:6px">'
+        f'<div style="font-size:10px;font-weight:700;color:#7C3AED;margin-bottom:4px">'
+        f'🔗 SYMPATHY PLAY — depende de {lider}</div>'
+        f'<div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">'
+        f'<span style="font-size:11px"><strong style="color:{lider_color}">{lider}</strong>'
+        f' ${lider_st["precio"]:.2f} · RSI {rsi_l} · {lider_st["tendencia"]}</span>'
+        f'<span style="font-size:10px;color:#6B7280">EMA20{">"if ema_ok else "<"}EMA50'
+        f' · Mom3d {mom_l:+.1f}%</span>'
+        f'{_corr_html}'
+        f'</div>'
+        f'<div style="margin-top:4px;font-size:11px;font-weight:700;color:{rec_color}">'
+        f'{rec_icon} {rec_text}</div>'
+        f'</div>'
+    )
+
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_lider_estado(lider_tk: str) -> dict:
+    """
+    v18: Obtiene estado actual del ticker líder (ej: NBIS)
+    para evaluar si el tren de arrastre sigue activo.
+    """
+    if not lider_tk or lider_tk in ("-","","nan"):
+        return {}
+    try:
+        import yfinance as _yf_lid
+        import pandas as _pd_lid
+        hist = _yf_lid.Ticker(lider_tk).history(period="1mo")
+        if hist.empty:
+            return {}
+        close = hist["Close"].values
+        vol   = hist["Volume"].values
+        s = _pd_lid.Series(close)
+        delta = s.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi   = round(float(100-100/(1+gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
+        ema20 = float(s.ewm(span=20).mean().iloc[-1])
+        ema50 = float(s.ewm(span=50).mean().iloc[-1]) if len(close) >= 50 else ema20
+        precio = float(close[-1])
+        pico   = float(close.max())
+        dd     = round((precio-pico)/pico*100, 1)
+        mom3   = round((close[-1]/close[-4]-1)*100, 2) if len(close) >= 4 else 0
+        avg_v  = float(__import__("numpy").mean(vol[-20:]))
+        vol_r  = int(float(vol[-1])/avg_v*100) if avg_v > 0 else 100
+        ema12  = float(s.ewm(span=12).mean().iloc[-1])
+        ema26  = float(s.ewm(span=26).mean().iloc[-1]) if len(close) >= 26 else ema12
+        macd   = round(ema12-ema26, 2)
+
+        # Estado del tren
+        tren_activo = (
+            precio >= ema20 * 0.97 and  # precio cerca o sobre EMA20
+            rsi >= 48 and               # RSI sin debilidad
+            mom3 > -3 and               # sin momentum negativo fuerte
+            macd > -0.5                  # MACD no colapsado
+        )
+        return {
+            "precio":      round(precio, 2),
+            "rsi":         rsi,
+            "ema20":       round(ema20, 2),
+            "ema50":       round(ema50, 2),
+            "dd":          dd,
+            "mom3":        mom3,
+            "vol_ratio":   vol_r,
+            "macd":        macd,
+            "tren_activo": tren_activo,
+            "sobre_ema20": precio >= ema20,
+        }
+    except Exception:
+        return {}
+
 
 def render_boton_registro(
     ticker: str, fase: str, precio: float, score: int,
@@ -5823,6 +6333,17 @@ def fetch_noticias_ticker(ticker: str) -> list:
                 if not titulo or not link:
                     continue
 
+                # v18: filtrar noticias genéricas de yfinance (eventos corporativos)
+                _titulo_lower = titulo.lower()
+                _es_generico = any(x in _titulo_lower for x in [
+                    "equity investor", "common stock", "class a shares",
+                    "form 8-k", "form 10-", "proxy statement", "sec filing",
+                    "annual report", "quarterly report", "ex-dividend",
+                    "stock split", "dividend payment", "rights offering",
+                ])
+                if _es_generico:
+                    continue
+
                 # Calcular antigüedad
                 fecha_dt = datetime.datetime.fromtimestamp(ts) if ts else datetime.datetime.now()
                 dias_atras = (datetime.datetime.now() - fecha_dt).days
@@ -5832,6 +6353,10 @@ def fetch_noticias_ticker(ticker: str) -> list:
                 sentimiento, impacto_base, keywords = analizar_sentimiento_noticia(titulo)
                 impacto = impacto_base // 2 if dias_atras > 14 else impacto_base
                 tipo = clasificar_tipo_noticia(titulo)
+
+                # Filtrar títulos muy cortos (< 20 chars = no es noticia real)
+                if len(titulo.strip()) < 20:
+                    continue
 
                 noticias.append({
                     "titulo":      titulo,
@@ -6232,6 +6757,10 @@ with st.sidebar:
 
     # ── Parámetros del modelo v18 (semana 27abr-08may) ─────────
     with st.expander("📊 Umbrales activos del modelo", expanded=False):
+        # Debug Prob_NBIS si hay error
+        _pd = st.session_state.get("_prob_debug","")
+        if _pd:
+            st.markdown(f"⚠️ **Debug Prob_NBIS:** `{_pd}`")
         st.markdown("""
 **Basados en análisis semana 27 Abr — 08 May:**
 
@@ -6555,19 +7084,37 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
             _rr_op    = str(_rr.get("Opinion_Trader","-"))
             _rr_area  = str(_rr.get("Area","-"))
 
-            _bc1, _bc2 = st.columns(2)
-            with _bc1:
-                if st.button(f"🦅 Agregar a Posiciones Greko",
-                             key=f"btn_greko_{tab_key}_{_rr_tk}",
-                             use_container_width=True, type="primary",
-                             help="Paper trading — registra señal para validar el modelo"):
-                    _ok_g, _msg_g = escribir_greko_sheets(
-                        ticker=_rr_tk, precio_compra=_rr_precio,
-                        fase=_rr_fase, score=_rr_score, prob_nbis=_rr_prob,
-                        area=_rr_area, tipo="Accion", fuente=tab_key,
-                        arrastradas=_rr_arr, opinion=_rr_op,
-                        cantidad=_reg_cant, notas=_reg_nota,
-                    )
+            # v18: verificar si ya está en Watchlist o Greko (evitar duplicados)
+            _wl_df_ck  = st.session_state.get("wl_res_df")
+            _greko_df_ck = st.session_state.get("_greko_rows_cache", [])
+            _ya_en_wl    = (_wl_df_ck is not None and not _wl_df_ck.empty and
+                            _rr_tk in _wl_df_ck["Ticker"].str.upper().values)
+            _ya_en_greko = any(str(r.get("Ticker","")).upper() == _rr_tk
+                               for r in _greko_df_ck)
+
+            if _ya_en_wl or _ya_en_greko:
+                _donde = "Watchlist" if _ya_en_wl else "Posiciones Greko"
+                st.markdown(
+                    f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+                    f'border-radius:8px;padding:6px 12px;font-size:11px;'
+                    f'color:#16A34A;font-weight:600">'
+                    f'✅ {_rr_tk} ya está en {_donde} — '
+                    f'no es necesario agregar de nuevo</div>',
+                    unsafe_allow_html=True)
+            else:
+                _bc1, _bc2 = st.columns(2)
+                with _bc1:
+                    if st.button(f"🦅 Agregar a Posiciones Greko",
+                                 key=f"btn_greko_{tab_key}_{_rr_tk}",
+                                 use_container_width=True, type="primary",
+                                 help="Paper trading — registra señal para validar el modelo"):
+                        _ok_g, _msg_g = escribir_greko_sheets(
+                            ticker=_rr_tk, precio_compra=_rr_precio,
+                            fase=_rr_fase, score=_rr_score, prob_nbis=_rr_prob,
+                            area=_rr_area, tipo="Accion", fuente=tab_key,
+                            arrastradas=_rr_arr, opinion=_rr_op,
+                            cantidad=_reg_cant, notas=_reg_nota,
+                        )
                     if _ok_g: st.success(_msg_g)
                     else:     st.error(_msg_g)
             with _bc2:
@@ -6673,26 +7220,19 @@ st.markdown(
     f'</div>',unsafe_allow_html=True)
 st.markdown(f'<div style="font-size:11px;color:{TXT_MUT};margin-bottom:10px">Modelo Rebote Técnico  - Patrón NBIS  - 3 Momentos  - Pre/Post Market  - {"RSI / MACD / EMA50 / Precio actualizados en tiempo real  - cache 20min" if _n_live>0 else "pip install yfinance para indicadores en tiempo real"}</div>',unsafe_allow_html=True)
 
-# ── Banner Oil v16 - presión sectorial ────────────────────────
+# ── Banner Oil v18 - presión sectorial ────────────────────────
 if oil.get("_ok") and oil.get("presion_sectorial"):
-    # v16 fix: calcular dinámicamente qué tickers están bajo presión
-    # en lugar de mostrar ANF/APTV/AOS hardcodeados
-    _sectores_presion = {"Consumo","Industrial","Retail","Autopartes"}
-    _tickers_presion = [
-        r[0] for r in RAW
-        if len(r) > 2 and str(r[2]) in _sectores_presion
-    ][:8]  # máximo 8 para no saturar
-    _tickers_str = "  -  ".join(_tickers_presion) if _tickers_presion else "sectores Consumo e Industrial"
-
+    # v18: mostrar solo el dato de precio + contexto, sin degradar tickers
+    # Los tickers hardcodeados (TSLA, BA, NKE) no son relevantes para Oil
     st.markdown(
-        f'<div style="background:#FEF2F2;border:1px solid #FCA5A5;border-radius:10px;'
+        f'<div style="background:#FEF9C3;border:1px solid #FCD34D;border-radius:10px;'
         f'padding:8px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px">'
         f'<span style="font-size:18px">🛢️</span>'
-        f'<div><span style="font-size:12px;font-weight:700;color:#DC2626">'
-        f'WTI ${oil["precio"]:.1f} - Presión en Consumo e Industrial</span><br>'
-        f'<span style="font-size:11px;color:#7F1D1D">'
-        f'Scores degradados automáticamente en: {_tickers_str}. '
-        f'Señales de estos sectores requieren mayor confirmación.</span></div>'
+        f'<div><span style="font-size:12px;font-weight:700;color:#92400E">'
+        f'WTI ${oil["precio"]:.1f} — Presión en sectores Oil/Energy</span><br>'
+        f'<span style="font-size:11px;color:#78350F">'
+        f'Evitar entradas en Oil, Gas y Energy mientras el precio siga débil. '
+        f'Sectores Tech, AI y Biotech no están afectados.</span></div>'
         f'</div>', unsafe_allow_html=True)
 
 # ── Estado del mercado (abierto/cerrado/pre/post) ─────────────
@@ -7115,23 +7655,21 @@ with tab1:
 # ══ TAB 4 - SWING ACTIVO ═════════════════════════════════════
 with tab2:
     st.markdown(
-        f'<div class="sec-header" style="background:{C_BG};border-color:{C_BOR}">'+
-        f'<span style="font-size:20px">⚡</span>'+
-        f'<div><span style="font-size:16px;font-weight:700;color:{C}">Swing Activo</span>'+
-        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'+
-        f'Rebote confirmado 2-3 días  - RSI girando ↑  - Salida obligatoria día 5-10</span></div>'+
-        f'</div>', unsafe_allow_html=True)
-
+        f'<div class="sec-header" style="background:{C_BG};border-color:{C_BOR}">'
+        f'<span style="font-size:20px">⚡</span>'
+        f'<div><span style="font-size:16px;font-weight:700;color:{C}">Swing Activo — M2 Rebote Técnico</span>'
+        f'<div style="font-size:11px;color:{TXT_MUT};margin-top:3px">'
+        f'DD ≤ -20% · RSI 48-65 · Score 40-55 · Prob_NBIS ≥ 25% · Ventana óptima 7-9 días</div>'
+        f'</div></div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="info-box">'+
-        f'<strong>3 fases del Swing - alineadas con el patrón NBIS:</strong><br>'+
-        f'<span style="color:#D97706">👀 TEMPRANA (M1->M2)</span> - Solo 2 días subiendo. '+
-        f'Puede revertir. <strong>No entrar</strong> - agregar a watchlist y esperar.<br>'+
-        f'<span style="color:#0891B2">⚡ ENTRADA VÁLIDA (M2)</span> - Rebote confirmado pero sin plena convicción. '+
-        f'<strong>Entrar 50%</strong> del tamaño. Si mañana confirma volumen, completar.<br>'+
-        f'<span style="color:#16A34A">🔥 ENTRAR HOY (M3)</span> - 3+ días + volumen alto + momentum fuerte. '+
-        f'<strong>Entrar 100%</strong> del tamaño planificado.<br><br>'+
-        f'🛑 Stop duro -5%  - 🎯 Target 1 +8% (vender 60%)  - 🎯 Target 2 +12% (runner 40%)  - Salida obligatoria día 10'+
+        f'<div class="info-box">'
+        f'<strong>📊 Criterios v18 (datos semana 27abr-08may):</strong> '
+        f'<span style="color:{R}">DD ≤ -20%</span> (WR 65% vs 33% con DD leve) · '
+        f'<span style="color:{C}">RSI 48-65</span> (WR 91% en esa zona) · '
+        f'<span style="color:{G}">Score 40-55</span> (WR 70% vs 25% si Score>55) · '
+        f'<span style="color:#7C3AED">Prob_NBIS ≥ 25%</span> (WR 33% si Prob<25%)<br>'
+        f'🏷️ Badge <strong style="color:{G}">✅ APTA</strong> = cumple los 4 criterios (WR histórico 80%+) · '
+        f'🛑 Stop -7% · 🎯 T1 +8% vender 55% · 🎯 T2 +15% runner · ⚠️ Alerta día 7'
         f'</div>',
         unsafe_allow_html=True)
 
@@ -7217,49 +7755,40 @@ with tab2:
         # OK o ruido normal: sin filtro
         sw_result_display = sw_result
 
-    # ── v18 MEJORAS (semana 27abr-08may): aplicar filtros en display ──
-    # Fundamentación estadística:
-    #   DD -5% a -20%: WR 33-40%  → correcciones leves = ruido
-    #   DD -20% o más: WR 65-67%  → corrección real con soporte
-    #   RSI < 48: WR bajo, rebote no confirmado
-    #   RSI 48-65: WR 91%  ← zona óptima
-    #   Score > 55: WR 25% (señal tardía, precio ya se movió)
-    #   Score 40-55: WR 70% ← zona óptima
+    # ── v18: Marcar señales que cumplen criterios óptimos (no filtrar) ──
+    # Los filtros DD -20%, RSI 48-65, Score 40-55 se muestran como badges
+    # pero NO eliminan señales — el trader decide basado en la info
     if sw_result_display is not None and not sw_result_display.empty:
-        n_antes = len(sw_result_display)
         _cols_sw = sw_result_display.columns.tolist()
-
-        # Filtro 1: DD mínimo -20%
-        if "DD_pico" in _cols_sw:
-            sw_result_display = sw_result_display[
-                pd.to_numeric(sw_result_display["DD_pico"], errors="coerce") <= -20
-            ]
-
-        # Filtro 2: RSI zona 48-65
-        if "RSI" in _cols_sw:
-            _rsi_sw = pd.to_numeric(sw_result_display["RSI"], errors="coerce")
-            sw_result_display = sw_result_display[
-                (_rsi_sw >= 48) & (_rsi_sw <= 65)
-            ]
-
-        # Filtro 3: Score 40-55
-        if "Score_Rebote" in _cols_sw:
-            _sc_sw = pd.to_numeric(sw_result_display["Score_Rebote"], errors="coerce")
-            sw_result_display = sw_result_display[
-                (_sc_sw >= 40) & (_sc_sw <= 55)
-            ]
-
-        n_despues = len(sw_result_display)
-        if n_antes != n_despues:
-            st.markdown(
-                f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
-                f'border-radius:8px;padding:6px 14px;margin-bottom:8px;font-size:11px">'
-                f'<strong style="color:#16A34A">🔬 Filtros v18 activos:</strong> '
-                f'{n_antes} señales → <strong>{n_despues} de calidad</strong> '
-                f'(DD≤-20% · RSI 48-65 · Score 40-55) — '
-                f'<span style="color:#6B7280">WR histórico con estos filtros: 80%+</span>'
-                f'</div>',
-                unsafe_allow_html=True)
+        # Calcular qué señales cumplen los 3 criterios óptimos
+        _dd_ok = pd.to_numeric(sw_result_display.get("DD_pico", pd.Series()), errors="coerce") <= -20
+        _rsi_ok = (pd.to_numeric(sw_result_display.get("RSI", pd.Series()), errors="coerce").between(48,65))
+        _sc_ok  = (pd.to_numeric(sw_result_display.get("Score_Rebote", pd.Series()), errors="coerce").between(40,55))
+        try:
+            _aptas = sw_result_display[_dd_ok & _rsi_ok & _sc_ok]
+            _n_aptas = len(_aptas)
+            _n_total = len(sw_result_display)
+            if _n_aptas > 0:
+                _tickers_aptos_sw = " · ".join(_aptas["Ticker"].tolist()[:8])
+                st.markdown(
+                    f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+                    f'border-radius:8px;padding:6px 14px;margin-bottom:8px;font-size:11px">'
+                    f'<strong style="color:#16A34A">✅ {_n_aptas} de {_n_total} cumplen criterios v18</strong> '
+                    f'(DD≤-20% · RSI 48-65 · Score 40-55) WR 80%+ → '
+                    f'<strong>{_tickers_aptos_sw}</strong>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f'<div style="background:#FFFBEB;border:1px solid #FCD34D;'
+                    f'border-radius:8px;padding:6px 14px;margin-bottom:8px;font-size:11px">'
+                    f'<strong style="color:#D97706">⚠️ Hoy ninguna cumple los 3 criterios óptimos</strong> '
+                    f'(DD≤-20% · RSI 48-65 · Score 40-55) — '
+                    f'Se muestran TODAS las señales del scanner para análisis.'
+                    f'</div>',
+                    unsafe_allow_html=True)
+        except Exception:
+            pass
 
     if sw_result is None:
         st.markdown(
@@ -7554,6 +8083,23 @@ with tab2:
         render_noticias_mini(sw_result["Ticker"].tolist(), "Noticias Swing Activo")
 # ══ TAB 1 - ENTRAR HOY ══════════════════════════════════════════
 with tab3:
+    st.markdown(
+        f'<div class="sec-header" style="background:{G_BG};border-color:{G_BOR}">'
+        f'<span style="font-size:20px">🔥</span>'
+        f'<div><span style="font-size:16px;font-weight:700;color:{G}">Entrar Hoy — M3 Confirmado</span>'
+        f'<div style="font-size:11px;color:{TXT_MUT};margin-top:3px">'
+        f'RSI 48-68 · DD ≤ -15% · Score 40-55 · Prob_NBIS ≥ 25% · Decisión ENTRAR o ANTICIPAR</div>'
+        f'</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="info-box" style="border-left:4px solid {G}">'
+        f'<strong>📊 Lógica Entrar Hoy:</strong> señales listas para ejecutar HOY. '
+        f'El rebote ya inició (RSI 48-68 subiendo) · corrección real (DD ≤ -15%) · '
+        f'score fresco (40-55, no tardío) · Prob ≥ 25% confirma absorción institucional.<br>'
+        f'<span style="color:{G}">✅ ENTRAR</span> = posición completa · '
+        f'<span style="color:{C}">⚡ ANTICIPAR</span> = 40% posición, completar si confirma mañana · '
+        f'🛑 Stop -7% · ⚠️ Si Prob_NBIS < 25% → baja a SEGUIR Fase 2'
+        f'</div>',
+        unsafe_allow_html=True)
     # ── v15: Banner de earnings próximos críticos (NBIS/NVDA/CRWD) ──
     import datetime as _dttB
     _today_b = _dttB.date.today()
@@ -7591,14 +8137,22 @@ with tab3:
         titulo="Entrar hoy",
         emoji="🔥",
         color=G, color_bg=G_BG, color_bor=G_BOR,
-        # v15 FIX: rsi_max 35->42 - alineado con get_decision M3 (RSI<=42)
-        # Antes: AMD con RSI=42 era M3 en Watchlist pero invisible en Entrar Hoy
-        # Ahora: ambos usan el mismo umbral -> consistencia total
-        desc="M3 confirmado  - RSI <= 42  - Catalizador activo  - Score >= 55",
-        rsi_max=42, dd_min=-8, score_min=55,
+        # v18 FIX: parámetros calibrados con datos semana 27abr-08may
+        # ANTES:  RSI<=42, DD>=-8, Score>=55 → WR 48%, avg +0.6%
+        # AHORA:  RSI 48-65, DD<=-20, Score 40-55 → WR 80%+, avg +5.7%
+        #
+        # El concepto de Tab3 cambia:
+        # ANTES: M3 = RSI muy bajo + score alto → "acción debilitada"
+        # AHORA: M3 = RSI zona de confirmación + DD real + momentum iniciando
+        #        La señal de "Entrar Hoy" requiere que el rebote YA COMENZÓ
+        #        no que la acción esté en el piso (eso es Tab1 Radar)
+        # v18: RSI máximo flexible + DD mínimo para filtrar ruido
+        # El badge ✅ APTA indica cuáles cumplen el combo óptimo
+        desc="M3 confirmado · DD≤-15% · Score ≥ 40 · Señales marcadas con criterios v18",
+        rsi_max=68, dd_min=-15, score_min=40,
         decisions=["ENTRAR","ANTICIPAR"],
-        prob_nbis_min=35,
-        default_sort="Prob_NBIS",
+        prob_nbis_min=25,
+        default_sort="Score",
     )
 
     # ── v18: Registro rápido de entrada en Sheets ───────────
@@ -7635,38 +8189,213 @@ with tab3:
 # ══ TAB 4 - SYMPATHY ═══════════════════════════════════════════
 # ══ TAB 5 - SYMPATHY ═════════════════════════════════════════════
 with tab4:
-    # ── v15: Banner de earnings próximos críticos (NBIS/NVDA/CRWD) ──
-    import datetime as _dttB
-    _today_b = _dttB.date.today()
-    _earn_criticos = []
-    for _key in ["scan_entrar","scan_swing","scan_detectadas"]:
-        _df_tmp = st.session_state.get(_key)
-        if _df_tmp is not None and not _df_tmp.empty and "Cat_Fecha" in _df_tmp.columns:
-            for _, _r in _df_tmp.iterrows():
-                _cf3 = str(_r.get("Cat_Fecha","-"))
-                if _cf3 in ("-","","nan","\u2014"): continue
-                try:
-                    _fc3 = _dttB.date.fromisoformat(_cf3[:10])
-                    _d3  = (_fc3 - _today_b).days
-                    if 1 <= _d3 <= 15:
-                        _earn_criticos.append((_r["Ticker"], _d3, _cf3[:10]))
-                    elif _d3 == 0:
-                        _earn_criticos.append((_r["Ticker"], 0, _cf3[:10]))
-                except: pass
-    _earn_criticos = sorted(set(_earn_criticos), key=lambda x: x[1])[:5]
-    if _earn_criticos:
-        def _earn_badge_fn(tk, d):
-            if d == 0:   return f'<span style="font-weight:800;color:#7C3AED">\U0001f4e3 {tk} (HOY)</span>'
-            elif d <= 2: return f'<span style="font-weight:800;color:#DC2626">\U0001f6ab {tk} ({d}d)</span>'
-            elif d <= 6: return f'<span style="font-weight:800;color:#D97706">\u26a0\ufe0f {tk} ({d}d)</span>'
-            else:        return f'<span style="font-weight:800;color:#16A34A">\U0001f3af {tk} ({d}d)</span>'
-        _earn_html = " &nbsp;\u00b7&nbsp; ".join([_earn_badge_fn(tk,d) for tk,d,_ in _earn_criticos])
+    st.markdown(
+        f'<div class="sec-header" style="background:#F5F3FF;border-color:#C4B5FD">'
+        f'<span style="font-size:20px">🔗</span>'
+        f'<div><span style="font-size:16px;font-weight:700;color:#7C3AED">Trenes de Arrastre</span>'
+        f'<div style="font-size:11px;color:#6B7280;margin-top:2px">'
+        f'Cuando el líder sube → ¿debo entrar a las arrastradas?</div>'
+        f'</div></div>', unsafe_allow_html=True)
+
+    _symp_data_t4 = leer_sympathy_sheets()
+
+    if not _symp_data_t4:
+        _symp_err  = st.session_state.get("_sympathy_error", "Sin detalle")
+        _symp_id   = _get_sheet_id_from_secrets("sympathy_id")
         st.markdown(
-            f'<div style="background:#F8FAFF;border:1px solid #BFDBFE;border-radius:10px;'
-            f'padding:10px 16px;margin-bottom:10px">'
-            f'<span style="font-size:11px;font-weight:700;color:#1D4ED8">\U0001f4c5 Earnings pr\u00f3ximos en se\u00f1ales activas: </span>'
-            f'{_earn_html}'
-            f'</div>', unsafe_allow_html=True)
+            f'<div style="background:#FEF2F2;border:2px solid #FCA5A5;'
+            f'border-radius:10px;padding:14px 18px">'
+            f'<div style="font-size:13px;font-weight:700;color:#DC2626;margin-bottom:8px">'
+            f'⚠️ Sin datos en GrekoTrader_Sympathy</div>'
+            f'<code style="font-size:10px">'
+            f'Sheet ID: {"✅ " + _symp_id[:24] if _symp_id else "❌ No encontrado"}<br>'
+            f'Diagnóstico: {_symp_err.replace(" | ", chr(10))}'
+            f'</code></div>', unsafe_allow_html=True)
+    else:
+        # Agrupar por líder
+        _por_lider_t4 = {}
+        for _t4k, _t4v in _symp_data_t4.items():
+            _t4l = _t4v["lider"]
+            if _t4l in ("-","","nan"): continue
+            _por_lider_t4.setdefault(_t4l, []).append((_t4k, _t4v))
+
+        # Estado líderes y arrastradas en tiempo real
+        with st.spinner("⚡ Calculando señales de entrada..."):
+            _estados_t4    = {_l: get_lider_estado(_l) for _l in _por_lider_t4}
+            _estados_arr_t4 = {}
+            for _arrs in _por_lider_t4.values():
+                for _atk, _ in _arrs:
+                    if _atk not in _estados_arr_t4:
+                        _estados_arr_t4[_atk] = get_lider_estado(_atk)
+
+        # ── Función para obtener fase actual desde Watchlist/Swing ──
+        def _get_fase_watchlist(ticker: str) -> tuple:
+            """
+            Busca el ticker en los datos de Watchlist, Swing y Entrar Hoy.
+            Retorna (fase, decision, apto) desde los datos más recientes.
+            """
+            # Buscar en Watchlist primero
+            _wl_df = st.session_state.get("wl_res_df")
+            if _wl_df is not None and not _wl_df.empty:
+                _row = _wl_df[_wl_df["Ticker"].str.upper() == ticker.upper()]
+                if not _row.empty:
+                    _r = _row.iloc[0]
+                    return (
+                        str(_r.get("Fase", "-")),
+                        str(_r.get("Decision", "-")),
+                        bool(_r.get("_apto_entrada", False))
+                    )
+            # Buscar en Swing Activo
+            _sw_df = st.session_state.get("scan_swing")
+            if _sw_df is not None and not _sw_df.empty:
+                _row = _sw_df[_sw_df["Ticker"].str.upper() == ticker.upper()]
+                if not _row.empty:
+                    _r = _row.iloc[0]
+                    return (str(_r.get("Etapa_v12", "-")), "SWING", True)
+            # Buscar en Entrar Hoy
+            _et_df = st.session_state.get("scan_entrar")
+            if _et_df is not None and not _et_df.empty:
+                _row = _et_df[_et_df["Ticker"].str.upper() == ticker.upper()]
+                if not _row.empty:
+                    return ("M3", "ENTRAR HOY", True)
+            return ("-", "-", False)
+
+        # ── Función de decisión por arrastrada ────────────
+        def _decision_arrastrada(arr_estado, lider_activo):
+            """Retorna (emoji, label, color, descripcion) para la arrastrada."""
+            rsi  = arr_estado.get("rsi", 0)
+            mom3 = arr_estado.get("mom3", 0)
+            dd   = arr_estado.get("dd", 0)
+            ema_ok = arr_estado.get("sobre_ema20", False)
+
+            if not lider_activo:
+                return "🚫", "NO ENTRAR", "#DC2626", "Líder débil — esperar que el tren se reactive"
+
+            if not arr_estado:
+                return "❓", "SIN DATOS", "#9CA3AF", "Sin datos de mercado"
+
+            # Arrastrada ya subió mucho — tarde
+            if rsi > 68:
+                return "⏰", "TARDE", "#D97706", f"RSI {rsi:.0f} — llegaste tarde, esperar corrección"
+
+            # Zona ideal de entrada
+            if 48 <= rsi <= 65 and dd <= -5 and lider_activo:
+                if mom3 > 0:
+                    return "✅", "ENTRAR", "#16A34A", f"RSI {rsi:.0f} · Mom {mom3:+.1f}% · Líder activo → entrada válida"
+                else:
+                    return "👀", "VIGILAR", "#2563EB", f"RSI {rsi:.0f} pero sin momentum aún → esperar vela verde"
+
+            # RSI bajo — corrección real, posible oportunidad si líder sube
+            if rsi < 48 and lider_activo and dd <= -15:
+                return "⚡", "OPORTUNIDAD", "#7C3AED", f"RSI {rsi:.0f} · DD {dd:.0f}% · Si líder confirma → entrada especulativa"
+
+            # RSI bajo sin DD suficiente
+            if rsi < 48:
+                return "⏳", "ESPERAR", "#D97706", f"RSI {rsi:.0f} — aún débil, no ha absorbido la corrección"
+
+            return "👀", "VIGILAR", "#2563EB", f"RSI {rsi:.0f} · Mom {mom3:+.1f}% — monitorear"
+
+        # ── Cards por tren ─────────────────────────────────
+        for _t4lider, _t4arrs in sorted(_por_lider_t4.items()):
+            _le4   = _estados_t4.get(_t4lider, {})
+            _ok4   = _le4.get("tren_activo", False)
+            _c4    = "#16A34A" if _ok4 else "#DC2626"
+            _bg4   = "#F0FDF4" if _ok4 else "#FEF2F2"
+            _lbl4  = "🟢 TREN ACTIVO — buscar entradas en arrastradas" if _ok4 else "🔴 TREN DÉBIL — no entrar a arrastradas"
+            _l_rsi = _le4.get("rsi", 0)
+            _l_mom = _le4.get("mom3", 0)
+            _l_pr  = _le4.get("precio", 0)
+
+            # Header del tren
+            st.markdown(
+                f'<div style="background:{_bg4};border:2px solid {_c4}30;'
+                f'border-radius:12px;padding:14px 18px;margin-bottom:14px">',
+                unsafe_allow_html=True)
+
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">'
+                f'<span style="font-size:18px;font-weight:900;color:{_c4}">{_t4lider}</span>'
+                f'<span style="background:{_c4};color:white;border-radius:6px;'
+                f'padding:3px 10px;font-size:11px;font-weight:700">{_lbl4}</span>'
+                f'</div>'
+                f'<div style="font-size:11px;color:#374151;margin-bottom:12px;'
+                f'background:white;border-radius:6px;padding:6px 12px;display:inline-block">'
+                f'Precio ${_l_pr:.2f} · RSI {_l_rsi:.0f} · Momentum {_l_mom:+.1f}% · '
+                f'EMA20 {"✅ respetada" if _le4.get("sobre_ema20") else "❌ rota"}'
+                f'</div>', unsafe_allow_html=True)
+
+            # Arrastradas con decisión clara
+            _cols_arrs = st.columns(min(len(_t4arrs), 3))
+            for _ci, (_atk4, _adata4) in enumerate(sorted(_t4arrs)):
+                _ae4 = _estados_arr_t4.get(_atk4, {})
+                _emoji4, _dec4, _dec_c4, _desc4 = _decision_arrastrada(_ae4, _ok4)
+                _a_rsi = _ae4.get("rsi", 0)
+                _a_pr  = _ae4.get("precio", 0)
+                _a_dd  = _ae4.get("dd", 0)
+                _a_mom = _ae4.get("mom3", 0)
+                _a_vol = _ae4.get("vol_ratio", 100)
+                _corr  = _adata4.get("correlacion","-")
+                _nota  = _adata4.get("notas","")[:40]
+
+                # Fase del Watchlist/Swing
+                _wl_fase, _wl_dec, _wl_apto = _get_fase_watchlist(_atk4)
+                _fase_colors = {
+                    "M3": ("#16A34A","#F0FDF4"),
+                    "M2": ("#D97706","#FFFBEB"),
+                    "M1": ("#6B7280","#F9FAFB"),
+                    "SWING": ("#2563EB","#EFF6FF"),
+                    "ENTRAR HOY": ("#16A34A","#F0FDF4"),
+                }
+                _fc, _fbg = _fase_colors.get(_wl_fase, ("#9CA3AF","#F3F4F6"))
+                _fase_badge = (
+                    f'<span style="background:{_fbg};color:{_fc};'
+                    f'border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700">'
+                    f'{"✅" if _wl_apto else "👁"} WL: {_wl_fase} · {_wl_dec}</span>'
+                    if _wl_fase != "-" else
+                    f'<span style="background:#F3F4F6;color:#9CA3AF;'
+                    f'border-radius:4px;padding:1px 6px;font-size:9px">'
+                    f'👁 No en Watchlist</span>'
+                )
+
+                with _cols_arrs[_ci % 3]:
+                    st.markdown(
+                        f'<div style="background:white;border:2px solid {_dec_c4}50;'
+                        f'border-radius:10px;padding:12px;margin-bottom:8px">'
+
+                        # Ticker + decisión sympathy
+                        f'<div style="display:flex;justify-content:space-between;margin-bottom:6px">'
+                        f'<span style="font-size:16px;font-weight:800;color:{_dec_c4}">{_atk4}</span>'
+                        f'<span style="background:{_dec_c4};color:white;border-radius:5px;'
+                        f'padding:2px 8px;font-size:11px;font-weight:700">{_emoji4} {_dec4}</span>'
+                        f'</div>'
+
+                        # Fase del Watchlist — perspectiva técnica propia
+                        f'<div style="margin-bottom:8px">{_fase_badge}</div>'
+
+                        # Precio y RSI
+                        f'<div style="font-size:13px;font-weight:700;margin-bottom:4px">'
+                        f'${_a_pr:.2f}'
+                        f'<span style="font-size:11px;font-weight:400;color:#6B7280;margin-left:8px">'
+                        f'RSI {_a_rsi:.0f}</span></div>'
+
+                        # DD y Momentum
+                        f'<div style="font-size:10px;color:#6B7280;margin-bottom:6px">'
+                        f'DD {_a_dd:.0f}% · Mom {_a_mom:+.1f}% · Vol {_a_vol}%</div>'
+
+                        # Descripción accionable — cruzando ambas perspectivas
+                        f'<div style="font-size:10px;color:{_dec_c4};font-weight:600;'
+                        f'border-top:1px solid {_dec_c4}20;padding-top:6px">'
+                        f'{_desc4}</div>'
+
+                        + (f'<div style="font-size:9px;color:#9CA3AF;margin-top:4px">'
+                           f'Correlación: {_corr}</div>' if _corr not in ("-","") else "")
+                        + (f'<div style="font-size:9px;color:#9CA3AF">{_nota}</div>' if _nota else "")
+                        # Noticia inline
+                        + render_noticia_inline(_atk4, G, R, A, TXT_MUT, BOR)
+                        + f'</div>', unsafe_allow_html=True)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
 with tab5:
     st.markdown(
         f'<div class="sec-header" style="background:{B_BG};border-color:{B_BOR}">'
@@ -7715,34 +8444,89 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
             wl_template.to_csv(index=False, sep=";", decimal=","),
             "watchlist_template.csv","text/csv",key="dl_wl_template")
 
-    # ── Upload ─────────────────────────────────────────────────
-    wl_file = st.file_uploader(
-        "📂 Subir Watchlist CSV",
-        type=["csv"],
-        help="Solo el Ticker es obligatorio",
-        key="wl_uploader")
+    st.markdown(
+        f'<div class="info-box">'
+        f'<strong>📊 Cómo leer el Watchlist:</strong> '
+        f'<span style="color:{G}">✅ APTA</span> = cumple DD≤-20% + RSI 48-65 + Score 40-55 + Prob≥25% → entrada válida · '
+        f'<span style="color:{TXT_MUT}">👁 RADAR</span> = en observación, aún no cumple criterios.<br>'
+        f'<strong>Fases:</strong> M1 = solo radar · M2 = fondo formando · M3 = listo para entrar · '
+        f'ANTICIPAR = set-up casi listo (Prob ≥ 25% requerida)'
+        f'</div>', unsafe_allow_html=True)
+
+    # ── v18: Cargar Watchlist desde Google Sheets (primario) ───
+    _wl_sheets = leer_watchlist_sheets()
+    _wl_sheets_ok = _wl_sheets is not None and not _wl_sheets.empty
+
+    if _wl_sheets_ok:
+        _wl_col_ok1, _wl_col_ok2 = st.columns([4,1])
+        with _wl_col_ok1:
+            st.markdown(
+                f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+                f'border-radius:8px;padding:7px 14px;margin-bottom:8px;font-size:11px">'
+                f'✅ <strong style="color:#16A34A">GrekoTrader_Watchlist conectado</strong> — '
+                f'{len(_wl_sheets)} acciones · se actualiza automáticamente'
+                f'</div>', unsafe_allow_html=True)
+        with _wl_col_ok2:
+            if st.button("🔄 Recargar", key="btn_reload_wl", help="Forzar recarga desde Sheets"):
+                leer_watchlist_sheets.clear()
+                st.rerun()
+    else:
+        _wl_err = st.session_state.get("_wl_sheets_error", "Sin detalle")
+        _wl_id  = _get_sheet_id_from_secrets("watchlist_id")
+        st.markdown(
+            f'<div style="background:#FEF2F2;border:2px solid #FCA5A5;'
+            f'border-radius:10px;padding:12px 16px;margin-bottom:8px">'
+            f'<div style="font-size:12px;font-weight:700;color:#DC2626;margin-bottom:6px">'
+            f'⚠️ GrekoTrader_Watchlist no conectado</div>'
+            f'<div style="font-size:10px;color:#374151;line-height:1.8">'
+            f'<strong>Sheet ID:</strong> {"✅ " + _wl_id[:20] + "..." if _wl_id else "❌ watchlist_id no encontrado en Secrets"}<br>'
+            f'<strong>Diagnóstico:</strong> <code>{_wl_err}</code>'
+            f'</div>'
+            f'</div>',
+            unsafe_allow_html=True)
+
+    # ── Fallback: CSV upload ────────────────────────────────────
+    # Solo mostrar CSV upload si Sheets NO está conectado
+    if not _wl_sheets_ok:
+        with st.expander("📂 Subir Watchlist CSV", expanded=True):
+            st.download_button(
+                "⬇️ Descargar plantilla Watchlist CSV",
+                pd.DataFrame({
+                    "Ticker":["NBIS","IONQ","MRNA"],
+                    "Nombre":["NeuroBase AI","IonQ Inc","Moderna"],
+                    "Area":["AI Infra","Quantum","Biotech"],
+                    "Nota":["Líder AI infra","Quantum computing","Vacunas ARN"],
+                }).to_csv(index=False, sep=";", decimal=","),
+                "watchlist_template.csv","text/csv",key="dl_wl_template_csv")
+            wl_file = st.file_uploader(
+                "📂 Subir Watchlist CSV",
+                type=["csv"],
+                help="Solo el Ticker es obligatorio",
+                key="wl_uploader")
+    else:
+        wl_file = None
 
     wl_df = None
 
-    if wl_file:
+    # Prioridad: 1) Google Sheets, 2) CSV subido, 3) Ejemplos
+    if _wl_sheets_ok:
+        wl_df = _wl_sheets.copy()
+    elif wl_file:
         try:
             wl_df = pd.read_csv(wl_file)
-            # Limpiar tickers - quitar $ y espacios
-            if "Ticker" in wl_df.columns:
-                wl_df["Ticker"] = wl_df["Ticker"].str.upper().str.strip().str.replace("$","")
             wl_df.columns = [c.strip() for c in wl_df.columns]
             if "Ticker" not in wl_df.columns:
                 st.error("❌ El CSV debe tener al menos la columna 'Ticker'")
                 wl_df = None
             else:
-                wl_df["Ticker"] = wl_df["Ticker"].str.upper().str.strip()
-                st.success(f"✅ Watchlist cargada - {len(wl_df)} acciones para analizar")
+                wl_df["Ticker"] = wl_df["Ticker"].str.upper().str.strip().str.replace("$","")
+                st.success(f"✅ CSV cargado — {len(wl_df)} acciones")
         except Exception as e:
             st.error(f"❌ Error: {e}"); wl_df = None
     else:
         st.markdown(
-            f'<div class="info-box">💡 No hay Watchlist cargada. '
-            f'Mostrando ejemplos. Sube tu CSV para analizar tus propias acciones.</div>',
+            f'<div class="info-box">💡 Conecta GrekoTrader_Watchlist en Sheets para carga automática. '
+            f'Mostrando ejemplos mientras tanto.</div>',
             unsafe_allow_html=True)
         wl_df = pd.DataFrame({
             "Ticker": ["TAN","CROX","CNC","MSTR","SOFI"],
@@ -7778,6 +8562,49 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
             wl_results.append({**r, "Nota": nota, "_source": source})
 
         wl_res_df = pd.DataFrame(wl_results)
+        st.session_state["wl_res_df"] = wl_res_df.copy()
+
+        # v18: forzar tipos numéricos preservando valores originales cuando falla
+        for _num_col in ["Score","RSI","Volumen","EMA50","MACD","DD_pico","Sim_NBIS"]:
+            if _num_col in wl_res_df.columns:
+                wl_res_df[_num_col] = pd.to_numeric(wl_res_df[_num_col], errors="coerce").fillna(0)
+
+        # Prob_NBIS: conversión especial — NO usar fillna(0) para no perder valores reales
+        if "Prob_NBIS" in wl_res_df.columns:
+            _prob_original = wl_res_df["Prob_NBIS"].copy()
+            _prob_numeric  = pd.to_numeric(wl_res_df["Prob_NBIS"], errors="coerce")
+            # Solo reemplazar donde la conversión funcionó (no NaN)
+            _mask_ok = _prob_numeric.notna()
+            wl_res_df.loc[_mask_ok, "Prob_NBIS"] = _prob_numeric[_mask_ok]
+            # Para los que fallaron (NaN), calcular directamente desde Score y RSI
+            _mask_fail = ~_mask_ok
+            if _mask_fail.any():
+                _sc_f = pd.to_numeric(wl_res_df.loc[_mask_fail, "Score"], errors="coerce").fillna(0)
+                _vol_f = pd.to_numeric(wl_res_df.loc[_mask_fail, "Volumen"], errors="coerce").fillna(100)
+                # prob_nbis simplificado: score*0.65 + min(vol/100*8,20) + 7
+                _prob_calc = (_sc_f * 0.65 + (_vol_f/100 * 8).clip(upper=20) + 7).round(1)
+                wl_res_df.loc[_mask_fail, "Prob_NBIS"] = _prob_calc
+            wl_res_df["Prob_NBIS"] = wl_res_df["Prob_NBIS"].astype(float).round(1)
+
+        # Filtrar tickers con _source='error' del display
+        if "_source" in wl_res_df.columns:
+            _wl_errors = wl_res_df[wl_res_df["_source"] == "error"]["Ticker"].tolist()
+            wl_res_df  = wl_res_df[wl_res_df["_source"] != "error"].copy()
+            if _wl_errors:
+                st.caption(f"⚠️ Sin datos: {', '.join(_wl_errors)} — tickers no soportados o delistados")
+
+        # DEBUG: tickers válidos con Prob_NBIS=0 (fuente no es error)
+        if not wl_res_df.empty and "Prob_NBIS" in wl_res_df.columns:
+            _prob_cero = wl_res_df[
+                (wl_res_df["Prob_NBIS"] == 0) &
+                (wl_res_df.get("_source", "ok") != "error")
+            ][["Ticker","Score","RSI","Volumen","Decision","_source"]].copy()
+            if not _prob_cero.empty:
+                st.markdown(
+                    f'<div style="background:#FEF9C3;border:1px solid #FCD34D;'
+                    f'border-radius:8px;padding:6px 12px;font-size:10px;margin-bottom:6px">'
+                    f'<strong>🔬 Debug Prob=0:</strong> {_prob_cero.to_dict("records")}'
+                    f'</div>', unsafe_allow_html=True)
 
         # ── v18: Filtros de calidad en Watchlist (semana 27abr-08may) ──
         # Solo para la vista "ENTRAR/ANTICIPAR" — no bloquear el radar completo
@@ -7998,7 +8825,62 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
             f'</table></div>',
             unsafe_allow_html=True)
 
-        # ── TREN DE ARRASTRE v16 en Watchlist ───────────────────────
+        # ── v18: Panel de contexto por ticker — noticias + comentario ──
+        # Se muestra para TODAS las acciones, expandible por ticker
+        st.markdown(
+            f'<div style="font-size:12px;font-weight:700;color:{TXT};margin:14px 0 8px">'
+            f'📰 Contexto por acción — noticias y comentario trader</div>',
+            unsafe_allow_html=True)
+
+        for _, _rwn in wl_res_df.iterrows():
+            _tkn      = _rwn["Ticker"]
+            _decn     = str(_rwn.get("Decision",""))
+            _fasen    = str(_rwn.get("Fase",""))
+            _rsin     = _rwn.get("RSI", 0)
+            _probn    = _rwn.get("Prob_NBIS", 0)
+            _notan    = str(_rwn.get("Nota",""))
+
+            # Color por decisión
+            _dc = G if _decn == "ENTRAR" else C if _decn == "ANTICIPAR" else TXT_MUT
+            _dbg = G_BG if _decn == "ENTRAR" else C_BG if _decn == "ANTICIPAR" else "transparent"
+            _dico = "🔥" if _decn == "ENTRAR" else "⚡" if _decn == "ANTICIPAR" else "👁"
+
+            # Noticia
+            _noticia_n = render_noticia_inline(_tkn, G, R, A, TXT_MUT, BOR)
+
+            # Earnings
+            _earn_n = ""
+            _cat_fn = str(_rwn.get("Cat_Fecha","-"))
+            if _cat_fn not in ("-","","nan"):
+                try:
+                    _dn = (datetime.date.fromisoformat(_cat_fn[:10]) - datetime.date.today()).days
+                    if 0 <= _dn <= 14:
+                        _earn_color = "#DC2626" if _dn <= 3 else "#D97706"
+                        _earn_n = (f'<span style="background:#FEF2F2;color:{_earn_color};'
+                                   f'border-radius:4px;padding:1px 7px;font-size:10px;'
+                                   f'font-weight:700;margin-left:6px">'
+                                   f'📅 Earnings {"HOY" if _dn==0 else f"en {_dn}d"}</span>')
+                except Exception:
+                    pass
+
+            # Solo renderizar si hay algo que mostrar (noticia o earnings)
+            if not _noticia_n and not _earn_n:
+                continue
+
+            with st.expander(
+                f"{_dico} {_tkn} — RSI {_rsin:.0f} · Prob {_probn:.0f}% · {_decn}",
+                expanded=(_decn in ["ENTRAR","ANTICIPAR"])
+            ):
+                # Noticia + earnings
+                if _earn_n:
+                    st.markdown(_earn_n, unsafe_allow_html=True)
+                if _noticia_n:
+                    st.markdown(_noticia_n, unsafe_allow_html=True)
+                if _notan and _notan not in ("-","","nan"):
+                    st.markdown(
+                        f'<div style="font-size:10px;color:{TXT_MUT};margin-top:4px">'
+                        f'📝 {_notan}</div>', unsafe_allow_html=True)
+
         _wl_con_tren = wl_res_df[
             wl_res_df["Arrastradas"].apply(lambda x: str(x) not in ("-","","nan"))
             | wl_res_df["Lider"].apply(lambda x: str(x) not in ("-","","nan"))
@@ -8059,13 +8941,66 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                 f'<div style="font-size:12px;font-weight:700;color:{G};margin-bottom:8px">'
                 f'💾 Registrar entrada en Google Sheets</div>',
                 unsafe_allow_html=True)
-            _tk_wl_reg = st.selectbox(
-                "Ticker a registrar",
-                ["— seleccionar —"] + list(wl_res_df["Ticker"].unique()),
-                key="sel_wl_reg"
-            )
+
+            # v18: solo mostrar tickers con ENTRAR o ANTICIPAR
+            _wl_candidatas = []
+            _wl_dec_map = {}
+            if "Decision" in wl_res_df.columns:
+                _wl_aptas = wl_res_df[wl_res_df["Decision"].isin(["ENTRAR","ANTICIPAR"])]
+                _wl_candidatas = _wl_aptas["Ticker"].tolist()
+                _wl_dec_map = _wl_aptas.set_index("Ticker")["Decision"].to_dict()
+
+            if not _wl_candidatas:
+                st.markdown(
+                    f'<div style="background:#FEF3C7;border:1px solid #FCD34D;'
+                    f'border-radius:8px;padding:8px 14px;font-size:11px;color:#92400E">'
+                    f'⏳ <strong>Sin señales ENTRAR o ANTICIPAR ahora.</strong> '
+                    f'Espera a que alguna acción alcance esa fase. '
+                    f'Solo se registran posiciones cuando el modelo tiene convicción.</div>',
+                    unsafe_allow_html=True)
+                _tk_wl_reg = "— seleccionar —"
+            else:
+                _wl_opciones_lbl = [f"{tk}  ({_wl_dec_map.get(tk,'')})" for tk in _wl_candidatas]
+                _sel_wl = st.selectbox(
+                    f"Ticker a registrar — {len(_wl_candidatas)} con señal activa",
+                    ["— seleccionar —"] + _wl_opciones_lbl,
+                    key="sel_wl_reg",
+                    help="Solo acciones con decisión ENTRAR o ANTICIPAR"
+                )
+                _tk_wl_reg = _sel_wl.split("  (")[0] if _sel_wl != "— seleccionar —" else "— seleccionar —"
+
             if _tk_wl_reg and _tk_wl_reg != "— seleccionar —":
                 _rw_wl = wl_res_df[wl_res_df["Ticker"]==_tk_wl_reg].iloc[0]
+
+                # v18: inputs adicionales para completar los campos del Sheet
+                _wl_col1, _wl_col2, _wl_col3 = st.columns(3)
+                with _wl_col1:
+                    _wl_cantidad = st.number_input(
+                        "Cantidad (acciones)", min_value=0.0, value=1.0,
+                        step=0.1, key=f"wl_cant_{_tk_wl_reg}")
+                with _wl_col2:
+                    _area_detectada = str(_rw_wl.get("Area","-"))
+                    _areas_opciones = ["AI Infra","Biotech","Cloud","Cripto","Solar","Consumo",
+                                       "Industrial","Salud","ETF","Fintech","LatAm","Otro"]
+                    _area_default   = _area_detectada if _area_detectada in _areas_opciones else "Otro"
+                    _wl_area = st.selectbox(
+                        "Área/Sector", _areas_opciones,
+                        index=_areas_opciones.index(_area_default),
+                        key=f"wl_area_{_tk_wl_reg}")
+                with _wl_col3:
+                    _tipos_op = ["Accion","ETF_Sectorial","ETF_Indice","ETF_Cripto"]
+                    _wl_tipo = st.selectbox(
+                        "Tipo", _tipos_op,
+                        key=f"wl_tipo_{_tk_wl_reg}")
+
+                _wl_notas = st.text_input(
+                    "Notas (opcional)", 
+                    value=st.session_state.get(f"ctx_wl_{_tk_wl_reg}",
+                          st.session_state.get(f"comentario_wl_{_tk_wl_reg}",
+                          str(_rw_wl.get("Nota","")))),
+                    key=f"wl_notas_{_tk_wl_reg}", 
+                    placeholder="Ej: sympathy de NBIS, earning próximo...")
+
                 render_boton_registro(
                     ticker=_tk_wl_reg,
                     fase=str(_rw_wl.get("Fase","-")),
@@ -8080,6 +9015,19 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                 )
                 # ── Botón 🦅 Greko en Watchlist ──────────────
                 _wl_tk_g = str(_rw_wl.get("Ticker",""))
+
+                # Mostrar SPY RSI actual antes de guardar
+                _spy_prev = st.session_state.get("mercado_data",{}).get("spy",{}).get("rsi",0)
+                if _spy_prev and float(_spy_prev) > 0:
+                    _spy_color = "#16A34A" if float(_spy_prev) >= 55 else "#D97706" if float(_spy_prev) >= 45 else "#DC2626"
+                    st.markdown(
+                        f'<div style="font-size:10px;color:{TXT_MUT};margin-bottom:4px">'
+                        f'📊 SPY RSI al guardar: <strong style="color:{_spy_color}">'
+                        f'{round(float(_spy_prev),1)}</strong> — se guardará en columna SPY_RSI_Dia</div>',
+                        unsafe_allow_html=True)
+                else:
+                    st.caption("⚠️ SPY RSI no disponible en sesión — se calculará al guardar")
+
                 if st.button(f"🦅 Agregar a Posiciones Greko",
                              key=f"btn_greko_wl_{_wl_tk_g}",
                              use_container_width=True,
@@ -8090,36 +9038,67 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                         fase=str(_rw_wl.get("Fase","")),
                         score=int(_rw_wl.get("Score",0)),
                         prob_nbis=float(_rw_wl.get("Prob_NBIS",0)),
-                        area=str(_rw_wl.get("Area","-")),
-                        tipo="Accion",
+                        area=_wl_area,
+                        tipo=_wl_tipo,
                         fuente="Watchlist",
                         arrastradas=str(_rw_wl.get("Arrastradas","-")),
                         opinion=str(_rw_wl.get("Opinion_Trader","-")),
+                        cantidad=_wl_cantidad,
+                        notas=_wl_notas,
                     )
                     if _ok_wg: st.success(_msg_wg)
                     else:      st.error(_msg_wg)
             st.markdown('</div>', unsafe_allow_html=True)
         wl_entrar = wl_res_df[wl_res_df["Decision"].isin(["ENTRAR","ANTICIPAR"])].sort_values("Score",ascending=False) if "Score" in wl_res_df.columns else wl_res_df[wl_res_df["Decision"].isin(["ENTRAR","ANTICIPAR"])]
         if not wl_entrar.empty:
-            st.markdown(f'<div style="font-size:13px;font-weight:700;color:{G};margin:16px 0 10px">✅ Oportunidades detectadas en tu watchlist</div>',unsafe_allow_html=True)
-            for _,r in wl_entrar.iterrows():
-                sc2=G if r["Score"]>=75 else A
-                dec_color=G if r["Decision"]=="ENTRAR" else C
-                dec_bg=G_BG if r["Decision"]=="ENTRAR" else C_BG
-                dec_bor=G_BOR if r["Decision"]=="ENTRAR" else C_BOR
+            st.markdown(
+                f'<div style="font-size:13px;font-weight:700;color:{G};margin:16px 0 10px">'
+                f'✅ Oportunidades detectadas — {len(wl_entrar)} acciones listas</div>',
+                unsafe_allow_html=True)
+            for _, r in wl_entrar.iterrows():
+                sc2       = G if r["Score"] >= 75 else A
+                dec_color = G if r["Decision"] == "ENTRAR" else C
+                dec_bg    = G_BG if r["Decision"] == "ENTRAR" else C_BG
+                dec_bor   = G_BOR if r["Decision"] == "ENTRAR" else C_BOR
+                _wl_tk_e  = r["Ticker"]
+                _wl_nota  = str(r.get("Nota",""))[:60]
+                _cat_fe   = str(r.get("Cat_Fecha","-"))
+                _cat_desc = str(r.get("Cat_Desc","-"))
+
+                # Earnings próximos
+                _earn_badge = ""
+                if _cat_fe not in ("-","","nan"):
+                    try:
+                        import datetime as _dte
+                        _dias_earn = (datetime.date.fromisoformat(_cat_fe[:10]) - datetime.date.today()).days
+                        if 0 <= _dias_earn <= 3:
+                            _earn_badge = f'<span style="background:#FEF2F2;color:#DC2626;border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700">🚨 Earnings en {_dias_earn}d</span>'
+                        elif 4 <= _dias_earn <= 14:
+                            _earn_badge = f'<span style="background:#FFFBEB;color:#D97706;border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700">📅 Earnings en {_dias_earn}d</span>'
+                    except Exception:
+                        pass
+
+                # Noticia inline
+                _noticia_wl = render_noticia_inline(_wl_tk_e, G, R, A, TXT_MUT, BOR)
+
+                # Card principal
                 st.markdown(
                     f'<div style="background:{dec_bg};border:1px solid {dec_bor};'
                     f'border-left:4px solid {dec_color};border-radius:10px;'
-                    f'padding:12px 16px;margin-bottom:8px;'
-                    f'display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
-                    f'<span style="font-size:18px;font-weight:800;color:{B}">{r["Ticker"]}</span>'
+                    f'padding:12px 16px;margin-bottom:4px">'
+                    f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">'
+                    f'<span style="font-size:18px;font-weight:800;color:{B}">{_wl_tk_e}</span>'
                     f'<span style="font-size:11px;color:{TXT_MUT}">{r["Nombre"]}</span>'
-                    f'{badge(r["Decision"],dec_cls)}'
+                    f'{badge(r["Decision"], dec_cls)}'
                     f'<span style="font-size:12px;font-weight:700;color:{sc2}">Score {r["Score"]}/100</span>'
-                    f'<span style="font-size:11px;color:{TXT_MUT}">Prob NBIS: <strong style="color:{G}">{r["Prob_NBIS"]}%</strong></span>'
-                    f'<span style="font-size:11px;color:{TXT_MUT}">Sim. NBIS: <strong style="color:{G}">{r["Sim_NBIS"]:.1f}%</strong></span>'
-                    f'<span style="font-size:11px;color:{B};font-style:italic">📝 {str(r.get("Nota",""))[:45]}</span>'
-                    f'</div>', unsafe_allow_html=True)
+                    f'<span style="font-size:11px;color:{TXT_MUT}">RSI <strong>{r["RSI"]}</strong></span>'
+                    f'<span style="font-size:11px;color:{TXT_MUT}">Prob <strong style="color:{G}">{r["Prob_NBIS"]}%</strong></span>'
+                    f'{" " + _earn_badge if _earn_badge else ""}'
+                    f'</div>'
+                    + (f'<div style="font-size:10px;color:{TXT_MUT};margin-bottom:4px">📝 {_wl_nota}</div>' if _wl_nota and _wl_nota != "-" else "")
+                    + (_noticia_wl if _noticia_wl else "")
+                    + f'</div>',
+                    unsafe_allow_html=True)
 
         # ── Exportar resultados ─────────────────────────────────
         export_wl = wl_res_df[[
@@ -8174,6 +9153,15 @@ También puedes descargar la plantilla de abajo y completarla.
         )
 
     # ── v18: Cargar posiciones VIVAS desde Google Sheets ───────
+    st.markdown(
+        f'<div class="info-box" style="border-left:4px solid #7C3AED;background:#F5F3FF">'
+        f'<strong>📊 Paper Trading / Modelo en Papel:</strong> '
+        f'posiciones registradas para validar señales del modelo sin dinero real. '
+        f'Cada card muestra señal de salida según reglas: '
+        f'Stop -7% · T1 +8% (55%) · T2 +15% (runner) · alerta día 7 · alerta día 10.<br>'
+        f'<span style="color:#7C3AED">⚡ Alerta día 7</span> = ventana óptima de salida (IONQ +24.9% día 9, RUN +26.5% día 8) · '
+        f'🔗 Panel Sympathy activo si el ticker tiene líder definido en GrekoTrader_Sympathy'
+        f'</div>', unsafe_allow_html=True)
     _sheets_greko_p = leer_posiciones_sheets(_SHEET_NAME_GREKO)
     _sheets_error = st.session_state.get("sheets_error")
 
@@ -8182,7 +9170,7 @@ También puedes descargar la plantilla de abajo y completarla.
             f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
             f'border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:11px">'
             f'<span style="font-weight:700;color:#16A34A">✅ Google Sheets conectado</span> — '
-            f'{len(_sheets_greko_p)} posiciones cargadas desde <strong>{_SHEET_NAME_MAURI}</strong> · '
+            f'{len(_sheets_greko_p)} posiciones cargadas desde <strong>{_SHEET_NAME_GREKO}</strong> · '
             f'Ventas y retiros persisten automáticamente.</div>',
             unsafe_allow_html=True)
     elif _sheets_error:
@@ -8193,7 +9181,7 @@ También puedes descargar la plantilla de abajo y completarla.
                  "Ve a Streamlit Cloud → Settings → Secrets y pega el bloque toml."),
             "not_found:GrekoTrader_Posiciones_Greko":
                 ("📄 Sheet no encontrado",
-                 f"El Sheet '{_SHEET_NAME_MAURI}' no existe o no está compartido. "
+                 f"El Sheet '{_SHEET_NAME_GREKO}' no existe o no está compartido. "
                  f"Compártelo con el email del service account (ver guía)."),
             "empty_sheet":
                 ("📋 Sheet vacío",
@@ -8331,6 +9319,14 @@ También puedes descargar la plantilla de abajo y completarla.
             posiciones_greko_df["Cat_Fecha"] = "-"
         if "Tipo" not in posiciones_greko_df.columns:
             posiciones_greko_df["Tipo"] = "Accion"
+
+        # v18: mostrar tickers descartados por datos inválidos en lugar de eliminarlos silenciosamente
+        _antes_drop_g = posiciones_greko_df.copy()
+        posiciones_greko_df = posiciones_greko_df.dropna(subset=["Precio_Compra","Cantidad"])
+        _descartados_g = _antes_drop_g[~_antes_drop_g.index.isin(posiciones_greko_df.index)]["Ticker"].tolist()
+        if _descartados_g:
+            st.warning(f"⚠️ {len(_descartados_g)} tickers sin Precio_Compra o Cantidad válidos en el Sheet: "
+                      f"**{', '.join(_descartados_g)}** — revisa las columnas en GrekoTrader_Posiciones_Greko")
         if "Estrategia" not in posiciones_greko_df.columns:
             posiciones_greko_df["Estrategia"] = "Swing"
 
@@ -8868,12 +9864,13 @@ También puedes descargar la plantilla de abajo y completarla.
                     f'</div>'
                     f'{"<div style=margin-top:8px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:7px;padding:8px>" + "<div style=font-size:10px;font-weight:700;color:#EA580C>🎯 SETUP RECOMPRA NBIS ACTIVO</div>" + "<div style=font-size:11px;color:#7C2D12>Caída post-earning = mercado sobrereaccionó. Monitorear RSI + Volumen + Soporte los próximos 3 días.</div></div>" if _peg["recompra_activa"] else ""}'
                     f'</div>', unsafe_allow_html=True)
-            # ── NBIS Panel + Pre/Post Market ─────────────────
+            # ── NBIS Panel + Sympathy Panel ──────────────────
+            _symp_html_t6 = render_sympathy_panel(tk, pc, pa, pnl_pct, G, A, R, TXT_MUT, BOR)
             st.markdown(
                 render_nbis_panel(
                     r.get("Prob_NBIS", 0), r.get("Sim_NBIS", 0),
                     G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR
-                ), unsafe_allow_html=True)  # v18: Pre/Post Market removido de posiciones
+                ) + _symp_html_t6, unsafe_allow_html=True)  # v18: sympathy desde Google Sheet
 
             # ── PIRAMIDACIÓN v18 — agregar a posición ganadora ──
             _pir = analisis.get("piramidar") if analisis else None
@@ -9113,6 +10110,16 @@ También puedes descargar la plantilla de abajo y completarla.
             key="dl_template",)
 
     # ── v18: Cargar posiciones VIVAS desde Google Sheets ───────
+    st.markdown(
+        f'<div class="info-box" style="border-left:4px solid {B}">'
+        f'<strong>📊 Posiciones MVALLE — Reglas de gestión:</strong> '
+        f'Acciones: Stop -7% · ETF Sectorial: Stop -12% · ETF Cripto: Stop -20%.<br>'
+        f'<span style="color:{G}">T1</span> = vender 55% · '
+        f'<span style="color:{G}">T2</span> = vender del runner · '
+        f'<span style="color:#D97706">⚡ Día 7</span> = ventana óptima revisión · '
+        f'<span style="color:{R}">⏰ Día 10</span> = salida obligatoria si sin T1.<br>'
+        f'Noticias inline debajo de cada posición para apoyar decisión de mantener o salir.'
+        f'</div>', unsafe_allow_html=True)
     _sheets_mauri = leer_posiciones_sheets(_SHEET_NAME_MAURI)
     _sheets_error = st.session_state.get("sheets_error")
 
@@ -9558,7 +10565,11 @@ También puedes descargar la plantilla de abajo y completarla.
 
             st.markdown(f'<hr style="border:none;border-top:1px solid {BOR};margin:12px 0">',unsafe_allow_html=True)
 
-            # Tren de Arrastre — disponible cuando se configure GrekoTrader_Sympathy
+            # v18: Sympathy panel desde Google Sheet
+            _symp_html_greko = render_sympathy_panel(
+                tk, pc, pa, pnl_pct, G, A, R, TXT_MUT, BOR)
+            if _symp_html_greko:
+                st.markdown(_symp_html_greko, unsafe_allow_html=True)
 
             # Fila 2: indicadores + NBIS + objetivos + lectura
             cd1,cd2,cd3,cd4 = st.columns(4)
@@ -9764,7 +10775,11 @@ También puedes descargar la plantilla de abajo y completarla.
                 render_nbis_panel(
                     r.get("Prob_NBIS", 0), r.get("Sim_NBIS", 0),
                     G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR
-                ), unsafe_allow_html=True)  # v18: Pre/Post Market removido de posiciones
+                ), unsafe_allow_html=True)  # v18: Pre/Post Market removido
+            # v18: Noticia más importante — ayuda a decidir vender o mantener
+            _noticia_pos = render_noticia_inline(tk, G, R, A, TXT_MUT, BOR)
+            if _noticia_pos:
+                st.markdown(_noticia_pos, unsafe_allow_html=True)
 
             # ── PIRAMIDACIÓN v18 — agregar a posición ganadora ──
             _pir = analisis.get("piramidar") if analisis else None
@@ -9968,6 +10983,21 @@ También puedes descargar la plantilla de abajo y completarla.
             st.markdown("---")
             render_noticias_mini(posiciones_df["Ticker"].tolist(), "Noticias Mis Posiciones")
 with tab7:
+    st.markdown(
+        f'<div class="sec-header" style="background:#FDF4FF;border-color:#E9D5FF">'
+        f'<span style="font-size:20px">💜</span>'
+        f'<div><span style="font-size:16px;font-weight:700;color:#7C3AED">Posiciones Amparito</span>'
+        f'<div style="font-size:11px;color:{TXT_MUT};margin-top:3px">'
+        f'Gestión activa · Stop -7% acciones · -12% ETF · Alerta día 7 · Noticias inline</div>'
+        f'</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="info-box" style="border-left:4px solid #7C3AED;background:#FDF4FF">'
+        f'<strong>📊 Reglas de gestión:</strong> misma lógica que MVALLE. '
+        f'T1 +8% → vender 55% · T2 +15% → ajustar runner · '
+        f'Stop duro según tipo: Accion -7% · ETF Sectorial -12% · ETF Cripto -20%.<br>'
+        f'Panel Sympathy activo si el ticker tiene líder en GrekoTrader_Sympathy · '
+        f'Noticia inline apoya decisión de mantener o salir.'
+        f'</div>', unsafe_allow_html=True)
     # v15: Banner earnings críticos en posiciones Amparito - igual que Tab6
     _amp_df_check = st.session_state.get("amp_posiciones_df") or st.session_state.get("amp_df")
     _earn_amp_list = []
@@ -10261,8 +11291,13 @@ with tab7:
 
             st.markdown(
                 render_nbis_panel(r.get("Prob_NBIS",0), r.get("Sim_NBIS",0),
-                    G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR),
-                unsafe_allow_html=True)  # v18: Pre/Post Market removido
+                    G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR)
+                + render_sympathy_panel(tk, pc, pa, pnl_pct, G, A, R, TXT_MUT, BOR),
+                unsafe_allow_html=True)
+            # v18: Noticia para decisión de venta/mantención
+            _n_amp = render_noticia_inline(tk, G, R, A, TXT_MUT, BOR)
+            if _n_amp:
+                st.markdown(_n_amp, unsafe_allow_html=True)
 
             # ── REGISTRO EN GOOGLE SHEETS (Amparito) v18 ────
             _col_reg_a1, _col_reg_a2 = st.columns(2)
