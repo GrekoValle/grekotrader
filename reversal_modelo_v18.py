@@ -1308,7 +1308,7 @@ def leer_watchlist_sheets() -> "pd.DataFrame | None":
         for row in rows[1:]:
             if not row: continue
             d = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
-            tk = str(d.get("Ticker","")).upper().strip().replace("$","")
+            tk = str(d.get("Ticker", d.get("Ticket", ""))).upper().strip().replace("$","")
             if not tk: continue
             wl_data.append({
                 "Ticker": tk,
@@ -5540,6 +5540,7 @@ def escribir_greko_sheets(
     opinion: str = "-",
     cantidad: float = 0,
     notas: str = "",
+    rsi_ticker: float = 0.0,   # v18: RSI del ticker al entrar
 ) -> tuple:
     """
     v18: Escribe una señal en GrekoTrader_Posiciones_Greko
@@ -5549,27 +5550,20 @@ def escribir_greko_sheets(
     import datetime as _dtg
     hoy = _dtg.date.today().isoformat()
 
-    # SPY RSI del día — intentar desde mercado_data primero, luego calcular directo
-    spy_rsi = "-"
+    # SPY_RSI_Dia = RSI del TICKER al entrar (contexto técnico de la señal)
+    # El RSI de SPY se agrega automáticamente en las notas como contexto de mercado
+    spy_rsi_valor = round(float(rsi_ticker), 1) if rsi_ticker and float(rsi_ticker) > 0 else "-"
+
+    # Agregar contexto SPY al campo notas
+    _spy_contexto = ""
     try:
         _mkt_g = st.session_state.get("mercado_data", {})
-        _spy_rsi_cached = _mkt_g.get("spy", {}).get("rsi", 0)
-        if _spy_rsi_cached and float(_spy_rsi_cached) > 0:
-            spy_rsi = round(float(_spy_rsi_cached), 1)
-        else:
-            # Fallback: calcular RSI de SPY directamente desde yfinance
-            import yfinance as _yf_spy
-            import pandas as _pd_spy
-            import numpy as _np_spy
-            _spy_hist = _yf_spy.Ticker("SPY").history(period="1mo")
-            if not _spy_hist.empty:
-                _s = _pd_spy.Series(_spy_hist["Close"].values)
-                _d = _s.diff()
-                _g = _d.clip(lower=0).rolling(14).mean()
-                _l = (-_d.clip(upper=0)).rolling(14).mean()
-                spy_rsi = round(float(100 - 100/(1 + _g.iloc[-1]/(_l.iloc[-1]+1e-9))), 1)
+        _spy_rsi_real = _mkt_g.get("spy", {}).get("rsi", 0)
+        if _spy_rsi_real and float(_spy_rsi_real) > 0:
+            _spy_contexto = f" | SPY RSI: {round(float(_spy_rsi_real),1)}"
     except Exception:
-        spy_rsi = "-"
+        pass
+    notas_final = (notas + _spy_contexto).strip(" |")
 
     # Precio Max y Min histórico desde hoy (al entrar son iguales al precio)
     fila_greko = [
@@ -5581,7 +5575,7 @@ def escribir_greko_sheets(
         fase,             # Fase
         score,            # Score
         prob_nbis,        # Prob_NBIS
-        spy_rsi,          # SPY_RSI_Dia
+        spy_rsi_valor,    # SPY_RSI_Dia (RSI del ticker al entrar)
         area,             # Area
         tipo,             # Tipo
         arrastradas,      # Arrastradas
@@ -5591,7 +5585,7 @@ def escribir_greko_sheets(
         "",               # Fue_Correcto
         "",               # Razon_Salida
         "",               # Error_Modelo
-        notas,            # Notas
+        notas_final,      # Notas (incluye SPY RSI como contexto)
     ]
 
     try:
@@ -7114,6 +7108,7 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
                             area=_rr_area, tipo="Accion", fuente=tab_key,
                             arrastradas=_rr_arr, opinion=_rr_op,
                             cantidad=_reg_cant, notas=_reg_nota,
+                            rsi_ticker=float(_rr.get("RSI", 0)),
                         )
                     if _ok_g: st.success(_msg_g)
                     else:     st.error(_msg_g)
@@ -8455,7 +8450,9 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 
     # ── v18: Cargar Watchlist desde Google Sheets (primario) ───
     _wl_sheets = leer_watchlist_sheets()
-    _wl_sheets_ok = _wl_sheets is not None and not _wl_sheets.empty
+    # P5_OK = conectado exitosamente aunque session_state diga error
+    _wl_diag = st.session_state.get("_wl_sheets_error","")
+    _wl_sheets_ok = (_wl_sheets is not None and not _wl_sheets.empty) or "P5_OK" in _wl_diag
 
     if _wl_sheets_ok:
         _wl_col_ok1, _wl_col_ok2 = st.columns([4,1])
@@ -8544,6 +8541,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 
         # ── Analizar cada acción ────────────────────────────────
         wl_results = []
+        _prob_debug_list = []
         for _, row in wl_df.iterrows():
             tk      = str(row["Ticker"]).upper()
             nombre  = str(row.get("Nombre", tk))
@@ -8552,6 +8550,9 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 
             r = get_row_for_ticker(tk, 0.0)  # precio_compra=0 -> se usará el actual
             source = r.get("_source", "universo")
+
+            # DEBUG: capturar Prob_NBIS real que viene de fetch
+            _prob_debug_list.append(f"{tk}={r.get('Prob_NBIS','?')}({type(r.get('Prob_NBIS','?')).__name__})")
 
             # Sobrescribir nombre/area si el usuario los dio y son más específicos
             if nombre != tk and r["Nombre"] in [tk, "-"]:
@@ -8563,6 +8564,13 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
 
         wl_res_df = pd.DataFrame(wl_results)
         st.session_state["wl_res_df"] = wl_res_df.copy()
+
+        # DEBUG temporal — ver valores reales de Prob_NBIS
+        st.markdown(
+            f'<details style="font-size:10px;color:#6B7280;margin-bottom:6px">'
+            f'<summary>🔬 Debug Prob_NBIS (click para ver)</summary>'
+            f'<code>{"  ·  ".join(_prob_debug_list[:15])}</code>'
+            f'</details>', unsafe_allow_html=True)
 
         # v18: forzar tipos numéricos preservando valores originales cuando falla
         for _num_col in ["Score","RSI","Volumen","EMA50","MACD","DD_pico","Sim_NBIS"]:
@@ -9045,6 +9053,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                         opinion=str(_rw_wl.get("Opinion_Trader","-")),
                         cantidad=_wl_cantidad,
                         notas=_wl_notas,
+                        rsi_ticker=float(_rw_wl.get("RSI", 0)),
                     )
                     if _ok_wg: st.success(_msg_wg)
                     else:      st.error(_msg_wg)
