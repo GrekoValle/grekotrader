@@ -1331,19 +1331,33 @@ def calcular_señal_recompra(
     precio_entrada: float,
     pnl_pct: float,
     tipo: str = "Accion",
+    cat_fecha: str = "-",     # v19: fecha de earnings para ajustar la lógica
 ) -> dict:
     """
     v19: Calcula si existe oportunidad de recompra para una posición abierta.
+    Ahora considera el contexto de earnings para ajustar la señal.
 
-    Reglas:
-      - PnL >= 15%: hay colchón para absorber la recompra
-      - DD desde máximo reciente -8% a -20%: pullback sano
-      - RSI actual 48-62: zona de reentrada
-      - EMA20 respetada: tendencia intacta
-      - RSI bajó desde >65: confirma que fue pullback real
-
-    Retorna dict con señal, precio_recompra, stop_combinado, target, descripcion
+    Escenario A — Pre-earnings 3-7d + PnL >= 20%:
+      → Recompra especulativa pequeña (20% posición)
+    Escenario B — Post-earnings precio inflado:
+      → NO recomprar (catalizador consumido)
+    Escenario C — Post-earnings precio castigado:
+      → Mantener lógica normal de recompra
     """
+    # ── Contexto de earnings antes de hacer cualquier fetch ─────
+    _earn_ctx = {"dias": None, "tipo": "sin_earnings"}
+    if cat_fecha and cat_fecha not in ("-","","nan","NaT"):
+        try:
+            import datetime as _dt_rc
+            _dias_rc = (_dt_rc.date.fromisoformat(str(cat_fecha)[:10])
+                        - _dt_rc.date.today()).days
+            _earn_ctx["dias"] = _dias_rc
+            if 3 <= _dias_rc <= 7:
+                _earn_ctx["tipo"] = "pre_earnings"
+            elif -3 <= _dias_rc <= 0:
+                _earn_ctx["tipo"] = "post_earnings"
+        except Exception:
+            pass
     try:
         import yfinance as _yf_r
         import numpy as _np_r
@@ -1391,6 +1405,60 @@ def calcular_señal_recompra(
 
         # ── Evaluar condiciones ───────────────────────────────
         cond_pnl      = pnl_pct >= 15
+
+        # ── v19: Evaluar contexto de earnings PRIMERO ─────────────
+        _earn_tipo = _earn_ctx.get("tipo","sin_earnings")
+        _earn_dias = _earn_ctx.get("dias")
+
+        # Escenario A: Pre-earnings 3-7 días
+        if _earn_tipo == "pre_earnings" and _earn_dias is not None:
+            if pnl_pct >= 20:
+                # Colchón suficiente → recompra especulativa pequeña
+                return {
+                    "señal":           "recompra_pre_earnings",
+                    "calidad":         "ESPECULATIVA",
+                    "emoji_calidad":   "⚡",
+                    "precio_recompra": round(float(close[-1]), 2),
+                    "precio_prom":     round((precio_entrada + float(close[-1]))/2, 2),
+                    "stop_combinado":  round(float(close[-1]) * 0.95, 2),  # stop -5% estricto
+                    "target":          round(float(close[-1]) * 1.12, 2),
+                    "rsi":             rsi,
+                    "dd_max":          dd_max,
+                    "ema_ok":          sobre_ema20,
+                    "descripcion":     (
+                        f"Earnings en {_earn_dias}d — recompra especulativa. "
+                        f"PnL original +{pnl_pct:.1f}% actúa como colchón. "
+                        f"Posición máx 20% · Stop -5% sobre recompra. "
+                        f"Si earnings positivo → posición total crece. "
+                        f"Si earnings negativo → colchón protege la original."
+                    ),
+                }
+            else:
+                return {
+                    "señal":  "esperar",
+                    "razon":  (f"Earnings en {_earn_dias}d — PnL {pnl_pct:+.1f}% "
+                               f"insuficiente como colchón. Necesitas ≥20% para "
+                               f"asumir el riesgo de un earnings próximo."),
+                    "rsi":    rsi,
+                    "dd_max": dd_max,
+                }
+
+        # Escenario B: Post-earnings precio inflado → NO recomprar
+        if _earn_tipo == "post_earnings":
+            _gap_post = float(close[-1]) / float(close[-3]) - 1 if len(close) > 3 else 0
+            if rsi > 68 or _gap_post > 0.12:
+                return {
+                    "señal":  "no_recomprar",
+                    "razon":  (f"Earnings hace {abs(_earn_dias)}d — precio subió "
+                               f"+{_gap_post*100:.0f}% · RSI {rsi:.0f}. "
+                               f"Catalizador consumido en el precio. "
+                               f"Esperar corrección a RSI 52-58."),
+                    "rsi":    rsi,
+                    "dd_max": dd_max,
+                }
+            # Escenario C: Post-earnings precio castigado → lógica normal
+            # (el precio bajó post-earnings, es como un pullback sano)
+            # → continúa con la lógica normal de recompra abajo
         cond_dd       = -20 <= dd_max <= -5
         cond_rsi      = 48 <= rsi <= 62
         cond_ema      = sobre_ema20
@@ -1629,6 +1697,242 @@ def auto_cargar_noticias(tickers: list, max_tickers: int = 12) -> None:
         except Exception:
             pass
 
+
+def tipo_pullback(dd: float, rsi: float, ema_d: float, 
+                  dias_alcistas: int, vol_ratio: float,
+                  tiene_posicion_abierta: bool = False,
+                  pnl_pct: float = 0.0) -> dict:
+    """
+    v19: Clasifica el tipo de pullback y genera mensaje claro para el trader.
+    
+    Pullback 1 — Corrección profunda en tendencia alcista (DD ≤ -20%)
+    Pullback 2 — Corrección leve en tendencia activa (DD -8% a -20%)  
+    Pullback 3 — Pullback en posición abierta (Recompra)
+    """
+    if tiene_posicion_abierta and pnl_pct >= 5:
+        # Pullback 3: posición abierta con ganancia
+        if dd <= -5:
+            return {
+                "tipo": 3,
+                "nombre": "Pullback en posición abierta",
+                "emoji": "🔄",
+                "color": "#7C3AED",
+                "bg": "#F5F3FF",
+                "descripcion": (
+                    f"Corrección {dd:.1f}% en tu posición ganadora (+{pnl_pct:.1f}%). "
+                    f"Oportunidad de recompra si RSI 48-62 y EMA20 se respeta. "
+                    f"Máximo agregar 30% de la posición original."
+                ),
+                "accion": "Ver panel Recompra",
+            }
+        else:
+            return {
+                "tipo": 3,
+                "nombre": "Pullback en posición abierta",
+                "emoji": "⏳",
+                "color": "#2563EB",
+                "bg": "#EFF6FF",
+                "descripcion": (
+                    f"Posición con +{pnl_pct:.1f}% de ganancia. "
+                    f"Aún no hay corrección suficiente para recompra. "
+                    f"Esperar pullback de al menos -5% desde máximo reciente."
+                ),
+                "accion": "Mantener posición",
+            }
+
+    if dd <= -20:
+        # Pullback 1: corrección profunda
+        if rsi >= 48 and dias_alcistas >= 2:
+            return {
+                "tipo": 1,
+                "nombre": "Pullback profundo — rebote técnico",
+                "emoji": "🔥",
+                "color": "#16A34A",
+                "bg": "#F0FDF4",
+                "descripcion": (
+                    f"Corrección profunda {dd:.1f}% desde máximo histórico. "
+                    f"RSI {rsi:.0f} en zona de entrada (48-65). "
+                    f"{'EMA20 respetada — tendencia intacta.' if ema_d >= -15 else 'Precio bajo EMA20 — vigilar.'} "
+                    f"Setup M2/M3 clásico del modelo. WR histórico: 65-80%."
+                ),
+                "accion": "Señal M2 válida — evaluar entrada",
+            }
+        else:
+            return {
+                "tipo": 1,
+                "nombre": "Pullback profundo — rebote aún no confirmado",
+                "emoji": "👀",
+                "color": "#D97706",
+                "bg": "#FFFBEB",
+                "descripcion": (
+                    f"Corrección profunda {dd:.1f}% pero rebote no confirmado. "
+                    f"RSI {rsi:.0f} {'aún bajo (< 48) — acción sigue débil.' if rsi < 48 else 'subiendo — positivo.'} "
+                    f"Necesita {max(0, 2-dias_alcistas)} día(s) más alcistas para confirmar."
+                ),
+                "accion": "Radar — esperar confirmación",
+            }
+
+    elif -20 < dd <= -8:
+        # Pullback 2: corrección leve en tendencia activa
+        if rsi >= 48 and ema_d >= -10:
+            return {
+                "tipo": 2,
+                "nombre": "Pullback saludable en tendencia activa",
+                "emoji": "⚡",
+                "color": "#0891B2",
+                "bg": "#ECFEFF",
+                "descripcion": (
+                    f"Corrección leve {dd:.1f}% en tendencia alcista activa. "
+                    f"RSI {rsi:.0f} en zona válida. "
+                    f"EMA20 respetada — la tendencia sigue intacta. "
+                    f"'Buy the dip' clásico. "
+                    f"Volumen {'bajo en la corrección ✅ — sano.' if vol_ratio < 80 else 'alto en la corrección ⚠️ — posible distribución.'}"
+                ),
+                "accion": "Entrada válida con posición reducida (50-60%)",
+            }
+        else:
+            return {
+                "tipo": 2,
+                "nombre": "Corrección leve — sin confirmación aún",
+                "emoji": "📡",
+                "color": "#6B7280",
+                "bg": "#F9FAFB",
+                "descripcion": (
+                    f"Corrección {dd:.1f}% desde máximo. "
+                    f"{'RSI ' + str(int(rsi)) + ' bajo zona de entrada (< 48).' if rsi < 48 else ''}"
+                    f"{'EMA20 rota — tendencia comprometida.' if ema_d < -10 else ''} "
+                    f"Esperar RSI sobre 48 y EMA20 respetada."
+                ),
+                "accion": "Radar — esperar mejor setup",
+            }
+
+    return {}  # DD muy pequeño (< -8%) — no es pullback significativo
+
+
+
+def calcular_stop_tipo(
+    pc: float,              # precio de compra
+    tipo: str,              # Accion, ETF_Cripto, ETF_Indice, ETF_Sectorial
+    beta: float,            # beta de la acción
+    score_entrada: float = 0,    # score al momento de entrar
+    prob_entrada: float = 0,     # prob_nbis al momento de entrar
+    tenia_earnings: bool = False, # si entró en ventana de earnings
+    pnl_pct: float = 0,         # ganancia actual para trailing stop
+) -> dict:
+    """
+    v19: Calcula el stop loss según 3 tipos:
+    
+    Stop Normal — señal técnica limpia (score 40-55, prob 30-50%):
+      Acción beta < 1.5: -7%
+      Acción beta 1.5-2.5: -10%
+      Acción beta > 2.5: -12%
+      ETF Sectorial: -12%
+      ETF Índice: sin stop (mantener siempre)
+      ETF Cripto: -20%
+      
+    Stop Estricto — señal con riesgo adicional:
+      Si Score > 55 o Prob > 50% → -5% (señal tardía)
+      Si entró con earnings → -5% (riesgo binario)
+      Si RSI > 65 al entrar → -5%
+      
+    Stop Trailing — posición en ganancia:
+      Si PnL > 20%: stop = precio_actual × 0.92 (-8% desde precio actual)
+      Si PnL > 40%: stop = precio_actual × 0.95 (-5% desde precio actual)
+    """
+    # ── Determinar tipo de stop ───────────────────────────────
+    _es_tardio   = score_entrada > 55 or prob_entrada > 50
+    _es_earnings = tenia_earnings
+    _stop_estricto = _es_tardio or _es_earnings
+
+    # ── ETFs: reglas fijas ────────────────────────────────────
+    if tipo == "ETF_Indice":
+        return {
+            "stop_pct":   0,
+            "stop_val":   0,
+            "tipo_stop":  "Sin stop — mantener siempre",
+            "etiqueta":   "📊 ETF Índice — nunca vender",
+            "obj1": pc*1.15, "obj2": pc*1.25, "obj3": pc*1.40,
+            "razon": "Los ETF de índice no se venden por señal técnica"
+        }
+    elif tipo == "ETF_Cripto":
+        pct = -20.0
+        return {
+            "stop_pct": pct, "stop_val": pc*(1+pct/100),
+            "tipo_stop": "Normal ETF Cripto",
+            "etiqueta":  f"🛑 Stop Cripto ({pct:.0f}%)",
+            "obj1": pc*1.30, "obj2": pc*1.60, "obj3": pc*2.00,
+            "razon": "Alta volatilidad cripto — stop amplio necesario"
+        }
+    elif tipo == "ETF_Sectorial":
+        pct = -12.0
+        return {
+            "stop_pct": pct, "stop_val": pc*(1+pct/100),
+            "tipo_stop": "Normal ETF Sectorial",
+            "etiqueta":  f"🛑 Stop ETF ({pct:.0f}%)",
+            "obj1": pc*1.20, "obj2": pc*1.40, "obj3": pc*1.60,
+            "razon": "ETF sectorial — stop estándar -12%"
+        }
+
+    # ── Acciones: según contexto ──────────────────────────────
+    if _stop_estricto:
+        pct = -5.0
+        tipo_lbl = "Estricto"
+        if _es_tardio:
+            razon = f"Señal tardía (Score {score_entrada:.0f} > 55 o Prob {prob_entrada:.0f}% > 50%) — menos margen de error"
+        else:
+            razon = "Entrada con earnings próximos — stop ajustado como entrada especulativa"
+        obj1 = pc*1.10; obj2 = pc*1.20; obj3 = pc*1.35
+    elif beta < 1.5:
+        pct = -7.0
+        tipo_lbl = "Normal beta bajo"
+        razon = f"Acción estable (Beta {beta:.1f}) — stop estándar"
+        obj1 = pc*1.15; obj2 = pc*1.25; obj3 = pc*1.40
+    elif beta < 2.5:
+        pct = -10.0
+        tipo_lbl = "Normal beta medio"
+        razon = f"Acción moderada (Beta {beta:.1f}) — stop ajustado"
+        obj1 = pc*1.20; obj2 = pc*1.40; obj3 = pc*1.60
+    else:
+        pct = -12.0
+        tipo_lbl = "Normal beta alto"
+        razon = f"Acción volátil (Beta {beta:.1f}) — stop amplio"
+        obj1 = pc*1.25; obj2 = pc*1.50; obj3 = pc*1.80
+
+    return {
+        "stop_pct":  pct,
+        "stop_val":  round(pc * (1 + pct/100), 2),
+        "tipo_stop": tipo_lbl,
+        "etiqueta":  f"🛑 Stop {'⚠️ Estricto' if _stop_estricto else 'Normal'} ({pct:.0f}%)",
+        "razon":     razon,
+        "obj1": round(obj1,2), "obj2": round(obj2,2), "obj3": round(obj3,2),
+    }
+
+def render_pullback_badge(ticker: str, dd: float, rsi: float, ema_d: float,
+                          dias_alcistas: int, vol_ratio: float,
+                          G: str, R: str, A: str, C: str,
+                          TXT_MUT: str,
+                          tiene_posicion: bool = False,
+                          pnl_pct: float = 0.0) -> str:
+    """
+    v19: Renderiza badge de tipo pullback para Watchlist, Swing y Posiciones.
+    """
+    pb = tipo_pullback(dd, rsi, ema_d, dias_alcistas, vol_ratio,
+                       tiene_posicion, pnl_pct)
+    if not pb:
+        return ""
+
+    return (
+        f'<div style="background:{pb["bg"]};border-left:3px solid {pb["color"]};'
+        f'border-radius:0 8px 8px 0;padding:8px 12px;margin-top:5px">'
+        f'<div style="font-size:11px;font-weight:700;color:{pb["color"]};margin-bottom:3px">'
+        f'{pb["emoji"]} {pb["nombre"]}</div>'
+        f'<div style="font-size:10px;color:#374151;line-height:1.7">'
+        f'{pb["descripcion"]}</div>'
+        f'<div style="font-size:10px;font-weight:600;color:{pb["color"]};'
+        f'margin-top:4px">→ {pb["accion"]}</div>'
+        f'</div>'
+    )
+
 def render_earn_news_card(
     ticker: str,
     cat_fecha: str,
@@ -1642,7 +1946,7 @@ def render_earn_news_card(
     import datetime as _dt_en
     partes = []
 
-    # ── Earnings badge ────────────────────────────────────────
+    # ── Earnings badge con ventana pre-earnings v19 ───────────
     if cat_fecha not in ("-","","nan","NaT"):
         try:
             _dias = (_dt_en.date.fromisoformat(str(cat_fecha)[:10])
@@ -1656,13 +1960,23 @@ def render_earn_news_card(
                 partes.append(
                     f'<span style="background:#FEF2F2;color:#DC2626;'
                     f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700">'
-                    f'🚨 Earnings {"HOY" if _dias == 0 else f"en {_dias}d"} — riesgo binario</span>')
-            elif 3 <= _dias <= 7:
+                    f'🚨 Earnings {"HOY" if _dias == 0 else f"en {_dias}d"} — NO entrar, riesgo binario</span>')
+            elif 3 <= _dias <= 5:
+                # v19 MEJORA 2: ventana pre-earnings (2-5 días antes)
+                partes.append(
+                    f'<span style="background:#F0FDF4;color:#16A34A;'
+                    f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700">'
+                    f'⚡ Earnings en {_dias}d — VENTANA PRE-EARNINGS</span>')
+                partes.append(
+                    f'<span style="font-size:10px;color:#374151;'
+                    f'background:#F0FDF4;border-radius:4px;padding:2px 8px">'
+                    f'Si RSI 48-62 + Score 40+: entrada especulativa 50% posición · stop -5%</span>')
+            elif 6 <= _dias <= 10:
                 partes.append(
                     f'<span style="background:#FFFBEB;color:#D97706;'
                     f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700">'
                     f'📅 Earnings en {_dias}d — preparar estrategia</span>')
-            elif 8 <= _dias <= 21:
+            elif 11 <= _dias <= 21:
                 partes.append(
                     f'<span style="background:#EFF6FF;color:#2563EB;'
                     f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700">'
@@ -1694,6 +2008,35 @@ def render_panel_recompra(
     v19: Renderiza el panel de recompra para una posición.
     """
     señal = recompra.get("señal", "")
+
+    if señal == "recompra_pre_earnings":
+        return (
+            f'<div style="background:#F0FDF4;border:2px solid #86EFAC;'
+            f'border-left:4px solid #16A34A;border-radius:10px;'
+            f'padding:10px 14px;margin-top:8px">'
+            f'<div style="font-size:12px;font-weight:800;color:#16A34A;margin-bottom:6px">'
+            f'⚡ RECOMPRA ESPECULATIVA — ventana pre-earnings</div>'
+            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:8px">'
+            f'<div style="text-align:center">'
+            f'<div style="font-size:9px;color:{TXT_MUT}">Precio recompra</div>'
+            f'<div style="font-size:13px;font-weight:700;color:{TXT}">${recompra.get("precio_recompra",0):.2f}</div></div>'
+            f'<div style="text-align:center">'
+            f'<div style="font-size:9px;color:{TXT_MUT}">Stop estricto</div>'
+            f'<div style="font-size:13px;font-weight:700;color:{R}">${recompra.get("stop_combinado",0):.2f}</div></div>'
+            f'<div style="text-align:center">'
+            f'<div style="font-size:9px;color:{TXT_MUT}">Target</div>'
+            f'<div style="font-size:13px;font-weight:700;color:{G}">${recompra.get("target",0):.2f}</div></div>'
+            f'<div style="text-align:center">'
+            f'<div style="font-size:9px;color:{TXT_MUT}">RSI actual</div>'
+            f'<div style="font-size:13px;font-weight:700;color:{TXT}">{recompra.get("rsi",0)}</div></div>'
+            f'</div>'
+            f'<div style="font-size:10px;color:#374151;line-height:1.7">'
+            f'{recompra.get("descripcion","")}'
+            f'</div>'
+            f'<div style="font-size:10px;font-weight:600;color:#D97706;margin-top:4px">'
+            f'⚠️ Posición máx 20% de la original · Stop -5% estricto · No ampliar después del earnings</div>'
+            f'</div>'
+        )
 
     if señal == "recompra":
         cal   = recompra.get("calidad","MEDIA")
@@ -4290,7 +4633,8 @@ def scan_tab(rsi_max: float, dd_min: float,
 
                 dec, fase, trig, col, bg = get_decision(sc, 0, 1.0, macd_h, rsi, "-",
                                                          prob_nbis=_prob_nbis,
-                                                         vol_ratio=vol, ema_d=ema_d)
+                                                         vol_ratio=vol, ema_d=ema_d,
+                                                         mercado_sobrecomprado=_spy_sobrecomprado)
                 if decisions and dec not in decisions:
                     continue
 
@@ -4352,9 +4696,10 @@ def _count(key):
 
 
 def get_decision(score, pre_move, pre_vol, macd, rsi, lider, prob_nbis=0,
-                  vol_ratio=100, ema_d=0.0):
+                  vol_ratio=100, ema_d=0.0, mercado_sobrecomprado=False):
     """
-    v19 fix: Agrega guards de RSI, volumen y EMA50 a la decisión.
+    v19 fix: Guards de RSI, volumen, EMA50 y contexto macro.
+    Si SPY RSI > 68 (mercado en máximos) → bloquear ENTRAR, solo ANTICIPAR mínimo.
     CMPX caso real: RSI=12, Vol=10%, EMA50=-50% → no es ANTICIPAR
     """
     # v18: asegurar que prob_nbis sea número
@@ -4378,6 +4723,16 @@ def get_decision(score, pre_move, pre_vol, macd, rsi, lider, prob_nbis=0,
     _vol_valido  = vol_ratio >= 50
     _ema_valido  = ema_d >= -30.0  # precio no más de -30% bajo EMA50
     _puede_entrar = _rsi_valido and _vol_valido and _ema_valido
+
+    # ── v19 Prioridad 1: mercado sobrecomprado → bloquear ENTRAR ──
+    if mercado_sobrecomprado:
+        # SPY RSI > 68 → máximos históricos → máximo ANTICIPAR con posición reducida
+        if score>=55 and pre_move>=3 and pre_vol>=1.3 and macd>0 and _prob_ok_entrar and _puede_entrar:
+            return "ANTICIPAR","Fase 3","⚠️ SPY SOBRECOMPRADO · Posición 40% · esperar corrección mercado",C,C_BG
+        elif score>=42 and macd>0 and _puede_entrar:
+            return "SEGUIR","Fase 2","⚠️ SPY RSI>68 · Mercado en máximos · alto riesgo de corrección",A,A_BG
+        else:
+            return "OBSERVAR","Fase 1","⚠️ SPY SOBRECOMPRADO · No entrar hasta corrección del mercado",TXT_MUT,BG
 
     # ── ENTRAR - señal M3 confirmada ──────────────────────────
     if score>=55 and pre_move>=3 and pre_vol>=1.3 and macd>0 and _prob_ok_entrar and _puede_entrar:
@@ -4679,8 +5034,10 @@ def build_df():
         # pero además limitamos la decisión
         es_iliquida = vol_k < 500
 
+        _spy_info_bdf = get_spy_filtro()
         dec, fase, trig, col, bg = get_decision(sc, pm, pv, macd, rsi, lider, prob_nbis=0,
-                                               vol_ratio=vol_r, ema_d=ema_d)
+                                               vol_ratio=vol_r, ema_d=ema_d,
+                                               mercado_sobrecomprado=_spy_info_bdf.get("mercado_sobrecomprado", False))
         # prob_nbis se calcula después — get_decision usa 0 por defecto aquí
         # El valor real se aplica cuando se recalcula abajo si aplica
 
@@ -4708,6 +5065,46 @@ def build_df():
             _cat_fecha_row = get_earnings_single(tk)
         row = dict(row)  # asegurar que es mutable
         row["Cat_Fecha"] = _cat_fecha_row
+
+        # v19: Reglas de earnings sobre la DECISIÓN (no solo el badge visual)
+        if _cat_fecha_row not in ("-","","nan"):
+            try:
+                import datetime as _dt_bd
+                _dias_earn_bd = (_dt_bd.date.fromisoformat(_cat_fecha_row[:10])
+                                 - _dt_bd.date.today()).days
+
+                # ── REGLA 1: Post-earnings precio inflado → BLOQUEAR ──────
+                # Si earnings fue hace 0-3 días Y precio subió > +15%
+                # → catalizador ya consumido en el precio
+                if -3 <= _dias_earn_bd <= 0:
+                    _gap_post = float(pm) if pm else 0  # pre_move como proxy del gap
+                    if _gap_post > 15 or rsi > 68:
+                        dec  = "SEGUIR"
+                        fase = "Fase 1"
+                        trig = (f"🚨 Post-earnings +{_gap_post:.0f}% · RSI {rsi:.0f} — "
+                                f"catalizador consumido · esperar RSI 48-58")
+                    else:
+                        # precio castigado post-earnings → válido (como ENPH)
+                        trig = f"⚠️ Post-earnings hace {abs(_dias_earn_bd)}d · {trig}"
+
+                # ── REGLA 2: Pre-earnings 3-5 días → ANTICIPAR, no ENTRAR ──
+                # Reducir a posición parcial — no apostar completo al resultado
+                elif 3 <= _dias_earn_bd <= 5:
+                    trig = f"⚡ PRE-EARNINGS {_dias_earn_bd}d · {trig}"
+                    # Degradar ENTRAR → ANTICIPAR (posición 40%, stop -5%)
+                    if dec == "ENTRAR":
+                        dec  = "ANTICIPAR"
+                        fase = "Fase 3"
+                        trig = f"⚡ PRE-EARNINGS {_dias_earn_bd}d · posición 40% · stop -5%"
+
+                # ── REGLA 3: Earnings muy próximo → NO entrar ─────────────
+                elif 0 <= _dias_earn_bd <= 2:
+                    trig = f"🚨 EARNINGS {'HOY' if _dias_earn_bd==0 else f'en {_dias_earn_bd}d'} — NO entrar"
+                    dec  = "VIGILAR"
+                    fase = "Fase 1"
+
+            except Exception:
+                pass
 
         rows.append({
             "Ticker":tk, "Nombre":row["Nombre"], "Area":row["Area"],
@@ -4887,10 +5284,34 @@ def fetch_ticker_data(ticker: str, precio_compra: float) -> dict:
             except Exception:
                 pass
             _prob_val = 0.0
+        _spy_info_ftd = get_spy_filtro()
         dec,fase,trig,col,bg = get_decision(sc, pre_move_calc,
                                             max(pre_vol_calc, 1.0), macd_hist, rsi, "",
                                             prob_nbis=_prob_val,
-                                            vol_ratio=vol_r, ema_d=ema_d)
+                                            vol_ratio=vol_r, ema_d=ema_d,
+                                            mercado_sobrecomprado=_spy_info_ftd.get("mercado_sobrecomprado", False))
+
+        # v19: aplicar reglas de earnings sobre la decisión
+        try:
+            _cat_ftd = get_earnings_single(ticker)
+            if _cat_ftd and _cat_ftd not in ("-","","nan"):
+                import datetime as _dt_ftd
+                _dias_ftd = (_dt_ftd.date.fromisoformat(_cat_ftd[:10])
+                             - _dt_ftd.date.today()).days
+                # Post-earnings precio inflado → bloquear
+                if -3 <= _dias_ftd <= 0 and (rsi > 68 or pre_move_calc > 15):
+                    dec  = "SEGUIR"; fase = "Fase 1"
+                    trig = f"🚨 Post-earnings RSI {rsi:.0f} — catalizador consumido"
+                # Pre-earnings → degradar ENTRAR a ANTICIPAR
+                elif 3 <= _dias_ftd <= 5 and dec == "ENTRAR":
+                    dec  = "ANTICIPAR"
+                    trig = f"⚡ PRE-EARNINGS {_dias_ftd}d · posición 40% · stop -5%"
+                # Earnings hoy o mañana → bloquear
+                elif 0 <= _dias_ftd <= 2:
+                    dec  = "VIGILAR"; fase = "Fase 1"
+                    trig = f"🚨 EARNINGS {'HOY' if _dias_ftd==0 else f'en {_dias_ftd}d'} — NO entrar"
+        except Exception:
+            pass
 
         return {
             "Ticker":ticker,"Nombre":nombre,"Area":area,
@@ -5911,18 +6332,41 @@ def escribir_trade_sheets(
     if precio_salida > 0 and precio_entrada > 0:
         resultado_pct = round((precio_salida - precio_entrada) / precio_entrada * 100, 2)
     
-    # SPY RSI del día
+    # SPY RSI del día — v19: fallback directo a yfinance si session_state vacío
     spy_rsi = ""
     try:
         _mkt2 = st.session_state.get("mercado_data", {})
-        spy_rsi = round(float(_mkt2.get("spy", {}).get("rsi", 0)), 1)
+        _spy_cached = round(float(_mkt2.get("spy", {}).get("rsi", 0)), 1)
+        if _spy_cached > 0:
+            spy_rsi = _spy_cached
+        else:
+            # Fallback: calcular directamente desde yfinance
+            import yfinance as _yf_spy2
+            import pandas as _pd_spy2
+            _spy_h = _yf_spy2.Ticker("SPY").history(period="1mo")
+            if not _spy_h.empty:
+                _s2 = _pd_spy2.Series(_spy_h["Close"].values)
+                _d2 = _s2.diff()
+                _g2 = _d2.clip(lower=0).rolling(14).mean()
+                _l2 = (-_d2.clip(upper=0)).rolling(14).mean()
+                spy_rsi = round(float(100 - 100/(1 + _g2.iloc[-1]/(_l2.iloc[-1]+1e-9))), 1)
     except Exception:
-        pass
+        spy_rsi = ""
 
-    # Obtener Area del ticker desde RAW
-    # v18: Area desde parámetro > RAW
-    _area_write = area if area and area not in ("-","","nan") else "-"
-    if _area_write == "-":
+    # Area del ticker — v19: parámetro > Watchlist session_state > RAW > "-"
+    _area_write = area if area and area not in ("-","","nan") else ""
+    if not _area_write:
+        # Buscar en wl_res_df (Watchlist cargado)
+        try:
+            _wl_df_ts = st.session_state.get("wl_res_df")
+            if _wl_df_ts is not None and "Area" in _wl_df_ts.columns:
+                _row_ts = _wl_df_ts[_wl_df_ts["Ticker"].str.upper() == ticker.upper()]
+                if not _row_ts.empty:
+                    _area_write = str(_row_ts.iloc[0]["Area"]).strip()
+        except Exception:
+            pass
+    if not _area_write:
+        # Buscar en RAW (universe estático)
         try:
             for _r in RAW:
                 if isinstance(_r, tuple) and len(_r) > 2 and str(_r[0]).upper() == ticker.upper():
@@ -5930,6 +6374,8 @@ def escribir_trade_sheets(
                     break
         except Exception:
             pass
+    if not _area_write or _area_write in ("-","","nan"):
+        _area_write = "-"
 
     # v18 fix: orden exacto de columnas del Sheet GrekoTrader_Senales_Modelo
     # Fecha_Señal | Ticker | Fase | Precio_Entrada | Score | Prob_NBIS |
@@ -6977,19 +7423,24 @@ def get_spy_filtro() -> dict:
         else:
             dd_min_adaptativo = -20.0   # bajista: umbral original
 
+        # v19 Prioridad 1: bloqueo cuando mercado sobrecomprado
+        # SPY RSI > 68 → máximos históricos → NO generar señales ENTRAR
+        mercado_sobrecomprado = spy_rsi > 68
+
         return {
-            "mercado_positivo": mercado_positivo,
-            "spy_ayer":  round(spy_ayer, 2),
-            "spy_antes": round(spy_antes, 2),
-            "cambio_pct": cambio_pct,
-            "nivel": nivel,
-            "spy_rsi": spy_rsi,
-            "dd_min_adaptativo": dd_min_adaptativo,  # v19: DD según contexto
-            "fuente": "yfinance"
+            "mercado_positivo":      mercado_positivo,
+            "mercado_sobrecomprado": mercado_sobrecomprado,
+            "spy_ayer":              round(spy_ayer, 2),
+            "spy_antes":             round(spy_antes, 2),
+            "cambio_pct":            cambio_pct,
+            "nivel":                 nivel,
+            "spy_rsi":               spy_rsi,
+            "dd_min_adaptativo":     dd_min_adaptativo,
+            "fuente":                "yfinance"
         }
     except Exception:
-        return {"mercado_positivo": True, "spy_ayer": 0.0,
-                "spy_antes": 0.0, "cambio_pct": 0.0,
+        return {"mercado_positivo": True, "mercado_sobrecomprado": False,
+                "spy_ayer": 0.0, "spy_antes": 0.0, "cambio_pct": 0.0,
                 "spy_rsi": 55.0, "dd_min_adaptativo": -15.0,
                 "fuente": "error"}
 
@@ -7041,6 +7492,7 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = 
                 # SPY bajista (RSI<45): -20% umbral original
                 _spy_dd = get_spy_filtro()
                 _dd_min_ctx = _spy_dd.get("dd_min_adaptativo", -15.0)
+                _spy_sobrecomprado = _spy_dd.get("mercado_sobrecomprado", False)
                 if dd > _dd_min_ctx:
                     continue
 
@@ -7267,6 +7719,17 @@ with st.sidebar:
             construir_cartera_global()
         except Exception:
             pass
+
+    # v19: mostrar alerta SPY en sidebar si sobrecomprado
+    _spy_sb = st.session_state.get("_cartera_global_cache", {})  # reutilizar cache
+    _spy_sb_info = get_spy_filtro()
+    if _spy_sb_info.get("mercado_sobrecomprado", False):
+        st.sidebar.markdown(
+            f'<div style="background:#FEF2F2;border:1px solid #FCA5A5;'
+            f'border-radius:8px;padding:6px 10px;margin-bottom:8px;font-size:10px">'
+            f'🚨 <strong style="color:#DC2626">SPY RSI {_spy_sb_info.get("spy_rsi",0):.0f}</strong> — '
+            f'Mercado sobrecomprado · Señales degradadas</div>',
+            unsafe_allow_html=True)
 
     with st.expander("📊 Umbrales activos del modelo", expanded=False):
         # Debug Prob_NBIS si hay error
@@ -7645,6 +8108,28 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
                 )
 
     render_table(df_show, cols_con_senal, tab_key=tab_key)
+
+    # ── v19: Panel de Pullback por acción ────────────────────────
+    if not df_show.empty:
+        st.markdown(
+            f'<div style="font-size:12px;font-weight:700;color:{TXT};'
+            f'margin:14px 0 8px">🔍 Análisis de Pullback por señal</div>',
+            unsafe_allow_html=True)
+        for _, _pr in df_show.iterrows():
+            _pr_tk   = str(_pr.get("Ticker",""))
+            _pr_dd   = float(str(_pr.get("DD_pico",0)).replace(",",".") or 0)
+            _pr_rsi  = float(str(_pr.get("RSI",50)).replace(",",".") or 50)
+            _pr_ema  = float(str(_pr.get("EMA50",0)).replace(",",".") or 0)
+            _pr_dias = int(_pr.get("Dias_Alcistas", _pr.get("dias_alcistas", 0)) or 0)
+            _pr_vol  = float(str(_pr.get("Volumen",100)).replace(",",".") or 100)
+            _pb_html = render_pullback_badge(
+                _pr_tk, _pr_dd, _pr_rsi, _pr_ema, _pr_dias, _pr_vol,
+                G, R, A, C, TXT_MUT)
+            if _pb_html:
+                st.markdown(
+                    f'<div style="font-size:11px;font-weight:700;color:{B};'
+                    f'margin:8px 0 2px">{_pr_tk}</div>' + _pb_html,
+                    unsafe_allow_html=True)
 
     # ── Mensaje contextual cuando no hay señales ─────────────────
     if df_show.empty:
@@ -8194,6 +8679,23 @@ with tab2:
         f'<div style="font-size:11px;color:{TXT_MUT};margin-top:3px">'
         f'DD ≤ -20% · RSI 48-65 · Score 40-55 · Prob_NBIS 30-45% · Ventana óptima 7-9 días</div>'
         f'</div></div>', unsafe_allow_html=True)
+    # v19 Prioridad 1: banner si mercado sobrecomprado
+    _spy_tab2 = get_spy_filtro()
+    _spy_rsi_t2 = _spy_tab2.get("spy_rsi", 55)
+    if _spy_tab2.get("mercado_sobrecomprado", False):
+        st.markdown(
+            f'<div style="background:#FEF2F2;border:2px solid #FCA5A5;'
+            f'border-radius:10px;padding:12px 18px;margin-bottom:10px">'
+            f'<div style="font-size:13px;font-weight:800;color:#DC2626;margin-bottom:4px">'
+            f'🚨 MERCADO SOBRECOMPRADO — SPY RSI {_spy_rsi_t2:.0f}</div>'
+            f'<div style="font-size:11px;color:#374151;line-height:1.8">'
+            f'El S&P 500 está en zona de máximos históricos (RSI > 68). '
+            f'Las entradas nuevas tienen WR < 40% en este contexto.<br>'
+            f'<strong>El modelo degradó ENTRAR → ANTICIPAR (40% posición)</strong> '
+            f'para todas las señales. Solo entrar con catalizador muy específico y convicción alta.'
+            f'</div></div>',
+            unsafe_allow_html=True)
+
     st.markdown(
         f'<div class="info-box">'
         f'<strong>📊 Criterios v19 (datos semana 27abr-08may):</strong> '
@@ -8651,6 +9153,18 @@ with tab3:
         f'<div style="font-size:11px;color:{TXT_MUT};margin-top:3px">'
         f'RSI 48-68 · DD ≤ -15% · Score 40-55 · Prob_NBIS 30-45% · Decisión ENTRAR o ANTICIPAR</div>'
         f'</div></div>', unsafe_allow_html=True)
+    # v19 Prioridad 1: banner Tab3
+    _spy_tab3 = get_spy_filtro()
+    if _spy_tab3.get("mercado_sobrecomprado", False):
+        st.markdown(
+            f'<div style="background:#FEF2F2;border:2px solid #FCA5A5;'
+            f'border-radius:10px;padding:10px 16px;margin-bottom:8px">'
+            f'<strong style="color:#DC2626">🚨 SPY RSI {_spy_tab3.get("spy_rsi",0):.0f} — MERCADO EN MÁXIMOS</strong><br>'
+            f'<span style="font-size:10px;color:#374151">'
+            f'No se generan señales ENTRAR. Las señales se degradan a ANTICIPAR (40% posición). '
+            f'Esperar que SPY RSI baje bajo 65 para volver a entradas normales.</span>'
+            f'</div>', unsafe_allow_html=True)
+
     st.markdown(
         f'<div class="info-box" style="border-left:4px solid {G}">'
         f'<strong>📊 Lógica Entrar Hoy:</strong> señales listas para ejecutar HOY. '
@@ -9471,6 +9985,17 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                     _tkn, str(_rwn.get("Cat_Fecha","-")), G, R, A, TXT_MUT, BOR)
                 if _en_card_wl:
                     st.markdown(_en_card_wl, unsafe_allow_html=True)
+                # v19: Badge pullback en Watchlist
+                _pb_wl_dd  = float(str(_rwn.get("DD_pico",0)).replace(",",".") or 0)
+                _pb_wl_rsi = float(str(_rwn.get("RSI",50)).replace(",",".") or 50)
+                _pb_wl_ema = float(str(_rwn.get("EMA50",0)).replace(",",".") or 0)
+                _pb_wl_vol = float(str(_rwn.get("Volumen",100)).replace(",",".") or 100)
+                _pb_wl_html = render_pullback_badge(
+                    _tkn, _pb_wl_dd, _pb_wl_rsi, _pb_wl_ema, 0, _pb_wl_vol,
+                    G, R, A, C, TXT_MUT)
+                if _pb_wl_html:
+                    st.markdown(_pb_wl_html, unsafe_allow_html=True)
+
                 if _notan and _notan not in ("-","","nan"):
                     st.markdown(
                         f'<div style="font-size:10px;color:{TXT_MUT};margin-top:4px">'
@@ -9639,7 +10164,8 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                     arrastradas=str(_rw_wl.get("Arrastradas","-")),
                     lider=str(_rw_wl.get("Lider","-")),
                     opinion=str(_rw_wl.get("Opinion_Trader","-")),
-                    key_prefix="tab5", tipo="ENTRADA"
+                    key_prefix="tab5", tipo="ENTRADA",
+                    area=_wl_area  # v19: pasar área seleccionada
                 )
                 # ── Botón 🦅 Greko en Watchlist ──────────────
                 _wl_tk_g = str(_rw_wl.get("Ticker",""))
@@ -10324,12 +10850,16 @@ También puedes descargar la plantilla de abajo y completarla.
                 # Señal de gestión de posición - no score de entrada
                 rsi_pos = r["RSI"]
                 pnl_pos = pnl_pct
+                # v19: stop type labels
+                _stop_tipo_lbl  = _stop_data.get("tipo_stop", "Normal")
+                _stop_razon_lbl = _stop_data.get("razon", "")
+                _stop_estricto_flag = "Estricto" in _stop_tipo_lbl
 
                 # Determinar semáforo de gestión
                 if pnl_pos >= 40:
                     gest_color = G; gest_emoji = "🟢"
                     gest_titulo = "Ganancia sólida"
-                    gest_msg = f"Tramo 1 ejecutado? Si no, vender 30% ahora. Dejar runner."
+                    gest_msg = "Tramo 1 ejecutado? Si no, vender 30% ahora. Dejar runner."
                 elif pnl_pos >= 20:
                     gest_color = G; gest_emoji = "🟢"
                     gest_titulo = "Objetivo 1 alcanzado"
@@ -10346,6 +10876,8 @@ También puedes descargar la plantilla de abajo y completarla.
                     gest_color = R; gest_emoji = "🔴"
                     gest_titulo = "En pérdida moderada"
                     gest_msg = "Revisar catalizador. ¿Sigue válido? Si no, evaluar salida."
+                    if _stop_estricto_flag:
+                        gest_msg += f" ⚠️ Stop {_stop_data.get('stop_pct',0):.0f}% — señal tardía al entrar."
                 else:
                     gest_color = R; gest_emoji = "🔴"
                     gest_titulo = "Pérdida alta - acción requerida"
@@ -10375,18 +10907,37 @@ También puedes descargar la plantilla de abajo y completarla.
                     f'</div>'
                     f'</div>', unsafe_allow_html=True)
             with cd3:
-                # Objetivos - usar _tipo_pos ya calculado arriba
-                _beta_p = float(r.get("Beta", 1.5))
-                if _tipo_pos=="ETF_Cripto":   stop_val=pc*0.80; obj1=pc*1.30; obj2=pc*1.60; obj3=pc*2.00
-                elif _tipo_pos=="ETF_Indice": stop_val=pc*0.88; obj1=pc*1.15; obj2=pc*1.25; obj3=pc*1.40
-                elif _tipo_pos=="ETF_Sectorial": stop_val=pc*0.90; obj1=pc*1.20; obj2=pc*1.40; obj3=pc*1.60
-                elif _beta_p < 1.5:           stop_val=pc*0.88; obj1=pc*1.15; obj2=pc*1.25; obj3=pc*1.40
-                elif _beta_p < 2.5:           stop_val=pc*0.90; obj1=pc*1.20; obj2=pc*1.40; obj3=pc*1.60
-                else:                         stop_val=pc*0.82; obj1=pc*1.25; obj2=pc*1.50; obj3=pc*1.80
-                stop_pct = (stop_val/pa-1)*100 if pa>0 else 0
-                obj1_pct  = (obj1/pa-1)*100 if pa>0 else 0
-                obj2_pct  = (obj2/pa-1)*100 if pa>0 else 0
-                obj3_pct  = (obj3/pa-1)*100 if pa>0 else 0
+                # Objetivos y stop - usar _tipo_pos ya calculado arriba
+                _beta_p    = float(r.get("Beta", 1.5))
+                _score_e   = float(r.get("Score", 0) or 0)
+                _prob_e    = float(r.get("Prob_NBIS", 0) or 0)
+                _cat_e     = str(r.get("Cat_Fecha", "-"))
+                # Detectar si entró con earnings próximos
+                _fue_earnings = False
+                try:
+                    import datetime as _dt_sp
+                    if _cat_e not in ("-","","nan"):
+                        _dias_entry = abs((
+                            _dt_sp.date.today() -
+                            _dt_sp.date.fromisoformat(_cat_e[:10])
+                        ).days)
+                        _fue_earnings = _dias_entry <= 5
+                except Exception:
+                    pass
+
+                _stop_data = calcular_stop_tipo(
+                    pc=pc, tipo=_tipo_pos, beta=_beta_p,
+                    score_entrada=_score_e, prob_entrada=_prob_e,
+                    tenia_earnings=_fue_earnings, pnl_pct=pnl_pct)
+
+                stop_val  = _stop_data["stop_val"]
+                obj1      = _stop_data["obj1"]
+                obj2      = _stop_data["obj2"]
+                obj3      = _stop_data["obj3"]
+                stop_pct  = (stop_val/pa-1)*100 if pa > 0 and stop_val > 0 else 0
+                obj1_pct  = (obj1/pa-1)*100 if pa > 0 else 0
+                obj2_pct  = (obj2/pa-1)*100 if pa > 0 else 0
+                obj3_pct  = (obj3/pa-1)*100 if pa > 0 else 0
 
                 def obj_color(pct):
                     return G if pct <= 0 else A if pct <= 20 else C
@@ -10519,11 +11070,24 @@ También puedes descargar la plantilla de abajo y completarla.
             if _en_card_gk:
                 st.markdown(_en_card_gk, unsafe_allow_html=True)
 
+            # v19: Badge Pullback P3 Greko
+            _pb_gk_dd  = float(str(r.get("DD_pico", 0) or 0).replace(",","."))
+            _pb_gk_rsi = float(str(r.get("RSI", 50) or 50).replace(",","."))
+            _pb_gk_ema = float(str(r.get("EMA50", 0) or 0).replace(",","."))
+            _pb_gk_vol = float(str(r.get("Volumen", 100) or 100).replace(",","."))
+            _pb_gk_html = render_pullback_badge(
+                tk, _pb_gk_dd, _pb_gk_rsi, _pb_gk_ema, 0, _pb_gk_vol,
+                G, R, A, C, TXT_MUT,
+                tiene_posicion=True, pnl_pct=pnl_pct)
+            if _pb_gk_html:
+                st.markdown(_pb_gk_html, unsafe_allow_html=True)
+
             # v19: Panel de Recompra
             if pnl_pct >= 5:
                 _recompra_data_g = calcular_señal_recompra(
                     ticker=tk, precio_entrada=pc,
-                    pnl_pct=pnl_pct, tipo=str(pos.get("Tipo","Accion")))
+                    pnl_pct=pnl_pct, tipo=str(pos.get("Tipo","Accion")),
+                    cat_fecha=str(r.get("Cat_Fecha","-")))
                 _recompra_html_g = render_panel_recompra(
                     _recompra_data_g, str(pos.get("Tipo","Accion")),
                     G, R, A, C, TXT, TXT_MUT, BOR)
@@ -11268,12 +11832,16 @@ También puedes descargar la plantilla de abajo y completarla.
                 # Señal de gestión de posición - no score de entrada
                 rsi_pos = r["RSI"]
                 pnl_pos = pnl_pct
+                # v19: stop type labels
+                _stop_tipo_lbl  = _stop_data.get("tipo_stop", "Normal")
+                _stop_razon_lbl = _stop_data.get("razon", "")
+                _stop_estricto_flag = "Estricto" in _stop_tipo_lbl
 
                 # Determinar semáforo de gestión
                 if pnl_pos >= 40:
                     gest_color = G; gest_emoji = "🟢"
                     gest_titulo = "Ganancia sólida"
-                    gest_msg = f"Tramo 1 ejecutado? Si no, vender 30% ahora. Dejar runner."
+                    gest_msg = "Tramo 1 ejecutado? Si no, vender 30% ahora. Dejar runner."
                 elif pnl_pos >= 20:
                     gest_color = G; gest_emoji = "🟢"
                     gest_titulo = "Objetivo 1 alcanzado"
@@ -11290,6 +11858,8 @@ También puedes descargar la plantilla de abajo y completarla.
                     gest_color = R; gest_emoji = "🔴"
                     gest_titulo = "En pérdida moderada"
                     gest_msg = "Revisar catalizador. ¿Sigue válido? Si no, evaluar salida."
+                    if _stop_estricto_flag:
+                        gest_msg += f" ⚠️ Stop {_stop_data.get('stop_pct',0):.0f}% — señal tardía al entrar."
                 else:
                     gest_color = R; gest_emoji = "🔴"
                     gest_titulo = "Pérdida alta - acción requerida"
@@ -11319,18 +11889,37 @@ También puedes descargar la plantilla de abajo y completarla.
                     f'</div>'
                     f'</div>', unsafe_allow_html=True)
             with cd3:
-                # Objetivos - usar _tipo_pos ya calculado arriba
-                _beta_p = float(r.get("Beta", 1.5))
-                if _tipo_pos=="ETF_Cripto":   stop_val=pc*0.80; obj1=pc*1.30; obj2=pc*1.60; obj3=pc*2.00
-                elif _tipo_pos=="ETF_Indice": stop_val=pc*0.88; obj1=pc*1.15; obj2=pc*1.25; obj3=pc*1.40
-                elif _tipo_pos=="ETF_Sectorial": stop_val=pc*0.90; obj1=pc*1.20; obj2=pc*1.40; obj3=pc*1.60
-                elif _beta_p < 1.5:           stop_val=pc*0.88; obj1=pc*1.15; obj2=pc*1.25; obj3=pc*1.40
-                elif _beta_p < 2.5:           stop_val=pc*0.90; obj1=pc*1.20; obj2=pc*1.40; obj3=pc*1.60
-                else:                         stop_val=pc*0.82; obj1=pc*1.25; obj2=pc*1.50; obj3=pc*1.80
-                stop_pct = (stop_val/pa-1)*100 if pa>0 else 0
-                obj1_pct  = (obj1/pa-1)*100 if pa>0 else 0
-                obj2_pct  = (obj2/pa-1)*100 if pa>0 else 0
-                obj3_pct  = (obj3/pa-1)*100 if pa>0 else 0
+                # Objetivos y stop - usar _tipo_pos ya calculado arriba
+                _beta_p    = float(r.get("Beta", 1.5))
+                _score_e   = float(r.get("Score", 0) or 0)
+                _prob_e    = float(r.get("Prob_NBIS", 0) or 0)
+                _cat_e     = str(r.get("Cat_Fecha", "-"))
+                # Detectar si entró con earnings próximos
+                _fue_earnings = False
+                try:
+                    import datetime as _dt_sp
+                    if _cat_e not in ("-","","nan"):
+                        _dias_entry = abs((
+                            _dt_sp.date.today() -
+                            _dt_sp.date.fromisoformat(_cat_e[:10])
+                        ).days)
+                        _fue_earnings = _dias_entry <= 5
+                except Exception:
+                    pass
+
+                _stop_data = calcular_stop_tipo(
+                    pc=pc, tipo=_tipo_pos, beta=_beta_p,
+                    score_entrada=_score_e, prob_entrada=_prob_e,
+                    tenia_earnings=_fue_earnings, pnl_pct=pnl_pct)
+
+                stop_val  = _stop_data["stop_val"]
+                obj1      = _stop_data["obj1"]
+                obj2      = _stop_data["obj2"]
+                obj3      = _stop_data["obj3"]
+                stop_pct  = (stop_val/pa-1)*100 if pa > 0 and stop_val > 0 else 0
+                obj1_pct  = (obj1/pa-1)*100 if pa > 0 else 0
+                obj2_pct  = (obj2/pa-1)*100 if pa > 0 else 0
+                obj3_pct  = (obj3/pa-1)*100 if pa > 0 else 0
 
                 def obj_color(pct):
                     return G if pct <= 0 else A if pct <= 20 else C
@@ -11460,11 +12049,24 @@ También puedes descargar la plantilla de abajo y completarla.
                 tk, str(r.get("Cat_Fecha","-")), G, R, A, TXT_MUT, BOR)
             if _en_card_mv:
                 st.markdown(_en_card_mv, unsafe_allow_html=True)
+            # v19: Badge Pullback P3 (en posición abierta)
+            _pb_pos_dd  = float(str(r.get("DD_pico", 0) or 0).replace(",","."))
+            _pb_pos_rsi = float(str(r.get("RSI", 50) or 50).replace(",","."))
+            _pb_pos_ema = float(str(r.get("EMA50", 0) or 0).replace(",","."))
+            _pb_pos_vol = float(str(r.get("Volumen", 100) or 100).replace(",","."))
+            _pb_pos_html = render_pullback_badge(
+                tk, _pb_pos_dd, _pb_pos_rsi, _pb_pos_ema, 0, _pb_pos_vol,
+                G, R, A, C, TXT_MUT,
+                tiene_posicion=True, pnl_pct=pnl_pct)
+            if _pb_pos_html:
+                st.markdown(_pb_pos_html, unsafe_allow_html=True)
+
             # v19: Panel de Recompra
             if pnl_pct >= 5:
                 _recompra_data = calcular_señal_recompra(
                     ticker=tk, precio_entrada=pc,
-                    pnl_pct=pnl_pct, tipo=str(pos.get("Tipo","Accion")))
+                    pnl_pct=pnl_pct, tipo=str(pos.get("Tipo","Accion")),
+                    cat_fecha=str(r.get("Cat_Fecha","-")))
                 _recompra_html = render_panel_recompra(
                     _recompra_data, str(pos.get("Tipo","Accion")),
                     G, R, A, C, TXT, TXT_MUT, BOR)
@@ -12012,11 +12614,24 @@ with tab7:
                 tk, str(r.get("Cat_Fecha","-")), G, R, A, TXT_MUT, BOR)
             if _en_card_amp:
                 st.markdown(_en_card_amp, unsafe_allow_html=True)
+            # v19: Badge Pullback P3 Amparito
+            _pb_amp_dd  = float(str(r.get("DD_pico", 0) or 0).replace(",","."))
+            _pb_amp_rsi = float(str(r.get("RSI", 50) or 50).replace(",","."))
+            _pb_amp_ema = float(str(r.get("EMA50", 0) or 0).replace(",","."))
+            _pb_amp_vol = float(str(r.get("Volumen", 100) or 100).replace(",","."))
+            _pb_amp_html = render_pullback_badge(
+                tk, _pb_amp_dd, _pb_amp_rsi, _pb_amp_ema, 0, _pb_amp_vol,
+                G, R, A, C, TXT_MUT,
+                tiene_posicion=True, pnl_pct=pnl_pct)
+            if _pb_amp_html:
+                st.markdown(_pb_amp_html, unsafe_allow_html=True)
+
             # v19: Panel de Recompra
             if pnl_pct >= 5:
                 _recompra_data_a = calcular_señal_recompra(
                     ticker=tk, precio_entrada=pc,
-                    pnl_pct=pnl_pct, tipo=str(pos.get("Tipo","Accion")))
+                    pnl_pct=pnl_pct, tipo=str(pos.get("Tipo","Accion")),
+                    cat_fecha=str(r.get("Cat_Fecha","-")))
                 _recompra_html_a = render_panel_recompra(
                     _recompra_data_a, str(pos.get("Tipo","Accion")),
                     G, R, A, C, TXT, TXT_MUT, BOR)
