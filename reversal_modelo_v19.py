@@ -13051,8 +13051,136 @@ with tab8:
 
 # ══ TAB 9 - BACKTESTING REAL + DASHBOARD RENDIMIENTO v16 ══════
 with tab9:
-    # ══ TAB 9 — BACKTESTING Y ATR SIZING v18 ══════════════════
-    # Explicación clara de para qué sirve cada sección
+    # ══ TAB 9 — BACKTESTING Y ATR SIZING v19 ══════════════════
+
+    # ══ v19: TABLA WR POR SECTOR — basado en trades REALES ════════
+    st.markdown(
+        f'<div style="font-size:15px;font-weight:800;color:{TXT};margin:16px 0 10px">'
+        f'📊 Win Rate por Sector — Trades reales de tus posiciones</div>',
+        unsafe_allow_html=True)
+
+    # Leer las 3 carteras y combinar posiciones CERRADAS
+    _wr_frames = []
+    for _wr_sheet, _wr_label in [
+        (_SHEET_NAME_MAURI,    "MVALLE"),
+        (_SHEET_NAME_AMPARITO, "Amparito"),
+        (_SHEET_NAME_GREKO,    "Greko"),
+    ]:
+        try:
+            _df_wr = leer_posiciones_sheets(_wr_sheet)
+            if _df_wr is not None and not _df_wr.empty:
+                _df_wr["_cartera"] = _wr_label
+                _wr_frames.append(_df_wr)
+        except Exception:
+            pass
+
+    if _wr_frames:
+        import pandas as _pd_wr
+        _df_all = _pd_wr.concat(_wr_frames, ignore_index=True)
+        _df_all = _normalizar_precios_df(_df_all)
+
+        # Solo posiciones CERRADAS (tienen Precio_Salida > 0)
+        if "Precio_Salida" in _df_all.columns and "Precio_Compra" in _df_all.columns:
+            _df_all["Precio_Salida"] = _pd_wr.to_numeric(_df_all["Precio_Salida"], errors="coerce")
+            _df_all["Precio_Compra"] = _pd_wr.to_numeric(_df_all["Precio_Compra"], errors="coerce")
+            _df_cerradas = _df_all[
+                _df_all["Precio_Salida"].notna() &
+                (_df_all["Precio_Salida"] > 0)
+            ].copy()
+
+            if not _df_cerradas.empty:
+                _df_cerradas["Retorno_%"] = (
+                    (_df_cerradas["Precio_Salida"] - _df_cerradas["Precio_Compra"])
+                    / _df_cerradas["Precio_Compra"] * 100
+                ).round(1)
+                _df_cerradas["Ganadora"] = _df_cerradas["Retorno_%"] > 0
+
+                # Agrupar por Area (sector)
+                _area_col = "Area" if "Area" in _df_cerradas.columns else None
+                if _area_col:
+                    _wr_by_sector = (
+                        _df_cerradas.groupby(_area_col)
+                        .agg(
+                            Señales  = ("Ticker",   "count"),
+                            Ganadoras= ("Ganadora",  "sum"),
+                            Avg_Ret  = ("Retorno_%", "mean"),
+                            Max_Ret  = ("Retorno_%", "max"),
+                            Min_Ret  = ("Retorno_%", "min"),
+                        )
+                        .reset_index()
+                    )
+                    _wr_by_sector["WR_%"] = (
+                        _wr_by_sector["Ganadoras"] / _wr_by_sector["Señales"] * 100
+                    ).round(0).astype(int)
+                    _wr_by_sector["Avg_Ret"] = _wr_by_sector["Avg_Ret"].round(1)
+                    _wr_by_sector = _wr_by_sector.sort_values("WR_%", ascending=False)
+
+                    # Renderizar tabla
+                    _wr_rows = ""
+                    for _, _rw in _wr_by_sector.iterrows():
+                        _wr_pct  = int(_rw["WR_%"])
+                        _wr_c    = G if _wr_pct >= 70 else A if _wr_pct >= 50 else R
+                        _wr_bg   = G_BG if _wr_pct >= 70 else A_BG if _wr_pct >= 50 else R_BG
+                        _ret_c   = G if _rw["Avg_Ret"] > 0 else R
+                        _sector  = str(_rw[_area_col])
+                        _wr_rows += (
+                            f'<tr style="background:{_wr_bg}">'
+                            f'<td style="font-weight:700;color:{TXT}">{_sector}</td>'
+                            f'<td style="text-align:center">{int(_rw["Señales"])}</td>'
+                            f'<td style="text-align:center">{int(_rw["Ganadoras"])}</td>'
+                            f'<td style="text-align:center;font-weight:800;color:{_wr_c}">'
+                            f'{_wr_pct}%</td>'
+                            f'<td style="text-align:center;color:{_ret_c}">'
+                            f'{_rw["Avg_Ret"]:+.1f}%</td>'
+                            f'<td style="text-align:center;color:{G}">'
+                            f'{_rw["Max_Ret"]:+.1f}%</td>'
+                            f'<td style="text-align:center;color:{R}">'
+                            f'{_rw["Min_Ret"]:+.1f}%</td>'
+                            f'</tr>'
+                        )
+
+                    # Totales
+                    _tot_sen = len(_df_cerradas)
+                    _tot_gan = int(_df_cerradas["Ganadora"].sum())
+                    _tot_wr  = round(_tot_gan/_tot_sen*100) if _tot_sen > 0 else 0
+                    _tot_ret = round(_df_cerradas["Retorno_%"].mean(), 1)
+
+                    st.markdown(
+                        f'<div class="tbl-wrap">'
+                        f'<table class="dtbl">'
+                        f'<thead><tr>'
+                        f'<th>Sector / Área</th><th>Señales</th><th>Ganadoras</th>'
+                        f'<th>WR%</th><th>Avg Retorno</th><th>Mejor</th><th>Peor</th>'
+                        f'</tr></thead>'
+                        f'<tbody>{_wr_rows}</tbody>'
+                        f'<tfoot><tr style="font-weight:800;border-top:2px solid {BOR}">'
+                        f'<td>TOTAL</td>'
+                        f'<td style="text-align:center">{_tot_sen}</td>'
+                        f'<td style="text-align:center">{_tot_gan}</td>'
+                        f'<td style="text-align:center;color:{G if _tot_wr>=60 else R}">{_tot_wr}%</td>'
+                        f'<td style="text-align:center;color:{G if _tot_ret>0 else R}">{_tot_ret:+.1f}%</td>'
+                        f'<td></td><td></td></tr></tfoot>'
+                        f'</table></div>',
+                        unsafe_allow_html=True)
+
+                    # Recomendación automática
+                    _mejores = _wr_by_sector[_wr_by_sector["WR_%"] >= 70]["Area"].tolist()
+                    _peores  = _wr_by_sector[_wr_by_sector["WR_%"] < 40]["Area"].tolist()
+                    if _mejores:
+                        st.success(f"🎯 **Sectores con mayor WR:** {', '.join(_mejores[:3])} — concentrar señales aquí")
+                    if _peores:
+                        st.warning(f"⚠️ **Sectores con bajo WR:** {', '.join(_peores[:3])} — revisar criterios o evitar")
+                else:
+                    st.info("ℹ️ Agrega la columna 'Area' en tus Sheets de posiciones para ver WR por sector.")
+            else:
+                st.info("ℹ️ Sin posiciones cerradas aún. El WR por sector aparecerá cuando registres salidas.")
+        else:
+            st.info("ℹ️ Las posiciones necesitan las columnas Precio_Compra y Precio_Salida.")
+    else:
+        st.info("ℹ️ Conecta las planillas de posiciones para ver el análisis de WR por sector.")
+
+    st.divider()
+    # ══════════════════════════════════════════════════════════════
 
     st.markdown(
         f'<div style="background:#F0FDF4;border:2px solid #86EFAC;border-radius:14px;'
