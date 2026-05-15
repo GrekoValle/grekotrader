@@ -9220,7 +9220,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                         return True
                 _wl_filtros = _wl_filtros[_wl_filtros["Cat_Fecha"].apply(_earn_ok)]
 
-            _tickers_aptos = set(_wl_filtros["Ticker"].tolist())
+            _tickers_aptos = set(_wl_filtros["Ticker"].tolist()) if not _wl_filtros.empty and "Ticker" in _wl_filtros.columns else set()
             _n_aptos = len(_tickers_aptos)
 
             # Agregar columna que indica si cumple filtros
