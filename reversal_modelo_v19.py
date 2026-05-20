@@ -1395,6 +1395,17 @@ def calcular_señal_recompra(
         vol_hoy  = float(vol[-1])
         vol_bajo = vol_hoy < avg_vol * 0.9  # vol bajo = pullback sano
 
+        # v19: Días alcistas consecutivos (detectar rebote activo)
+        _dias_alcistas = 0
+        for _ci in range(len(close)-1, max(0, len(close)-8), -1):
+            if close[_ci] > close[_ci-1]:
+                _dias_alcistas += 1
+            else:
+                break
+
+        # Pre-market proxy: comparar último close vs close anterior
+        _premia_pct = round((float(close[-1]) - float(close[-2])) / float(close[-2]) * 100, 1)
+
         # ── Stops según tipo ──────────────────────────────────
         stop_pct = {
             "Accion":        -7.0,
@@ -1402,6 +1413,74 @@ def calcular_señal_recompra(
             "ETF_Indice":    -12.0,
             "ETF_Cripto":    -18.0,
         }.get(tipo, -7.0)
+
+        # ── ESCENARIO 2: Posición en PÉRDIDA + rebote activo ─────
+        # "Promediar a la baja" cuando el rebote está confirmado
+        if pnl_pct < 0 and pnl_pct >= -20:
+            _rebote_ok = (
+                _dias_alcistas >= 2 and   # rebote iniciado
+                48 <= rsi <= 65 and        # RSI válido, no cayendo
+                sobre_ema20 and            # tendencia no rota
+                not rsi_baja               # RSI subiendo
+            )
+            if _rebote_ok:
+                # Calcular precio promedio si agrega 40%
+                _agregar_pct = 0.40
+                _precio_prom = round(
+                    (precio_entrada + precio_actual * _agregar_pct) /
+                    (1 + _agregar_pct), 2)
+                _stop_comb   = round(_precio_prom * (1 + stop_pct/100), 2)
+                _breakeven   = round(_precio_prom * 1.005, 2)  # casi breakeven
+                _target      = round(precio_entrada * 1.05, 2) # recuperar + 5%
+
+                return {
+                    "señal":           "promedio_baja",
+                    "calidad":         "REBOTE ACTIVO",
+                    "emoji_calidad":   "⚡",
+                    "precio_actual":   precio_actual,
+                    "precio_promedio": _precio_prom,
+                    "stop_combinado":  _stop_comb,
+                    "breakeven":       _breakeven,
+                    "target":          _target,
+                    "rsi":             rsi,
+                    "dd_max":          dd_max,
+                    "dias_alcistas":   _dias_alcistas,
+                    "ema_ok":          sobre_ema20,
+                    "vol_bajo":        vol_bajo,
+                    "descripcion":     (
+                        f"{_dias_alcistas} días alcistas consecutivos · "
+                        f"RSI {rsi} subiendo · EMA20 respetada. "
+                        f"Agregar 40% reduce precio promedio a ${_precio_prom:.2f}. "
+                        f"Stop combinado: ${_stop_comb:.2f} · "
+                        f"Target recuperación: ${_target:.2f}"
+                    ),
+                }
+            else:
+                # Escenario 3: pérdida sin rebote — no actuar
+                _razon_no = (
+                    f"RSI {rsi} cayendo" if rsi_baja else
+                    f"Solo {_dias_alcistas} día(s) alcista(s) — esperar confirmación" if _dias_alcistas < 2 else
+                    "EMA20 rota — tendencia comprometida" if not sobre_ema20 else
+                    f"RSI {rsi} fuera de zona válida"
+                )
+                return {
+                    "señal":  "no_promediar",
+                    "razon":  f"Posición en pérdida {pnl_pct:+.1f}% — {_razon_no}. "
+                              f"Esperar {max(0, 2-_dias_alcistas)} día(s) más alcistas antes de agregar.",
+                    "rsi":    rsi,
+                    "dd_max": dd_max,
+                    "dias_alcistas": _dias_alcistas,
+                }
+
+        # ── ESCENARIO 3 extremo: pérdida > -20% — nunca promediar ──
+        if pnl_pct < -20:
+            return {
+                "señal":  "no_promediar",
+                "razon":  f"Pérdida {pnl_pct:+.1f}% — demasiado profunda para promediar. "
+                          f"Evaluar salida y re-entrada cuando el precio estabilice.",
+                "rsi":    rsi,
+                "dd_max": dd_max,
+            }
 
         # ── Evaluar condiciones ───────────────────────────────
         cond_pnl      = pnl_pct >= 15
@@ -2008,6 +2087,49 @@ def render_panel_recompra(
     v19: Renderiza el panel de recompra para una posición.
     """
     señal = recompra.get("señal", "")
+
+    if señal == "promedio_baja":
+        _dias = recompra.get("dias_alcistas", 0)
+        return (
+            f'<div style="background:#EFF6FF;border:2px solid #93C5FD;'
+            f'border-left:4px solid #2563EB;border-radius:10px;'
+            f'padding:10px 14px;margin-top:8px">'
+            f'<div style="font-size:12px;font-weight:800;color:#2563EB;margin-bottom:6px">'
+            f'⚡ PROMEDIAR A LA BAJA — {_dias} días alcistas · rebote confirmado</div>'
+            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:8px">'
+            f'<div style="text-align:center">'
+            f'<div style="font-size:9px;color:{TXT_MUT}">Precio actual</div>'
+            f'<div style="font-size:13px;font-weight:700;color:{TXT}">${recompra.get("precio_actual",0):.2f}</div></div>'
+            f'<div style="text-align:center">'
+            f'<div style="font-size:9px;color:{TXT_MUT}">Precio prom. nuevo</div>'
+            f'<div style="font-size:13px;font-weight:700;color:#2563EB">${recompra.get("precio_promedio",0):.2f}</div></div>'
+            f'<div style="text-align:center">'
+            f'<div style="font-size:9px;color:{TXT_MUT}">Stop combinado</div>'
+            f'<div style="font-size:13px;font-weight:700;color:{R}">${recompra.get("stop_combinado",0):.2f}</div></div>'
+            f'<div style="text-align:center">'
+            f'<div style="font-size:9px;color:{TXT_MUT}">Target recuperación</div>'
+            f'<div style="font-size:13px;font-weight:700;color:{G}">${recompra.get("target",0):.2f}</div></div>'
+            f'</div>'
+            f'<div style="font-size:10px;color:#374151;line-height:1.7">'
+            f'{recompra.get("descripcion","")}</div>'
+            f'<div style="font-size:10px;font-weight:600;color:#2563EB;margin-top:4px">'
+            f'Agregar máx 40% posición original · '
+            f'RSI {recompra.get("rsi",0)} · '
+            f'{"Vol ↓ sano" if recompra.get("vol_bajo") else "Vol ↑ vigilar"}'
+            f'</div></div>'
+        )
+
+    if señal == "no_promediar":
+        return (
+            f'<div style="background:#FEF3C7;border:1px solid #FCD34D;'
+            f'border-left:3px solid #D97706;border-radius:8px;'
+            f'padding:8px 12px;margin-top:6px">'
+            f'<div style="font-size:11px;font-weight:700;color:#D97706;margin-bottom:3px">'
+            f'⏳ No promediar aún</div>'
+            f'<div style="font-size:10px;color:#374151">'
+            f'{recompra.get("razon","")}</div>'
+            f'</div>'
+        )
 
     if señal == "recompra_pre_earnings":
         return (
@@ -10843,13 +10965,36 @@ También puedes descargar la plantilla de abajo y completarla.
                     f'<span style="color:{TXT_MUT}">MACD</span><span style="color:{G if r["MACD"]>0 else R};font-weight:700">{r["MACD"]:+.2f}</span>'
                     f'<span style="color:{TXT_MUT}">Volumen</span><span style="color:{c_vol(r["Volumen"]/100)};font-weight:700">{r["Volumen"]}%</span>'
                     f'<span style="color:{TXT_MUT}">Beta</span><span style="color:{TXT};font-weight:700">{r["Beta"]}</span>'
-                    f'<span style="color:{TXT_MUT}">Pre-Mkt</span><span style="color:{c_pre(r["Pre_Move"])};font-weight:700">+{r["Pre_Move"]:.1f}%</span>'
+                    f'<span style="color:{TXT_MUT}">Pre-Mkt</span><span style="color:{c_pre(r["Pre_Move"])};font-weight:700">{r["Pre_Move"]:+.1f}%</span>'
                     f'<span style="color:{TXT_MUT}">Vol Pre</span><span style="color:{c_vol(r["Pre_Vol"])};font-weight:700">{r["Pre_Vol"]:.1f}x</span>'
+                    f'<span style="color:{TXT_MUT}">Post-Mkt</span>'
+                    f'<span style="color:{c_pre(r.get("Post_Move",0))};font-weight:700">{r.get("Post_Move",0):+.1f}%</span>'
+                    f'<span style="color:{TXT_MUT}">DD desde pico</span>'
+                    f'<span style="color:{R if float(r.get("DD_pico",0)) < -15 else A if float(r.get("DD_pico",0)) < -8 else G};font-weight:700">{float(r.get("DD_pico",0)):+.1f}%</span>'
                     f'</div></div>',unsafe_allow_html=True)
             with cd2:
                 # Señal de gestión de posición - no score de entrada
                 rsi_pos = r["RSI"]
                 pnl_pos = pnl_pct
+
+                # v19: calcular _stop_data antes de usarlo
+                _beta_p_cd2   = float(r.get("Beta", 1.5))
+                _score_e_cd2  = float(r.get("Score", 0) or 0)
+                _prob_e_cd2   = float(r.get("Prob_NBIS", 0) or 0)
+                _cat_e_cd2    = str(r.get("Cat_Fecha", "-"))
+                _fue_earn_cd2 = False
+                try:
+                    import datetime as _dt_cd2
+                    if _cat_e_cd2 not in ("-","","nan"):
+                        _fue_earn_cd2 = abs((_dt_cd2.date.today() -
+                            _dt_cd2.date.fromisoformat(_cat_e_cd2[:10])).days) <= 5
+                except Exception:
+                    pass
+                _stop_data = calcular_stop_tipo(
+                    pc=pc, tipo=_tipo_pos, beta=_beta_p_cd2,
+                    score_entrada=_score_e_cd2, prob_entrada=_prob_e_cd2,
+                    tenia_earnings=_fue_earn_cd2, pnl_pct=pnl_pct)
+
                 # v19: stop type labels
                 _stop_tipo_lbl  = _stop_data.get("tipo_stop", "Normal")
                 _stop_razon_lbl = _stop_data.get("razon", "")
@@ -11825,13 +11970,36 @@ También puedes descargar la plantilla de abajo y completarla.
                     f'<span style="color:{TXT_MUT}">MACD</span><span style="color:{G if r["MACD"]>0 else R};font-weight:700">{r["MACD"]:+.2f}</span>'
                     f'<span style="color:{TXT_MUT}">Volumen</span><span style="color:{c_vol(r["Volumen"]/100)};font-weight:700">{r["Volumen"]}%</span>'
                     f'<span style="color:{TXT_MUT}">Beta</span><span style="color:{TXT};font-weight:700">{r["Beta"]}</span>'
-                    f'<span style="color:{TXT_MUT}">Pre-Mkt</span><span style="color:{c_pre(r["Pre_Move"])};font-weight:700">+{r["Pre_Move"]:.1f}%</span>'
+                    f'<span style="color:{TXT_MUT}">Pre-Mkt</span><span style="color:{c_pre(r["Pre_Move"])};font-weight:700">{r["Pre_Move"]:+.1f}%</span>'
                     f'<span style="color:{TXT_MUT}">Vol Pre</span><span style="color:{c_vol(r["Pre_Vol"])};font-weight:700">{r["Pre_Vol"]:.1f}x</span>'
+                    f'<span style="color:{TXT_MUT}">Post-Mkt</span>'
+                    f'<span style="color:{c_pre(r.get("Post_Move",0))};font-weight:700">{r.get("Post_Move",0):+.1f}%</span>'
+                    f'<span style="color:{TXT_MUT}">DD desde pico</span>'
+                    f'<span style="color:{R if float(r.get("DD_pico",0)) < -15 else A if float(r.get("DD_pico",0)) < -8 else G};font-weight:700">{float(r.get("DD_pico",0)):+.1f}%</span>'
                     f'</div></div>',unsafe_allow_html=True)
             with cd2:
                 # Señal de gestión de posición - no score de entrada
                 rsi_pos = r["RSI"]
                 pnl_pos = pnl_pct
+
+                # v19: calcular _stop_data antes de usarlo
+                _beta_p_cd2   = float(r.get("Beta", 1.5))
+                _score_e_cd2  = float(r.get("Score", 0) or 0)
+                _prob_e_cd2   = float(r.get("Prob_NBIS", 0) or 0)
+                _cat_e_cd2    = str(r.get("Cat_Fecha", "-"))
+                _fue_earn_cd2 = False
+                try:
+                    import datetime as _dt_cd2
+                    if _cat_e_cd2 not in ("-","","nan"):
+                        _fue_earn_cd2 = abs((_dt_cd2.date.today() -
+                            _dt_cd2.date.fromisoformat(_cat_e_cd2[:10])).days) <= 5
+                except Exception:
+                    pass
+                _stop_data = calcular_stop_tipo(
+                    pc=pc, tipo=_tipo_pos, beta=_beta_p_cd2,
+                    score_entrada=_score_e_cd2, prob_entrada=_prob_e_cd2,
+                    tenia_earnings=_fue_earn_cd2, pnl_pct=pnl_pct)
+
                 # v19: stop type labels
                 _stop_tipo_lbl  = _stop_data.get("tipo_stop", "Normal")
                 _stop_razon_lbl = _stop_data.get("razon", "")
@@ -12603,6 +12771,22 @@ with tab7:
 
 
             # Tren de Arrastre — datos en Sheet GrekoTrader_Sympathy (próximamente)
+
+            # v19: Indicadores actuales en Amparito
+            st.markdown(
+                f'<div style="background:{BG_HEAD};border-radius:10px;padding:10px;margin-top:6px">'
+                f'<div style="font-size:11px;font-weight:700;color:{TXT};margin-bottom:6px">Indicadores actuales</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:11px">'
+                f'<span style="color:{TXT_MUT}">RSI</span><span style="color:{c_rsi(r["RSI"])};font-weight:700">{r["RSI"]}</span>'
+                f'<span style="color:{TXT_MUT}">MACD</span><span style="color:{G if r["MACD"]>0 else R};font-weight:700">{r["MACD"]:+.2f}</span>'
+                f'<span style="color:{TXT_MUT}">Volumen</span><span style="color:{c_vol(r["Volumen"]/100)};font-weight:700">{r["Volumen"]}%</span>'
+                f'<span style="color:{TXT_MUT}">Beta</span><span style="color:{TXT};font-weight:700">{r["Beta"]}</span>'
+                f'<span style="color:{TXT_MUT}">Pre-Mkt</span><span style="color:{c_pre(r["Pre_Move"])};font-weight:700">{r["Pre_Move"]:+.1f}%</span>'
+                f'<span style="color:{TXT_MUT}">Vol Pre</span><span style="color:{c_vol(r["Pre_Vol"])};font-weight:700">{r["Pre_Vol"]:.1f}x</span>'
+                f'<span style="color:{TXT_MUT}">Post-Mkt</span><span style="color:{c_pre(r.get("Post_Move",0))};font-weight:700">{r.get("Post_Move",0):+.1f}%</span>'
+                f'<span style="color:{TXT_MUT}">DD desde pico</span><span style="color:{R if float(r.get("DD_pico",0)) < -15 else A if float(r.get("DD_pico",0)) < -8 else G};font-weight:700">{float(r.get("DD_pico",0)):+.1f}%</span>'
+                f'</div></div>',
+                unsafe_allow_html=True)
 
             st.markdown(
                 render_nbis_panel(r.get("Prob_NBIS",0), r.get("Sim_NBIS",0),
