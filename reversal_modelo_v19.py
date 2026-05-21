@@ -1893,10 +1893,11 @@ def calcular_stop_tipo(
     pc: float,              # precio de compra
     tipo: str,              # Accion, ETF_Cripto, ETF_Indice, ETF_Sectorial
     beta: float,            # beta de la acción
-    score_entrada: float = 0,    # score al momento de entrar
-    prob_entrada: float = 0,     # prob_nbis al momento de entrar
-    tenia_earnings: bool = False, # si entró en ventana de earnings
-    pnl_pct: float = 0,         # ganancia actual para trailing stop
+    score_entrada: float = 0,
+    prob_entrada: float = 0,
+    tenia_earnings: bool = False,
+    pnl_pct: float = 0,
+    pa: float = 0,          # v19 FIX: precio actual para calcular targets reales
 ) -> dict:
     """
     v19: Calcula el stop loss según 3 tipos:
@@ -1924,32 +1925,42 @@ def calcular_stop_tipo(
     _stop_estricto = _es_tardio or _es_earnings
 
     # ── ETFs: reglas fijas ────────────────────────────────────
+    # v19 FIX: targets desde precio ACTUAL (pa), no desde precio de compra (pc)
+    # Si pa no se pasa, usar pc como fallback
+    _pa = pa if pa > 0 else pc
+    _stop_activado = pa > 0 and pa < pc * 0.85  # posición en pérdida significativa
+
     if tipo == "ETF_Indice":
         return {
             "stop_pct":   0,
             "stop_val":   0,
             "tipo_stop":  "Sin stop — mantener siempre",
             "etiqueta":   "📊 ETF Índice — nunca vender",
-            "obj1": pc*1.15, "obj2": pc*1.25, "obj3": pc*1.40,
-            "razon": "Los ETF de índice no se venden por señal técnica"
+            "obj1": _pa*1.15, "obj2": _pa*1.25, "obj3": _pa*1.40,
+            "razon": "Los ETF de índice no se venden por señal técnica",
+            "stop_activado": False,
         }
     elif tipo == "ETF_Cripto":
         pct = -20.0
+        _sv = pc*(1+pct/100)
         return {
-            "stop_pct": pct, "stop_val": pc*(1+pct/100),
+            "stop_pct": pct, "stop_val": _sv,
             "tipo_stop": "Normal ETF Cripto",
             "etiqueta":  f"🛑 Stop Cripto ({pct:.0f}%)",
-            "obj1": pc*1.30, "obj2": pc*1.60, "obj3": pc*2.00,
-            "razon": "Alta volatilidad cripto — stop amplio necesario"
+            "obj1": _pa*1.20, "obj2": _pa*1.50, "obj3": _pa*2.00,
+            "razon": "Alta volatilidad cripto — stop amplio",
+            "stop_activado": pa > 0 and pa < _sv,
         }
     elif tipo == "ETF_Sectorial":
         pct = -12.0
+        _sv = pc*(1+pct/100)
         return {
-            "stop_pct": pct, "stop_val": pc*(1+pct/100),
+            "stop_pct": pct, "stop_val": _sv,
             "tipo_stop": "Normal ETF Sectorial",
             "etiqueta":  f"🛑 Stop ETF ({pct:.0f}%)",
-            "obj1": pc*1.20, "obj2": pc*1.40, "obj3": pc*1.60,
-            "razon": "ETF sectorial — stop estándar -12%"
+            "obj1": _pa*1.10, "obj2": _pa*1.25, "obj3": _pa*1.50,
+            "razon": "ETF sectorial — stop estándar -12%",
+            "stop_activado": pa > 0 and pa < _sv,
         }
 
     # ── Acciones: según contexto ──────────────────────────────
@@ -1957,33 +1968,35 @@ def calcular_stop_tipo(
         pct = -5.0
         tipo_lbl = "Estricto"
         if _es_tardio:
-            razon = f"Señal tardía (Score {score_entrada:.0f} > 55 o Prob {prob_entrada:.0f}% > 50%) — menos margen de error"
+            razon = f"Señal tardía (Score {score_entrada:.0f} > 55 o Prob {prob_entrada:.0f}% > 50%)"
         else:
-            razon = "Entrada con earnings próximos — stop ajustado como entrada especulativa"
-        obj1 = pc*1.10; obj2 = pc*1.20; obj3 = pc*1.35
+            razon = "Entrada con earnings próximos — stop ajustado"
+        obj1 = _pa*1.08; obj2 = _pa*1.15; obj3 = _pa*1.25
     elif beta < 1.5:
         pct = -7.0
         tipo_lbl = "Normal beta bajo"
-        razon = f"Acción estable (Beta {beta:.1f}) — stop estándar"
-        obj1 = pc*1.15; obj2 = pc*1.25; obj3 = pc*1.40
+        razon = f"Acción estable (Beta {beta:.1f})"
+        obj1 = _pa*1.10; obj2 = _pa*1.20; obj3 = _pa*1.35
     elif beta < 2.5:
         pct = -10.0
         tipo_lbl = "Normal beta medio"
-        razon = f"Acción moderada (Beta {beta:.1f}) — stop ajustado"
-        obj1 = pc*1.20; obj2 = pc*1.40; obj3 = pc*1.60
+        razon = f"Acción moderada (Beta {beta:.1f})"
+        obj1 = _pa*1.12; obj2 = _pa*1.25; obj3 = _pa*1.45
     else:
         pct = -12.0
         tipo_lbl = "Normal beta alto"
-        razon = f"Acción volátil (Beta {beta:.1f}) — stop amplio"
-        obj1 = pc*1.25; obj2 = pc*1.50; obj3 = pc*1.80
+        razon = f"Acción volátil (Beta {beta:.1f})"
+        obj1 = _pa*1.15; obj2 = _pa*1.30; obj3 = _pa*1.60
 
+    _sv_acc = round(pc * (1 + pct/100), 2)
     return {
         "stop_pct":  pct,
-        "stop_val":  round(pc * (1 + pct/100), 2),
+        "stop_val":  _sv_acc,
         "tipo_stop": tipo_lbl,
         "etiqueta":  f"🛑 Stop {'⚠️ Estricto' if _stop_estricto else 'Normal'} ({pct:.0f}%)",
         "razon":     razon,
         "obj1": round(obj1,2), "obj2": round(obj2,2), "obj3": round(obj3,2),
+        "stop_activado": pa > 0 and pa < _sv_acc,
     }
 
 def render_pullback_badge(ticker: str, dd: float, rsi: float, ema_d: float,
@@ -6441,7 +6454,8 @@ def escribir_trade_sheets(
     fue_correcto: str = "-",
     error_modelo: str = "-",
     notas: str = "",
-    area: str = "",    # v18: área del sector (opcional, usa RAW si vacío)
+    area: str = "",
+    rsi_ticker: float = 0,  # v19 B+C: RSI del ticker específico al entrar
 ) -> tuple:
     """
     Escribe una fila en Google Sheets según el tipo de registro.
@@ -6462,7 +6476,6 @@ def escribir_trade_sheets(
         if _spy_cached > 0:
             spy_rsi = _spy_cached
         else:
-            # Fallback: calcular directamente desde yfinance
             import yfinance as _yf_spy2
             import pandas as _pd_spy2
             _spy_h = _yf_spy2.Ticker("SPY").history(period="1mo")
@@ -6474,6 +6487,27 @@ def escribir_trade_sheets(
                 spy_rsi = round(float(100 - 100/(1 + _g2.iloc[-1]/(_l2.iloc[-1]+1e-9))), 1)
     except Exception:
         spy_rsi = ""
+
+    # v19 B: RSI del TICKER específico
+    # Si viene el parámetro → usarlo directamente
+    # Si no → intentar calcular desde yfinance
+    _rsi_tk_final = ""
+    try:
+        if rsi_ticker and float(rsi_ticker) > 0:
+            _rsi_tk_final = round(float(rsi_ticker), 1)
+        else:
+            # Calcular RSI del ticker desde yfinance
+            import yfinance as _yf_rsi_tk
+            import pandas as _pd_rsi_tk
+            _tk_h = _yf_rsi_tk.Ticker(ticker).history(period="1mo")
+            if not _tk_h.empty and len(_tk_h) >= 14:
+                _s_tk = _pd_rsi_tk.Series(_tk_h["Close"].values)
+                _d_tk = _s_tk.diff()
+                _g_tk = _d_tk.clip(lower=0).rolling(14).mean()
+                _l_tk = (-_d_tk.clip(upper=0)).rolling(14).mean()
+                _rsi_tk_final = round(float(100 - 100/(1 + _g_tk.iloc[-1]/(_l_tk.iloc[-1]+1e-9))), 1)
+    except Exception:
+        _rsi_tk_final = ""
 
     # Area del ticker — v19: parámetro > Watchlist session_state > RAW > "-"
     _area_write = area if area and area not in ("-","","nan") else ""
@@ -6499,10 +6533,10 @@ def escribir_trade_sheets(
     if not _area_write or _area_write in ("-","","nan"):
         _area_write = "-"
 
-    # v18 fix: orden exacto de columnas del Sheet GrekoTrader_Senales_Modelo
+    # v19: orden columnas GrekoTrader_Senales_Modelo
     # Fecha_Señal | Ticker | Fase | Precio_Entrada | Score | Prob_NBIS |
     # Cat_Fecha | Arrastradas | Lider | Opinion_Trader | Version_Modelo |
-    # SPY_RSI_Dia | Tipo | Notas | Timestamp | Area
+    # SPY_RSI_Dia (= RSI TICKER) | Tipo | Notas | Timestamp | Area | RSI_Mercado
     fila = [
         str(hoy),                               # Fecha_Señal
         ticker,                                 # Ticker
@@ -6513,14 +6547,14 @@ def escribir_trade_sheets(
         cat_fecha,                              # Cat_Fecha
         arrastradas,                            # Arrastradas
         lider,                                  # Lider
-        # v18: asegurar que Opinion_Trader llega con contenido
         (opinion[:150] if opinion and opinion not in ("-","","nan") else "-"),  # Opinion_Trader
         "v19",                                  # Version_Modelo
-        spy_rsi,                                # SPY_RSI_Dia
+        _rsi_tk_final if _rsi_tk_final else spy_rsi,  # SPY_RSI_Dia → v19: RSI del TICKER
         tipo,                                   # Tipo
         notas,                                  # Notas
         str(hoy),                               # Timestamp
         _area_write,                            # Area
+        spy_rsi,                                # RSI_Mercado (SPY RSI del día) ← NUEVA col
     ]
 
     # v18 fix: usar el Sheet correcto según el tipo de registro
@@ -6832,6 +6866,10 @@ def render_sympathy_panel(ticker: str, pc: float, pa: float,
     if lider in ("-", "", "nan"):
         return ""  # No es sympathy play
 
+    # v19 FIX: si el líder es la misma acción → no hay tren real
+    if str(lider).upper().strip() == str(ticker).upper().strip():
+        return ""  # Líder indefinido, señal inválida
+
     lider_st = get_lider_status(lider)
     lider_color = "#16A34A" if lider_st["activo"] else "#D97706"
     rsi_l  = lider_st.get("rsi", 0)
@@ -6984,6 +7022,7 @@ def render_boton_registro(
                 fue_correcto=_correcto, error_modelo=_error,
                 notas=_notas,
                 area=area,
+                rsi_ticker=float(rsi_ticker) if rsi_ticker else 0,  # v19 B+C
             )
             if ok:
                 st.success(msg)
@@ -9414,6 +9453,8 @@ with tab4:
         for _t4k, _t4v in _symp_data_t4.items():
             _t4l = _t4v["lider"]
             if _t4l in ("-","","nan"): continue
+            # v19 FIX: ignorar si el líder es la misma acción
+            if str(_t4l).upper().strip() == str(_t4k).upper().strip(): continue
             _por_lider_t4.setdefault(_t4l, []).append((_t4k, _t4v))
 
         # Estado líderes y arrastradas en tiempo real
@@ -10993,7 +11034,7 @@ También puedes descargar la plantilla de abajo y completarla.
                 _stop_data = calcular_stop_tipo(
                     pc=pc, tipo=_tipo_pos, beta=_beta_p_cd2,
                     score_entrada=_score_e_cd2, prob_entrada=_prob_e_cd2,
-                    tenia_earnings=_fue_earn_cd2, pnl_pct=pnl_pct)
+                    tenia_earnings=_fue_earn_cd2, pnl_pct=pnl_pct, pa=pa)
 
                 # v19: stop type labels
                 _stop_tipo_lbl  = _stop_data.get("tipo_stop", "Normal")
@@ -11027,6 +11068,17 @@ También puedes descargar la plantilla de abajo y completarla.
                     gest_color = R; gest_emoji = "🔴"
                     gest_titulo = "Pérdida alta - acción requerida"
                     gest_msg = "Stop loss cercano. Evaluar salida inmediata."
+
+                # v19 FIX: alerta si stop ya fue cruzado
+                if _stop_data.get("stop_activado", False):
+                    st.markdown(
+                        f'<div style="background:#FEF2F2;border:2px solid #DC2626;'
+                        f'border-radius:8px;padding:8px 14px;margin-top:6px">'
+                        f'<div style="font-size:12px;font-weight:800;color:#DC2626">'
+                        f'🔴 STOP ACTIVADO — Precio actual ${pa:.2f} cruzó stop ${_stop_data.get("stop_val",0):.2f}</div>'
+                        f'<div style="font-size:10px;color:#374151;margin-top:2px">'
+                        f'Evaluar salida. Si es ETF Cripto en ciclo bajista → considerar salir y reentrar cuando retome tendencia.</div>'
+                        f'</div>', unsafe_allow_html=True)
 
                 # RSI de la posición
                 rsi_gest = "RSI alto - zona salida" if rsi_pos > 65 else \
@@ -11073,7 +11125,7 @@ También puedes descargar la plantilla de abajo y completarla.
                 _stop_data = calcular_stop_tipo(
                     pc=pc, tipo=_tipo_pos, beta=_beta_p,
                     score_entrada=_score_e, prob_entrada=_prob_e,
-                    tenia_earnings=_fue_earnings, pnl_pct=pnl_pct)
+                    tenia_earnings=_fue_earnings, pnl_pct=pnl_pct, pa=pa)
 
                 stop_val  = _stop_data["stop_val"]
                 obj1      = _stop_data["obj1"]
@@ -11998,7 +12050,7 @@ También puedes descargar la plantilla de abajo y completarla.
                 _stop_data = calcular_stop_tipo(
                     pc=pc, tipo=_tipo_pos, beta=_beta_p_cd2,
                     score_entrada=_score_e_cd2, prob_entrada=_prob_e_cd2,
-                    tenia_earnings=_fue_earn_cd2, pnl_pct=pnl_pct)
+                    tenia_earnings=_fue_earn_cd2, pnl_pct=pnl_pct, pa=pa)
 
                 # v19: stop type labels
                 _stop_tipo_lbl  = _stop_data.get("tipo_stop", "Normal")
@@ -12032,6 +12084,17 @@ También puedes descargar la plantilla de abajo y completarla.
                     gest_color = R; gest_emoji = "🔴"
                     gest_titulo = "Pérdida alta - acción requerida"
                     gest_msg = "Stop loss cercano. Evaluar salida inmediata."
+
+                # v19 FIX: alerta si stop ya fue cruzado
+                if _stop_data.get("stop_activado", False):
+                    st.markdown(
+                        f'<div style="background:#FEF2F2;border:2px solid #DC2626;'
+                        f'border-radius:8px;padding:8px 14px;margin-top:6px">'
+                        f'<div style="font-size:12px;font-weight:800;color:#DC2626">'
+                        f'🔴 STOP ACTIVADO — Precio actual ${pa:.2f} cruzó stop ${_stop_data.get("stop_val",0):.2f}</div>'
+                        f'<div style="font-size:10px;color:#374151;margin-top:2px">'
+                        f'Evaluar salida. Si es ETF Cripto en ciclo bajista → considerar salir y reentrar cuando retome tendencia.</div>'
+                        f'</div>', unsafe_allow_html=True)
 
                 # RSI de la posición
                 rsi_gest = "RSI alto - zona salida" if rsi_pos > 65 else \
@@ -12078,7 +12141,7 @@ También puedes descargar la plantilla de abajo y completarla.
                 _stop_data = calcular_stop_tipo(
                     pc=pc, tipo=_tipo_pos, beta=_beta_p,
                     score_entrada=_score_e, prob_entrada=_prob_e,
-                    tenia_earnings=_fue_earnings, pnl_pct=pnl_pct)
+                    tenia_earnings=_fue_earnings, pnl_pct=pnl_pct, pa=pa)
 
                 stop_val  = _stop_data["stop_val"]
                 obj1      = _stop_data["obj1"]
