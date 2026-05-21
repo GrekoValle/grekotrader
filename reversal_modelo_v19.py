@@ -16,6 +16,15 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import streamlit as st
+
+# v19: Silenciar warnings ruidosos de yfinance en consola
+import logging as _logging
+import warnings as _warnings
+_warnings.filterwarnings("ignore", category=FutureWarning)
+_warnings.filterwarnings("ignore", category=DeprecationWarning)
+_logging.getLogger("yfinance").setLevel(_logging.ERROR)
+_logging.getLogger("urllib3").setLevel(_logging.ERROR)
+_logging.getLogger("peewee").setLevel(_logging.ERROR)
 import warnings as _warnings
 _warnings.filterwarnings("ignore", category=UserWarning)  # suprimir 404 yfinance
 import pandas as pd
@@ -1030,6 +1039,8 @@ def fetch_market_indicators() -> dict:
             en_correccion = 0
             for tk in tickers:
                 try:
+                    import time as _tm_scan
+                    _tm_scan.sleep(0.08)  # anti rate-limit
                     h = yf.Ticker(tk).history(period="3mo")
                     if h.empty: continue
                     c2 = h["Close"].values
@@ -2097,7 +2108,8 @@ def render_panel_recompra(
     TXT: str, TXT_MUT: str, BOR: str,
 ) -> str:
     """
-    v19: Renderiza el panel de recompra para una posición.
+    v19: Renderiza el panel de GESTIÓN/RECOMPRA para una posición.
+    Claramente diferenciado de las noticias externas.
     """
     señal = recompra.get("señal", "")
 
@@ -3394,6 +3406,8 @@ def calcular_atr(ticker: str, periodo: int = 14) -> float:
     """Calcula ATR (Average True Range) real de los últimos N días."""
     try:
         import yfinance as yf, numpy as np
+        import time as _tm_bd
+        _tm_bd.sleep(0.05)
         hist = yf.Ticker(ticker).history(period="3mo")
         if hist.empty or len(hist) < periodo + 1:
             return 0.0
@@ -4409,15 +4423,24 @@ def render_noticias_mini(tickers: list, titulo: str = "📰 Noticias del mercado
     news_cache = st.session_state.get("noticias_cache", {})
     if not news_cache:
         st.markdown(
-            f'<div style="background:{BG_HEAD};border:1px solid {BOR};'+
-            f'border-radius:8px;padding:10px 14px;font-size:11px;color:{TXT_MUT}">'+
-            f'📰 Sin noticias - presiona "🔄 Actualizar noticias" en el sidebar</div>',
+            f'<div style="background:#1E3A5F;border-radius:8px 8px 0 0;padding:8px 14px">'
+            f'<span style="font-size:12px;font-weight:700;color:white">📰 NOTICIAS DEL MERCADO</span>'
+            f'</div>'
+            f'<div style="background:{BG_HEAD};border:1px solid {BOR};border-radius:0 0 8px 8px;'
+            f'padding:10px 14px;font-size:11px;color:{TXT_MUT}">'
+            f'Sin noticias — presiona "🔄 Actualizar noticias" en el sidebar</div>',
             unsafe_allow_html=True)
         return
 
+    _ts_news = st.session_state.get("noticias_actualizadas", "-")
     st.markdown(
-        f'<div style="font-size:12px;font-weight:700;color:{TXT};margin:10px 0 6px">'+
-        f'{titulo}  - {st.session_state.get("noticias_actualizadas","-")}</div>',
+        f'<div style="background:#1E3A5F;border-radius:8px 8px 0 0;'
+        f'padding:8px 14px;display:flex;justify-content:space-between;'
+        f'align-items:center">'
+        f'<div style="font-size:12px;font-weight:700;color:white">'
+        f'📰 NOTICIAS DEL MERCADO</div>'
+        f'<div style="font-size:10px;color:#93C5FD">Última actualización: {_ts_news}</div>'
+        f'</div>',
         unsafe_allow_html=True)
 
     tickers_con_noticias = [tk for tk in tickers if tk in news_cache and news_cache[tk]["noticias"]]
@@ -5332,6 +5355,9 @@ def _fetch_fallback_row(ticker: str, precio_compra: float, razon: str = "Sin dat
 
 @st.cache_data(ttl=300, show_spinner=False)  # FIX v13.1: 5 min (antes 3600=1h -> fase no actualizaba)
 def fetch_ticker_data(ticker: str, precio_compra: float) -> dict:
+    # Silenciar warnings de yfinance para este ticker
+    import logging as _log_ftd
+    _log_ftd.getLogger("yfinance").setLevel(_log_ftd.CRITICAL)
     """Retorna dict con los mismos campos que df_all para un ticker arbitrario."""
     # v15 fix: tickers conocidos como inválidos en yfinance - evita spam de 404
     _TICKER_BLACKLIST = {
@@ -6974,7 +7000,8 @@ def render_boton_registro(
     prob_nbis: float, cat_fecha: str, arrastradas: str,
     lider: str, opinion: str, key_prefix: str,
     tipo: str = "ENTRADA",
-    area: str = ""
+    area: str = "",
+    rsi_ticker: float = 0,   # v19: RSI del ticker al momento de registrar
 ):
     """
     Renderiza el botón de registro + formulario rápido.
@@ -7377,7 +7404,7 @@ def clasificar_tipo_noticia(titulo: str) -> str:
 def fetch_noticias_ticker(ticker: str) -> list:
     """
     Descarga y analiza las últimas noticias de un ticker via yfinance.
-    Compatible con todas las versiones de yfinance.
+    Compatible con todas las versiones de yfinance. Max 5s por ticker.
     """
     noticias = []
     try:
@@ -7387,6 +7414,8 @@ def fetch_noticias_ticker(ticker: str) -> list:
             raw_news = stk.news or []
         except Exception:
             raw_news = []
+        if not raw_news:
+            return []
 
         for item in raw_news[:8]:
             try:
@@ -8004,24 +8033,117 @@ trades_reales_id = "ID_del_sheet"
     st.markdown(f'<div style="font-size:12px;font-weight:700;color:{TXT};margin-bottom:8px">📰 Noticias automáticas</div>', unsafe_allow_html=True)
 
     if st.button("🔄 Actualizar noticias", use_container_width=True, help="Descarga y analiza las últimas noticias de cada ticker via yfinance"):
-        # Combinar tickers de todos los tabs escaneados
         _all_scanned = []
+
+        # Scans (Swing, Entrar Hoy, Detectadas)
         for _k in ["scan_entrar","scan_swing","scan_detectadas"]:
             _d = st.session_state.get(_k)
             if _d is not None and not _d.empty:
                 _all_scanned.extend(_d["Ticker"].tolist())
-        tickers_universo = list(dict.fromkeys(_all_scanned)) or ["MSFT","NVDA","AAPL"]
-        progress = st.progress(0)
+
+        # v19 FIX: también incluir tickers del Watchlist
+        try:
+            _wl = st.session_state.get("wl_res_df")
+            if _wl is not None and not _wl.empty and "Ticker" in _wl.columns:
+                _all_scanned.extend(_wl["Ticker"].tolist())
+        except Exception:
+            pass
+
+        # v19 FIX: tickers de Posiciones Greko
+        try:
+            _pg = leer_posiciones_sheets(_SHEET_NAME_GREKO)
+            if _pg is not None and not _pg.empty and "Ticker" in _pg.columns:
+                _activas = _pg[_pg.get("Fecha_Salida", pd.Series(["-"]*len(_pg))).astype(str).isin(["-","","nan","NaT","None"])]
+                _all_scanned.extend(_activas["Ticker"].tolist())
+        except Exception:
+            pass
+
+        # v19 FIX: tickers de Posiciones MVALLE
+        try:
+            _pm = leer_posiciones_sheets(_SHEET_NAME_MAURI)
+            if _pm is not None and not _pm.empty and "Ticker" in _pm.columns:
+                _activas = _pm[_pm.get("Fecha_Salida", pd.Series(["-"]*len(_pm))).astype(str).isin(["-","","nan","NaT","None"])]
+                _all_scanned.extend(_activas["Ticker"].tolist())
+        except Exception:
+            pass
+
+        # v19 FIX: tickers de Posiciones Amparito
+        try:
+            _pa = leer_posiciones_sheets(_SHEET_NAME_AMPARITO)
+            if _pa is not None and not _pa.empty and "Ticker" in _pa.columns:
+                _activas = _pa[_pa.get("Fecha_Salida", pd.Series(["-"]*len(_pa))).astype(str).isin(["-","","nan","NaT","None"])]
+                _all_scanned.extend(_activas["Ticker"].tolist())
+        except Exception:
+            pass
+
+        # v19 FIX: tickers del Sympathy Sheet activos
+        try:
+            _symp_all = st.session_state.get("sympathy_data", {})
+            for _stk, _sv in _symp_all.items():
+                _all_scanned.append(_stk)
+                _lider = _sv.get("lider","")
+                if _lider and _lider not in ("-","","nan"):
+                    _all_scanned.append(_lider)
+        except Exception:
+            pass
+
+        # Deduplicar y limpiar
+        tickers_universo = list(dict.fromkeys(
+            [str(t).upper().strip() for t in _all_scanned
+             if t and str(t).upper().strip() not in ("-","","NAN")]
+        ))
+
+        if not tickers_universo:
+            tickers_universo = ["MSFT","NVDA","AAPL","ENPH","IONQ"]
+
+        st.info(f"Cargando noticias para {len(tickers_universo)} tickers...")
+        progress    = st.progress(0)
+        status_txt  = st.empty()
         cache_nuevo = {}
+
+        # Limitar a 40 tickers máximo para evitar timeouts
+        _MAX_TICKERS = 40
+        if len(tickers_universo) > _MAX_TICKERS:
+            # Priorizar posiciones abiertas sobre watchlist
+            tickers_universo = tickers_universo[:_MAX_TICKERS]
+
+        _total = len(tickers_universo)
+        _ok = 0; _err = 0
+
         for i, tk in enumerate(tickers_universo):
-            news = fetch_noticias_ticker(tk)
+            status_txt.markdown(
+                f'<div style="font-size:10px;color:#64748B">'
+                f'⏳ {i+1}/{_total} — {tk}</div>',
+                unsafe_allow_html=True)
+            try:
+                import signal as _sig
+                # Timeout de 5s por ticker en sistemas Unix
+                def _timeout_handler(signum, frame):
+                    raise TimeoutError()
+                try:
+                    _sig.signal(_sig.SIGALRM, _timeout_handler)
+                    _sig.alarm(5)
+                    news  = fetch_noticias_ticker(tk)
+                    _sig.alarm(0)
+                except Exception:
+                    news = []
+            except Exception:
+                # Windows no tiene SIGALRM — usar try/except directo
+                try:
+                    news = fetch_noticias_ticker(tk)
+                except Exception:
+                    news = []
             bonus = calcular_bonus_noticias(news)
             cache_nuevo[tk] = {"noticias": news, "bonus": bonus}
-            progress.progress((i+1)/len(tickers_universo))
+            if news: _ok += 1
+            else:    _err += 1
+            progress.progress((i+1)/_total)
+
         st.session_state["noticias_cache"] = cache_nuevo
         st.session_state["noticias_actualizadas"] = datetime.datetime.now().strftime("%H:%M")
         progress.empty()
-        st.success("✅ Noticias actualizadas")
+        status_txt.empty()
+        st.success(f"✅ Noticias actualizadas · {_ok} tickers con noticias · {_err} sin datos")
 
     if st.session_state["noticias_actualizadas"]:
         st.markdown(
@@ -9296,6 +9418,7 @@ with tab2:
                         opinion=str(_rw.get("Opinion_Trader", _rw.get("Lectura", "-"))),
                         key_prefix="tab2", tipo="CANDIDATO",
                         area=str(_rw.get("Area","-")),
+                        rsi_ticker=float(_rw.get("RSI", 0)),
                     )
 
         # Exportar
@@ -12883,6 +13006,12 @@ with tab7:
                     _recompra_data_a, str(pos.get("Tipo","Accion")),
                     G, R, A, C, TXT, TXT_MUT, BOR)
                 if _recompra_html_a:
+                    st.markdown(
+                        f'<div style="background:#F1F5F9;border-radius:8px 8px 0 0;'
+                        f'padding:6px 12px;margin-top:8px">'
+                        f'<span style="font-size:10px;font-weight:700;color:#475569">'
+                        f'⚙️ GESTIÓN DE POSICIÓN</span></div>',
+                        unsafe_allow_html=True)
                     st.markdown(_recompra_html_a, unsafe_allow_html=True)
                 elif _recompra_data_a.get("señal") == "esperar_pullback":
                     _rsi_a   = _recompra_data_a.get("rsi", 0)
