@@ -5355,10 +5355,10 @@ def _fetch_fallback_row(ticker: str, precio_compra: float, razon: str = "Sin dat
 
 @st.cache_data(ttl=300, show_spinner=False)  # FIX v13.1: 5 min (antes 3600=1h -> fase no actualizaba)
 def fetch_ticker_data(ticker: str, precio_compra: float) -> dict:
+    """Retorna dict con los mismos campos que df_all para un ticker arbitrario."""
     # Silenciar warnings de yfinance para este ticker
     import logging as _log_ftd
     _log_ftd.getLogger("yfinance").setLevel(_log_ftd.CRITICAL)
-    """Retorna dict con los mismos campos que df_all para un ticker arbitrario."""
     # v15 fix: tickers conocidos como inválidos en yfinance - evita spam de 404
     _TICKER_BLACKLIST = {
         "MSTU",   # ETF apalancado sin fundamentals en Yahoo
