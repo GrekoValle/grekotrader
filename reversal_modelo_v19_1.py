@@ -1035,20 +1035,55 @@ def fetch_market_indicators() -> dict:
         except Exception:
             pass
 
-        # % acciones S&P500 bajo su EMA50 - proxy via ETF XLK vs SMA
+        # SPY completo: RSI + EMA50 + EMA200 + MACD tendencia + cambio 20d
         try:
-            # Usar RSI del SPY como proxy de sentimiento
-            spy = yf.Ticker("SPY").history(period="3mo")
+            spy = yf.Ticker("SPY").history(period="1y")
             if not spy.empty:
                 s = spy["Close"]
+                _pa_spy   = float(s.iloc[-1])
+                _p20_spy  = float(s.iloc[-20]) if len(s)>=20 else _pa_spy
+                _chg20    = round((_pa_spy-_p20_spy)/_p20_spy*100, 1)  # cambio 20 días
+                # RSI
                 delta = s.diff()
                 gain  = delta.clip(lower=0).rolling(14).mean()
                 loss  = (-delta.clip(upper=0)).rolling(14).mean()
                 rsi_spy = round(float(100-100/(1+gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
-                ema50_spy = float(s.ewm(span=50).mean().iloc[-1])
-                bajo_ema  = "SPY bajo EMA50" if float(s.iloc[-1]) < ema50_spy else "SPY sobre EMA50"
-                result["spy"] = {"rsi": rsi_spy, "ema_status": bajo_ema,
-                                 "precio": round(float(s.iloc[-1]),2)}
+                # EMA50 y EMA200
+                ema50_spy  = float(s.ewm(span=50,  adjust=False).mean().iloc[-1])
+                ema200_spy = float(s.ewm(span=200, adjust=False).mean().iloc[-1])
+                # MACD tendencia (12/26) y señal (9)
+                ema12 = s.ewm(span=12, adjust=False).mean()
+                ema26 = s.ewm(span=26, adjust=False).mean()
+                macd_line   = ema12 - ema26
+                macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+                macd_now    = float(macd_line.iloc[-1])
+                macd_sig    = float(macd_signal.iloc[-1])
+                macd_prev   = float(macd_line.iloc[-2]) if len(macd_line)>=2 else macd_now
+                macd_cruce  = "positivo" if macd_now > macd_sig else "negativo"
+                macd_dir    = "subiendo" if macd_now > macd_prev else "bajando"
+                # VIX tendencia (necesita descarga separada de 5d)
+                result["spy"] = {
+                    "rsi":       rsi_spy,
+                    "precio":    round(_pa_spy, 2),
+                    "chg_20d":   _chg20,
+                    "sobre_ema50":  _pa_spy > ema50_spy,
+                    "sobre_ema200": _pa_spy > ema200_spy,
+                    "dist_ema200":  round((_pa_spy - ema200_spy)/ema200_spy*100, 1),
+                    "macd_cruce":   macd_cruce,
+                    "macd_dir":     macd_dir,
+                    "ema_status": "SPY sobre EMA200" if _pa_spy > ema200_spy else "SPY BAJO EMA200",
+                }
+        except Exception: pass
+
+        # VIX tendencia (7d)
+        try:
+            vix_hist = yf.Ticker("^VIX").history(period="1mo")
+            if not vix_hist.empty and len(vix_hist) >= 7:
+                _vix_now  = float(vix_hist["Close"].iloc[-1])
+                _vix_7d   = float(vix_hist["Close"].iloc[-7])
+                _vix_chg  = round(_vix_now - _vix_7d, 1)
+                result["vix_trend"] = {"valor": round(_vix_now,1), "chg_7d": _vix_chg,
+                                       "subiendo": _vix_chg > 2}
         except Exception: pass
 
         # Sector más débil - buscar el que tiene más acciones en corrección
@@ -1345,7 +1380,7 @@ def leer_watchlist_sheets() -> "pd.DataFrame | None":
         for row in rows[1:]:
             if not row: continue
             d = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
-            tk = str(d.get("Ticker", d.get("Ticket", ""))).upper().strip().replace("$","")
+            tk = str(d.get("Ticker", d.get("Ticket", d.get("TICKER", d.get("TICKET", ""))))).upper().strip().replace("$","").replace(" ","")
             if not tk: continue
             wl_data.append({
                 "Ticker": tk,
@@ -2925,177 +2960,227 @@ def badge_recomendacion_momentum(score: int, rsi: float,
 
 
 
-# ══ SISTEMA GTU — GrekoTrader Upside v1.0 ═══════════════════════════════════
-# Basado en correlaciones reales de 104 posiciones (27-Abr→29-May-2026)
-# Pesos iniciales: w1=0.45 RSI · w2=0.25 Prob · w3=0.15 Momentum · w4=0.10 Score
-# Actualización manual cada 2 semanas con nuevos datos
-
-_GTU_LOOKUP = {
-    "EXT_82+":   {"p25":14.8, "p50":18.8, "p75":26.1, "wr":95, "n":21,
-                  "label":"RSI 82+ · Ext momentum", "color":"#FBBF24"},
-    "MOM_DD":    {"p25":13.7, "p50":23.7, "p75":38.9, "wr":100,"n":9,
-                  "label":"RSI 65-82 + DD≥15%",      "color":"#10B981"},
-    "MOM_CLEAN": {"p25":-0.8, "p50":0.7,  "p75":11.6, "wr":69, "n":13,
-                  "label":"RSI 65-82 sin DD",         "color":"#34D399"},
-    "TRANS_DD":  {"p25":3.6,  "p50":6.1,  "p75":13.0, "wr":80, "n":10,
-                  "label":"RSI 55-65 + DD≥25%",       "color":"#60A5FA"},
-    "TRANS":     {"p25":-6.6, "p50":-2.6, "p75":5.6,  "wr":35, "n":17,
-                  "label":"RSI 55-65 sin DD",          "color":"#F59E0B"},
-    "NBIS":      {"p25":-7.8, "p50":-1.2, "p75":2.4,  "wr":41, "n":17,
-                  "label":"RSI 40-55 · NBIS clásico",  "color":"#F87171"},
-    "NBIS_PROF": {"p25":-5.3, "p50":-3.6, "p75":-2.1, "wr":15, "n":13,
-                  "label":"RSI 40-55 + DD≥30%",        "color":"#EF4444"},
-    "OVERSOLD":  {"p25":-14.2,"p50":-9.4, "p75":-3.3, "wr":25, "n":4,
-                  "label":"RSI <40 · oversold",        "color":"#DC2626"},
-}
-
-_GTU_WEIGHTS = {
-    "w1_rsi": 0.45, "w2_prob": 0.25, "w3_momentum": 0.15,
-    "w4_score": 0.10, "w5_dd_rsi": 0.03, "w6_earnings": 0.02,
-    "version": "1.0", "n_actualizaciones": 0
-}
-
-
-def _gtu_get_perfil(rsi: float, dd_abs: float, prob: float) -> str:
-    """Clasifica la señal en perfil histórico para lookup de rango."""
-    if rsi >= 82:         return "EXT_82+"
-    elif rsi >= 65:
-        if dd_abs >= 15:  return "MOM_DD"
-        else:             return "MOM_CLEAN"
-    elif rsi >= 55:
-        if dd_abs >= 25:  return "TRANS_DD"
-        else:             return "TRANS"
-    elif rsi >= 40:
-        if dd_abs >= 30:  return "NBIS_PROF"
-        else:             return "NBIS"
-    else:                 return "OVERSOLD"
-
-
-def calcular_gtu(rsi: float, prob_nbis: float, score_mvalle: int,
-                 dd_abs: float, earnings_flag: int = 0) -> dict:
+def calcular_riesgo_extension(rsi: float, dist_ema50: float,
+                               dist_52w: float, tipo: str) -> dict:
     """
-    GrekoTrader Upside Formula v1.0
-    Basada en correlaciones de 104 posiciones reales.
-    Pesos fijos — ajustar manualmente cada 2 semanas.
+    v19.3 — Riesgo de Extensión (RE)
+    Fórmula separada para NBIS y Momentum.
+    Mide qué tan extendida está una acción respecto a sus promedios clave.
     
-    Returns: dict con gtu_score (0-100), nivel (1-4), perfil, rango, rango_hist, color
+    Args:
+        rsi:       RSI actual de la acción (0-100)
+        dist_ema50: distancia % al EMA50 (positivo=sobre, negativo=bajo)
+        dist_52w:   distancia % al máximo 52 semanas (siempre negativo o 0)
+        tipo:       "NBIS" o "Momentum"
+    
+    Returns:
+        dict con re_score, nivel, badge_html, componentes
     """
-    W = _GTU_WEIGHTS
+    try:
+        _tipo_up = str(tipo).upper()
+        _is_mom  = "MOMENTUM" in _tipo_up or "MOM" in _tipo_up
 
-    # ── Componentes ────────────────────────────────────────────
-    rsi_pts   = (rsi / 100) * 40                        # 0-40pts
-    prob_pts  = (prob_nbis / 100) * 25                  # 0-25pts
-    mom_pts   = 15.0 if rsi >= 65 else 0.0              # 0 o 15pts
-    sc_pts    = (min(score_mvalle, 20) / 20.0) * 10.0   # 0-10pts
-    ddrsi_pts = (dd_abs * min(rsi, 82) / 10000.0) * 5.0 # interaction capped
-    earn_pts  = float(earnings_flag) * 5.0              # 0-5pts
+        if _is_mom:
+            # ── MOMENTUM: mide extensión al ALZA ─────────────
+            # E1: extensión sobre EMA50 (cap 30%)
+            _e1_raw = max(0.0, float(dist_ema50))
+            _e1     = min(_e1_raw / 30.0, 1.0) * 100.0
 
-    raw = (W["w1_rsi"]      * rsi_pts  +
-           W["w2_prob"]     * prob_pts +
-           W["w3_momentum"] * mom_pts  +
-           W["w4_score"]    * sc_pts   +
-           W["w5_dd_rsi"]   * ddrsi_pts+
-           W["w6_earnings"] * earn_pts)
+            # E2: velocidad del RSI (solo penaliza si RSI > 60)
+            _e2_raw = max(0.0, float(rsi) - 60.0)
+            _e2     = min(_e2_raw / 40.0, 1.0) * 100.0
 
-    max_posible = (W["w1_rsi"]*40 + W["w2_prob"]*25 + W["w3_momentum"]*15 +
-                   W["w4_score"]*10 + W["w5_dd_rsi"]*5 + W["w6_earnings"]*5)
-    gtu = round((raw / max_posible) * 100, 1) if max_posible > 0 else 0.0
+            # E3: proximidad al máximo 52W (cerca del max = riesgo)
+            _e3_raw = max(0.0, 100.0 - abs(float(dist_52w)))
+            _e3     = min(_e3_raw / 100.0, 1.0) * 100.0
 
-    # ── Nivel GTU ────────────────────────────────────────────────
-    if gtu >= 70:  nivel=4; gtu_rango="+40-80%"; gtu_emoji="🔥"; gtu_color="#FBBF24"
-    elif gtu >= 55:nivel=3; gtu_rango="+20-50%"; gtu_emoji="🟢"; gtu_color="#10B981"
-    elif gtu >= 40:nivel=2; gtu_rango="+10-25%"; gtu_emoji="🟡"; gtu_color="#F59E0B"
-    else:          nivel=1; gtu_rango="+5-15%";  gtu_emoji="⚪"; gtu_color="#94A3B8"
+            _re     = round(_e1*0.40 + _e2*0.35 + _e3*0.25, 1)
+            _thresh_normal  = 55.0
+            _thresh_parcial = 75.0
 
-    # ── Rango histórico ────────────────────────────────────────
-    perfil    = _gtu_get_perfil(rsi, dd_abs, prob_nbis)
-    hist      = _GTU_LOOKUP.get(perfil, {})
-    rh_p25    = hist.get("p25", 0)
-    rh_p50    = hist.get("p50", 0)
-    rh_p75    = hist.get("p75", 0)
-    rh_wr     = hist.get("wr",  0)
-    rh_n      = hist.get("n",   0)
-    rh_label  = hist.get("label", perfil)
-    rh_color  = hist.get("color","#64748B")
+            _comp = {
+                f"EMA50 +{_e1_raw:.0f}%": round(_e1*0.40,1),
+                f"RSI {rsi:.0f}":          round(_e2*0.35,1),
+                f"Dist52W {dist_52w:.0f}%": round(_e3*0.25,1),
+            }
+        else:
+            # ── NBIS: mide extensión a la BAJA ───────────────
+            # E1: extensión bajo EMA50 (cap 40%)
+            _e1_raw = max(0.0, abs(min(0.0, float(dist_ema50))))
+            _e1     = min(_e1_raw / 40.0, 1.0) * 100.0
 
-    if rh_p50 > 20: rh_emoji = "🔥"
-    elif rh_p50 > 8: rh_emoji = "🟢"
-    elif rh_p50 > 0: rh_emoji = "🟡"
-    else:            rh_emoji = "🔴"
+            # E2: velocidad de caída RSI (solo penaliza si RSI < 55)
+            _e2_raw = max(0.0, 55.0 - float(rsi))
+            _e2     = min(_e2_raw / 55.0, 1.0) * 100.0
 
-    return {
-        "gtu":        gtu,
-        "nivel":      nivel,
-        "rango":      gtu_rango,
-        "emoji":      gtu_emoji,
-        "color":      gtu_color,
-        "componentes": {
-            "RSI":      round(rsi_pts * W["w1_rsi"], 1),
-            "Prob":     round(prob_pts * W["w2_prob"], 1),
-            "Momentum": round(mom_pts * W["w3_momentum"], 1),
-            "Score":    round(sc_pts * W["w4_score"], 1),
-            "DD_RSI":   round(ddrsi_pts * W["w5_dd_rsi"], 1),
-            "Earnings": round(earn_pts * W["w6_earnings"], 1),
-        },
-        "perfil":     perfil,
-        "rh_perfil_label": rh_label,
-        "rh_p25":     rh_p25,
-        "rh_p50":     rh_p50,
-        "rh_p75":     rh_p75,
-        "rh_wr":      rh_wr,
-        "rh_n":       rh_n,
-        "rh_emoji":   rh_emoji,
-        "rh_color":   rh_color,
-    }
+            # E3: profundidad del DD anual (cap 70%)
+            _e3_raw = min(abs(float(dist_52w)), 70.0)
+            _e3     = (_e3_raw / 70.0) * 100.0
 
+            _re     = round(_e1*0.45 + _e2*0.30 + _e3*0.25, 1)
+            _thresh_normal  = 40.0
+            _thresh_parcial = 65.0
+
+            _comp = {
+                f"EMA50 {dist_ema50:.0f}%":  round(_e1*0.45,1),
+                f"RSI {rsi:.0f}":             round(_e2*0.30,1),
+                f"Dist52W {dist_52w:.0f}%":   round(_e3*0.25,1),
+            }
+
+        # ── Nivel y badge ─────────────────────────────────────
+        if _re >= _thresh_parcial:
+            _nivel   = "NO_ENTRAR"
+            _emoji   = "🚫"
+            _label   = "No entrar"
+            _color   = "#EF4444"
+            _bg      = "#FEF2F2"
+            _border  = "#FECACA"
+            _tip     = "Señal muy extendida — esperar corrección"
+        elif _re >= _thresh_normal:
+            _nivel   = "PARCIAL"
+            _emoji   = "⚡"
+            _label   = "Entrada parcial"
+            _color   = "#F97316"
+            _bg      = "#FFF7ED"
+            _border  = "#FDBA74"
+            _tip     = "Extendida — considerar 50% del tamaño habitual"
+        else:
+            _nivel   = "NORMAL"
+            _emoji   = "✅"
+            _label   = "Entrada normal"
+            _color   = "#16A34A"
+            _bg      = "#F0FDF4"
+            _border  = "#86EFAC"
+            _tip     = "Dentro de rangos sanos"
+
+        # Barra de progreso
+        _bar_pct   = min(int(_re), 100)
+        _bar_color = _color
+        _bar_width = _bar_pct
+        _tipo_label = "MOMENTUM" if _is_mom else "NBIS"
+        _thresh_label = f"Normal<{int(_thresh_normal)} · Parcial<{int(_thresh_parcial)} · No>{int(_thresh_parcial)}"
+
+        _comp_str = " · ".join([f"{k}={v}pts" for k,v in _comp.items()])
+
+        _badge_html = (
+            f'<div style="background:{_bg};border:1px solid {_border};'
+            f'border-left:3px solid {_color};border-radius:6px;padding:6px 10px;margin-top:4px">'
+            f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase;'
+            f'letter-spacing:.8px;margin-bottom:3px">🔰 Riesgo Extensión {_tipo_label}</div>'
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">'
+            f'<div style="font-size:13px;font-weight:800;color:{_color}">'
+            f'{_emoji} {_re:.0f}/100</div>'
+            f'<div style="font-size:11px;font-weight:700;color:{_color}">{_label}</div>'
+            f'</div>'
+            f'<div style="background:#E2E8F0;border-radius:3px;height:5px;margin-bottom:4px">'
+            f'<div style="background:{_bar_color};width:{_bar_width}%;height:100%;'
+            f'border-radius:3px;transition:width .5s"></div></div>'
+            f'<div style="font-size:9px;color:#64748B">{_comp_str}</div>'
+            f'<div style="font-size:9px;color:#94A3B8;margin-top:2px">'
+            f'💡 {_tip} · {_thresh_label}</div>'
+            f'</div>'
+        )
+
+        _badge_mini = (
+            f'<span style="background:{_bg};border:1px solid {_border};'
+            f'border-radius:4px;padding:2px 7px;font-size:9px;'
+            f'font-weight:700;color:{_color}">'
+            f'RE {_emoji} {_re:.0f}</span>'
+        )
+
+        return {
+            "re":          _re,
+            "nivel":       _nivel,
+            "emoji":       _emoji,
+            "label":       _label,
+            "color":       _color,
+            "badge_html":  _badge_html,
+            "badge_mini":  _badge_mini,
+            "componentes": _comp,
+            "tipo":        _tipo_label,
+        }
+    except Exception as _e_re:
+        return {
+            "re": 50.0, "nivel":"PARCIAL", "emoji":"⚡",
+            "label":"Entrada parcial", "color":"#F97316",
+            "badge_html":"", "badge_mini":"",
+            "componentes":{}, "tipo":"N/D",
+        }
+
+
+def _gtu_get_rh(rsi: float, dd_abs: float, prob: float) -> dict:
+    """Retorna el rango histórico del perfil sin GTU score."""
+    _perfil = _gtu_get_perfil_rh(rsi, dd_abs, prob)
+    return _GTU_LOOKUP_RH.get(_perfil, {"rh_wr":50,"rh_p50":5,"rh_p25":0,"rh_p75":15,"rh_n":0,"rh_color":"#64748B","rh_emoji":"📊"})
+
+def _gtu_get_perfil_rh(rsi: float, dd_abs: float, prob: float) -> str:
+    if rsi >= 82:        return "EXT_82+"
+    elif rsi >= 65:
+        if dd_abs >= 15: return "MOM_DD"
+        else:            return "MOM_CLEAN"
+    elif rsi >= 55:
+        if dd_abs >= 25: return "TRANS_DD"
+        else:            return "TRANS"
+    elif rsi >= 40:
+        if dd_abs >= 30: return "NBIS_PROF"
+        else:            return "NBIS"
+    else:                return "OVERSOLD"
+
+_GTU_LOOKUP_RH = {
+    "EXT_82+":   {"rh_p25":14.8,"rh_p50":18.8,"rh_p75":26.1,"rh_wr":95,"rh_n":21,"rh_color":"#FBBF24","rh_emoji":"🔥"},
+    "MOM_DD":    {"rh_p25":13.7,"rh_p50":23.7,"rh_p75":38.9,"rh_wr":100,"rh_n":9,"rh_color":"#10B981","rh_emoji":"✅"},
+    "MOM_CLEAN": {"rh_p25":-0.8,"rh_p50":0.7, "rh_p75":11.6,"rh_wr":69, "rh_n":13,"rh_color":"#34D399","rh_emoji":"📊"},
+    "TRANS_DD":  {"rh_p25":3.6, "rh_p50":6.1, "rh_p75":13.0,"rh_wr":80, "rh_n":10,"rh_color":"#60A5FA","rh_emoji":"📈"},
+    "TRANS":     {"rh_p25":-6.6,"rh_p50":-2.6,"rh_p75":5.6, "rh_wr":35, "rh_n":17,"rh_color":"#F59E0B","rh_emoji":"⚠️"},
+    "NBIS":      {"rh_p25":-7.8,"rh_p50":-1.2,"rh_p75":2.4, "rh_wr":41, "rh_n":17,"rh_color":"#F87171","rh_emoji":"⚠️"},
+    "NBIS_PROF": {"rh_p25":-5.3,"rh_p50":-3.6,"rh_p75":-2.1,"rh_wr":15, "rh_n":13,"rh_color":"#EF4444","rh_emoji":"🚫"},
+    "OVERSOLD":  {"rh_p25":-14.2,"rh_p50":-9.4,"rh_p75":-3.3,"rh_wr":25,"rh_n":4, "rh_color":"#DC2626","rh_emoji":"🚫"},
+}
 
 
 def actualizar_todas_fases_batch(sheet_names: list) -> tuple:
     """
-    v19.3 OPCIÓN B — Recorre TODAS las posiciones activas de los Sheets indicados.
-    Calcula Fase live para cada ticker con yf.download BATCH (1 sola llamada).
-    Escribe F + AB en un solo batchUpdate por Sheet.
-    
-    NO modifica X (RSI_Accion), Y (MACD_Estado), Z (DD_Pico_Pct) — son historia.
-    
-    Criterios de Fase live:
+    v19.3 Opción B — Recorre TODAS las posiciones activas.
+    Calcula Fase live (yf.download batch) y escribe F + AB
+    en una sola llamada batchUpdate por Sheet.
+    NO modifica X (RSI_Accion), Y (MACD_Estado), Z (DD_Pico_Pct).
+
+    Criterios Fase live:
       M3:       RSI 48-65 + DD ≤-15% + MACD+
       M2:       RSI 40-65 + DD ≤-10%
       Momentum: RSI > 65
-      M1:       resto (señal debilitada)
-    
-    Retorna: (ok, mensaje_resumen)
+      M1:       resto
     """
     import datetime as _dtb
-    import yfinance as _yf_batch_fase
+    import yfinance as _yf_bf
 
-    _hoy_str  = _dtb.date.today().strftime("%d-%m-%Y")
-    _resumen  = []
-    _total_ok = 0
-    _total_err= 0
+    _hoy_str = _dtb.date.today().strftime("%d-%m-%Y")
+    _resumen = []
+    _total_err = 0
 
     for _sn in sheet_names:
         try:
-            # ── PASO 1: Leer Sheet completo (1 llamada) ──────────
             svc = _get_sheets_service()
             if not svc:
                 _resumen.append(f"❌ {_sn}: Sin servicio Sheets")
+                _total_err += 1
                 continue
 
-            _secret_key = ("posiciones_greko_id" if "Greko" in _sn
-                           else "posiciones_mauri_id" if "Mauri" in _sn
-                           else "posiciones_amparito_id")
-            sheet_id = _get_sheet_id_from_secrets(_secret_key)
-            if not sheet_id:
-                sheet_id = _buscar_sheet_id(_sn)
-            if not sheet_id:
+            _secret = ("posiciones_greko_id"   if "Greko"    in _sn else
+                       "posiciones_mauri_id"   if "Mauri"    in _sn else
+                       "posiciones_amparito_id")
+            _sid = _get_sheet_id_from_secrets(_secret)
+            if not _sid:
+                _sid = _buscar_sheet_id(_sn)
+            if not _sid:
                 _resumen.append(f"❌ {_sn}: ID no encontrado")
+                _total_err += 1
                 continue
 
-            _meta  = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+            _meta  = svc.spreadsheets().get(spreadsheetId=_sid).execute()
             _hoja  = _meta["sheets"][0]["properties"]["title"]
             _raw   = svc.spreadsheets().values().get(
-                spreadsheetId=sheet_id, range=f"'{_hoja}'!A:AB").execute()
+                spreadsheetId=_sid, range=f"'{_hoja}'!A:AB").execute()
             _rows  = _raw.get("values", [])
             if not _rows:
                 _resumen.append(f"⚠️ {_sn}: Sheet vacío")
@@ -3108,70 +3193,64 @@ def actualizar_todas_fases_batch(sheet_names: list) -> tuple:
 
             _idx_tk  = _ci("Ticker", 0)
             _idx_fs  = _ci("Fecha_Salida", 14)
-            _idx_fe  = _ci("Fecha_Entrada", 3)
-            _idx_f   = _ci("Fase", 5)          # columna F
-            _idx_ab  = _ci("Fecha_Cambio_Fase", 27)  # columna AB
+            _idx_f   = _ci("Fase", 5)
+            _idx_ab  = _ci("Fecha_Cambio_Fase", 27)
 
-            # ── Recopilar tickers activos ─────────────────────────
-            _activos = []  # [(row_number_1based, ticker, fase_actual)]
+            _activos = []
             for _ri, _row in enumerate(_rows[1:], 2):
                 if len(_row) <= _idx_tk: continue
                 _tk = str(_row[_idx_tk]).upper().strip()
-                if not _tk or _tk in ("-","", "TICKER"): continue
+                if not _tk or _tk in ("-", "", "TICKER"): continue
                 _fs = str(_row[_idx_fs]).strip() if len(_row) > _idx_fs else ""
-                if _fs and _fs not in ("-","","nan","None","NaT"): continue  # cerrada
-                _fase_actual = str(_row[_idx_f]).strip() if len(_row) > _idx_f else "-"
-                _activos.append((_ri, _tk, _fase_actual))
+                if _fs and _fs not in ("-", "", "nan", "None", "NaT"): continue
+                _fase_ant = str(_row[_idx_f]).strip() if len(_row) > _idx_f else "-"
+                _activos.append((_ri, _tk, _fase_ant))
 
             if not _activos:
                 _resumen.append(f"ℹ️ {_sn}: Sin posiciones activas")
                 continue
 
-            # ── PASO 2: yf.download BATCH (1 sola llamada) ───────
             _tks_uniq = list(set([a[1] for a in _activos]))
             _live = {}
             try:
-                _dl = _yf_batch_fase.download(
+                _dl = _yf_bf.download(
                     " ".join(_tks_uniq), period="3mo",
                     auto_adjust=True, progress=False, threads=True)
                 _cl = _dl.get("Close", _dl)
                 for _tk_b in _tks_uniq:
                     try:
                         _s = (_cl[_tk_b].dropna()
-                              if hasattr(_cl,"columns") and _tk_b in _cl.columns
+                              if hasattr(_cl, "columns") and _tk_b in _cl.columns
                               else _cl.dropna())
                         if len(_s) < 20: continue
                         _pa     = float(_s.iloc[-1])
                         _pico   = float(_s.rolling(60, min_periods=1).max().iloc[-1])
-                        _dd     = round((_pa-_pico)/_pico*100,1) if _pico>0 else 0
+                        _dd     = round((_pa - _pico) / _pico * 100, 1) if _pico > 0 else 0
                         _d      = _s.diff()
                         _g      = _d.clip(lower=0).rolling(14).mean()
                         _lo     = (-_d.clip(upper=0)).rolling(14).mean()
-                        _rsi    = round(float(100-100/(1+_g.iloc[-1]/(_lo.iloc[-1]+1e-9))),1)
+                        _rsi    = round(float(100 - 100 / (1 + _g.iloc[-1] / (_lo.iloc[-1] + 1e-9))), 1)
                         _macd   = "+" if _s.ewm(span=12).mean().iloc[-1] > _s.ewm(span=26).mean().iloc[-1] else "-"
-                        _live[_tk_b] = {"rsi":_rsi, "macd":_macd, "dd":_dd}
-                    except Exception: pass
+                        _live[_tk_b] = {"rsi": _rsi, "macd": _macd, "dd": _dd}
+                    except Exception:
+                        pass
             except Exception as _edl:
                 _resumen.append(f"❌ {_sn}: Error download — {str(_edl)[:40]}")
+                _total_err += 1
                 continue
 
-            # ── PASO 3: Calcular Fase live para cada posición ────
             _updates_data = []
-            _cambios      = 0
-            _sin_cambio   = 0
+            _cambios = 0
+            _sin_cambio = 0
 
             for _row_n, _tk_a, _fase_ant in _activos:
                 _ld = _live.get(_tk_a, {})
                 if not _ld:
                     _sin_cambio += 1
                     continue
-
                 _rsi_l  = _ld["rsi"]
                 _macd_l = _ld["macd"]
                 _dd_l   = _ld["dd"]
-                _dd_abs = abs(_dd_l)
-
-                # Criterios de Fase live
                 if 48 <= _rsi_l <= 65 and _dd_l <= -15 and _macd_l == "+":
                     _fase_nueva = "M3"
                 elif 40 <= _rsi_l <= 65 and _dd_l <= -10:
@@ -3180,22 +3259,19 @@ def actualizar_todas_fases_batch(sheet_names: list) -> tuple:
                     _fase_nueva = "Momentum"
                 else:
                     _fase_nueva = "M1"
-
-                # Preparar update para columna F (siempre)
                 _updates_data.append({
                     "range": f"'{_hoja}'!F{_row_n}",
                     "values": [[_fase_nueva]]
                 })
-
-                # Columna AB: solo si cambió la fase
-                _fase_ant_up = _fase_ant.upper()
-                _fase_nueva_up = _fase_nueva.upper()
-                _cambio_detectado = (
-                    _fase_ant_up != _fase_nueva_up and
-                    not (_fase_ant_up in ("M3","FASE 3","FASE3","ENTRAR") and _fase_nueva_up == "M3") and
-                    not (_fase_ant_up in ("M2","FASE 2","FASE2","ENTRADA") and _fase_nueva_up == "M2")
-                )
-                if _cambio_detectado:
+                _fa_up = _fase_ant.upper()
+                _fn_up = _fase_nueva.upper()
+                if _fa_up not in (_fn_up, "M3", "M2", "MOMENTUM", "M1"):
+                    _updates_data.append({
+                        "range": f"'{_hoja}'!AB{_row_n}",
+                        "values": [[_hoy_str]]
+                    })
+                    _cambios += 1
+                elif _fa_up != _fn_up:
                     _updates_data.append({
                         "range": f"'{_hoja}'!AB{_row_n}",
                         "values": [[_hoy_str]]
@@ -3204,35 +3280,33 @@ def actualizar_todas_fases_batch(sheet_names: list) -> tuple:
                 else:
                     _sin_cambio += 1
 
-            # ── PASO 4: batchUpdate (1 sola llamada API) ─────────
             if _updates_data:
                 _result = svc.spreadsheets().values().batchUpdate(
-                    spreadsheetId=sheet_id,
-                    body={"valueInputOption":"USER_ENTERED","data":_updates_data}
+                    spreadsheetId=_sid,
+                    body={"valueInputOption": "USER_ENTERED", "data": _updates_data}
                 ).execute()
                 _celdas = _result.get("totalUpdatedCells", 0)
                 _resumen.append(
                     f"✅ {_sn}: {len(_activos)} activas · "
                     f"{_cambios} fases cambiaron · {_sin_cambio} sin cambio · "
-                    f"{_celdas} celdas escritas"
-                )
-                _total_ok += 1
+                    f"{_celdas} celdas escritas")
             else:
                 _resumen.append(f"ℹ️ {_sn}: Sin datos live para actualizar")
 
-            # Limpiar caché
             try: leer_posiciones_sheets.clear()
             except Exception: pass
 
-        except Exception as _e_sheet:
-            _resumen.append(f"❌ {_sn}: {str(_e_sheet)[:60]}")
+        except Exception as _e_s:
+            _resumen.append(f"❌ {_sn}: {str(_e_s)[:60]}")
             _total_err += 1
 
-    # Limpiar caché Score MVALLE
-    import streamlit as _st_c
-    _st_c.session_state.pop("_score_rows_base", None)
-    _st_c.session_state.pop("_greko_processed_df", None)
-    _st_c.session_state.pop("_mv_processed_df", None)
+    try:
+        import streamlit as _st_c
+        _st_c.session_state.pop("_score_rows_base", None)
+        _st_c.session_state.pop("_greko_processed_df", None)
+        _st_c.session_state.pop("_mv_processed_df", None)
+    except Exception:
+        pass
 
     _ok_global = _total_err == 0
     _msg = " | ".join(_resumen) if _resumen else "Sin resultados"
@@ -8606,6 +8680,29 @@ def escribir_posicion_sheets(
     except Exception as e:
         return False, f"❌ Error: {str(e)[:80]}"
 
+
+def _buscar_area_watchlist(ticker: str) -> str:
+    """
+    v19.3: Busca el Area de un ticker en el Google Sheet Watchlist.
+    Retorna el Area si existe, o "-" si no.
+    El Watchlist tiene columnas: Ticker | Nombre | Area | Nota
+    """
+    try:
+        _wl_df = leer_watchlist_sheets()
+        if _wl_df is not None and not _wl_df.empty:
+            # Handle both "Ticker" and "Ticket" column names
+            _tk_col = "Ticker" if "Ticker" in _wl_df.columns else "Ticket" if "Ticket" in _wl_df.columns else None
+            if _tk_col is None:
+                return "-"
+            _match = _wl_df[_wl_df[_tk_col].str.upper() == ticker.upper()]
+            if not _match.empty:
+                _area = str(_match.iloc[0].get("Area", "-")).strip()
+                if _area and _area not in ("-", "", "nan", "None"):
+                    return _area
+    except Exception:
+        pass
+    return "-"
+
 def escribir_greko_sheets(
     ticker: str,
     precio_compra: float,
@@ -10465,7 +10562,12 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
             _rr_prob  = float(_rr.get("Prob_NBIS",0))
             _rr_arr   = str(_rr.get("Arrastradas","-"))
             _rr_op    = str(_rr.get("Opinion_Trader","-"))
-            _rr_area  = str(_rr.get("Area","-"))
+            # v19.3: buscar Area desde Watchlist Sheet primero, fallback al campo Area del resultado
+            _rr_area_raw = str(_rr.get("Area","-")).strip()
+            if _rr_area_raw in ("-","","nan","None"):
+                _rr_area = _buscar_area_watchlist(_rr_tk)
+            else:
+                _rr_area = _rr_area_raw
 
             # v19.2: verificar si ya está en Greko (evitar duplicados)
             # PERO permitir si la posición está vencida
@@ -11038,6 +11140,143 @@ with col_signal:
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 st.markdown("---")
 
+def detectar_regimen(spy_data: dict, vix_val: float, vix_trend: dict = None) -> dict:
+    """
+    v19.3 — Detector de Régimen del Mercado
+    Detecta si el viento es a favor, neutro o en contra.
+    
+    Señales de alerta temprana (antes de que el SPY caiga):
+      - MACD SPY cruza a negativo (3-7 días de adelanto)
+      - VIX sube >3 puntos en 1 semana (2-5 días de adelanto)
+      - SPY cae bajo EMA200 (confirmación de bear)
+    """
+    if not spy_data:
+        return {"regimen":"DESCONOCIDO","color":"#64748B","emoji":"❓",
+                "accion":"Sin datos de mercado","umbral_score":15,"alerta":""}
+
+    _rsi        = spy_data.get("rsi", 55)
+    _sobre_e200 = spy_data.get("sobre_ema200", True)
+    _dist_e200  = spy_data.get("dist_ema200", 5)
+    _macd_cruce = spy_data.get("macd_cruce", "positivo")
+    _macd_dir   = spy_data.get("macd_dir", "subiendo")
+    _chg_20d    = spy_data.get("chg_20d", 0)
+    _vix_trend  = vix_trend or {}
+    _vix_subiendo = _vix_trend.get("subiendo", False)
+    _vix_chg_7d   = _vix_trend.get("chg_7d", 0)
+
+    # ── SEÑALES DE ALERTA TEMPRANA ─────────────────────────
+    _alertas  = []
+    _urgencia = 0  # 0=ninguna, 1=precaución, 2=alerta, 3=urgente
+
+    if _macd_cruce == "negativo" and _macd_dir == "bajando":
+        _alertas.append("⚠️ MACD SPY cruzó a negativo — viento cambiando")
+        _urgencia = max(_urgencia, 2)
+    elif _macd_cruce == "negativo":
+        _alertas.append("💡 MACD SPY negativo pero estabilizando")
+        _urgencia = max(_urgencia, 1)
+
+    if _vix_chg_7d > 4:
+        _alertas.append(f"🚨 VIX subió +{_vix_chg_7d:.1f}pts en 7 días — miedo aumentando")
+        _urgencia = max(_urgencia, 2)
+    elif _vix_chg_7d > 2:
+        _alertas.append(f"⚠️ VIX subiendo +{_vix_chg_7d:.1f}pts — vigilar")
+        _urgencia = max(_urgencia, 1)
+
+    if _chg_20d < -5:
+        _alertas.append(f"🚨 SPY cayó {_chg_20d:.1f}% en 20 días")
+        _urgencia = max(_urgencia, 3)
+    elif _chg_20d < -2:
+        _alertas.append(f"⚠️ SPY débil en el mes: {_chg_20d:.1f}%")
+        _urgencia = max(_urgencia, 1)
+
+    # ── CLASIFICACIÓN DE RÉGIMEN ───────────────────────────
+    if not _sobre_e200 or (_chg_20d < -7):
+        # BEAR: SPY bajo EMA200 o caída fuerte
+        return {
+            "regimen":       "BEAR",
+            "color":         "#EF4444",
+            "color_bg":      "#FEF2F2",
+            "color_border":  "#FECACA",
+            "emoji":         "🐻",
+            "titulo":        "🐻 RÉGIMEN BEAR — Viento en contra",
+            "accion_nbis":   "No entrar NBIS nuevos · Solo defensa con catalizador excepcional",
+            "accion_mom":    "No entrar Momentum · Alto riesgo de reversión",
+            "accion_pos":    "🚨 Revisar TODOS los stops · Cristalizar ganancias inmediatamente",
+            "umbral_score":  17,
+            "alertas":       _alertas,
+            "urgencia":      _urgencia,
+            "contexto":      f"SPY {'bajo' if not _sobre_e200 else 'débil'} EMA200 · MACD {_macd_cruce} · VIX {vix_val:.0f}",
+        }
+    elif (_macd_cruce == "negativo" and _macd_dir == "bajando") or          (_vix_chg_7d > 4) or (_chg_20d < -3):
+        # ALERTA: señales de deterioro, aún bull pero cambiando
+        return {
+            "regimen":       "ALERTA",
+            "color":         "#F97316",
+            "color_bg":      "#FFF7ED",
+            "color_border":  "#FDBA74",
+            "emoji":         "⚠️",
+            "titulo":        "⚠️ RÉGIMEN CAMBIANDO — Señales de deterioro",
+            "accion_nbis":   "Pausar nuevas entradas NBIS · Solo score ≥17 con catalizador fuerte",
+            "accion_mom":    "No iniciar nuevas posiciones · Apretar stops de las existentes",
+            "accion_pos":    "⚡ Cristalizar 50% de posiciones con PnL > +10% · Apretar stops",
+            "umbral_score":  17,
+            "alertas":       _alertas,
+            "urgencia":      _urgencia,
+            "contexto":      f"MACD SPY {_macd_cruce} y {_macd_dir} · VIX +{_vix_chg_7d:.1f}pts/sem · SPY {_chg_20d:.1f}%/20d",
+        }
+    elif _rsi > 72 or (vix_val < 16 and _rsi > 68):
+        # SOBRECOMPRADO: sigue bull pero con riesgo de corrección
+        return {
+            "regimen":       "SOBRECOMPRADO",
+            "color":         "#EAB308",
+            "color_bg":      "#FEFCE8",
+            "color_border":  "#FDE047",
+            "emoji":         "🌡️",
+            "titulo":        "🌡️ MERCADO SOBRECOMPRADO — Ser selectivo",
+            "accion_nbis":   "Solo NBIS score ≥15 + catalizador real + WR perfil ≥70%",
+            "accion_mom":    "Solo Momentum RSI ≤78 · RE < 70 · catalizador activo",
+            "accion_pos":    "⚡ Mover stops de runners a breakeven · No cristalizar aún",
+            "umbral_score":  15,
+            "alertas":       _alertas,
+            "urgencia":      _urgencia,
+            "contexto":      f"SPY RSI {_rsi:.0f} · VIX {vix_val:.0f} · +{_dist_e200:.1f}% sobre EMA200",
+        }
+    elif 55 <= _rsi <= 72 and _sobre_e200 and _macd_cruce == "positivo":
+        # BULL NORMAL: condiciones ideales para el modelo
+        return {
+            "regimen":       "BULL",
+            "color":         "#22C55E",
+            "color_bg":      "#F0FDF4",
+            "color_border":  "#86EFAC",
+            "emoji":         "🚀",
+            "titulo":        "🚀 BULL MARKET NORMAL — Condiciones favorables",
+            "accion_nbis":   "Operar NBIS con score ≥13 + WR perfil ≥65%",
+            "accion_mom":    "Operar Momentum con score ≥13 · RSI acción ≤80",
+            "accion_pos":    "✅ Mantener posiciones · Stops normales · Buscar runners",
+            "umbral_score":  13,
+            "alertas":       _alertas,
+            "urgencia":      _urgencia,
+            "contexto":      f"SPY RSI {_rsi:.0f} · MACD+ · +{_dist_e200:.1f}% sobre EMA200",
+        }
+    else:
+        # NEUTRO
+        return {
+            "regimen":       "NEUTRO",
+            "color":         "#64748B",
+            "color_bg":      "#F8FAFC",
+            "color_border":  "#CBD5E1",
+            "emoji":         "⚡",
+            "titulo":        "⚡ MERCADO NEUTRO — Selectivo por ticker",
+            "accion_nbis":   "NBIS score ≥15 + catalizador confirmado",
+            "accion_mom":    "Momentum solo si RSI acción ≤75 y hay catalizador claro",
+            "accion_pos":    "📊 Mantener posiciones con catalizador · Revisar sin catalizador",
+            "umbral_score":  15,
+            "alertas":       _alertas,
+            "urgencia":      _urgencia,
+            "contexto":      f"SPY RSI {_rsi:.0f} · MACD {_macd_cruce} · VIX {vix_val:.0f}",
+        }
+
+
 tab1,tab2,tab3,tab4,tab5,tab_posiciones,tab8,tab_score,tab9=st.tabs([
     "⚡ Momentum","⚡ Swing Activo","🔥 Entrar hoy",
     "🔗 Sympathy","🔎 Mi Watchlist",
@@ -11279,6 +11518,8 @@ with tab1:
                             "Stop":        f"${round(_pa_m*0.95,2):.2f} (-5%)",
                             "T1":          f"${round(_pa_m*1.15,2):.2f} (+15%)",
                             "T2":          f"${round(_pa_m*1.30,2):.2f} (+30%)",
+                            "Sector":      str(_info_m.get("sector","") or "-"),
+                            "Nombre":      str(_info_m.get("shortName","") or _tk_m),
                         })
                     except Exception:
                         continue
@@ -11359,13 +11600,16 @@ with tab1:
                     _pc_mom = float(str(_mr.get("Precio",0)) or 0)
                 except Exception:
                     _pc_mom = 0
+                # Buscar Area desde Watchlist, fallback al sector de yfinance
+                _area_wl_mom  = _buscar_area_watchlist(_mr["Ticker"])
+                _area_mom_fin = _area_wl_mom if _area_wl_mom != "-" else _mr.get("Sector","-")
                 _ok_m, _msg_m = escribir_greko_sheets(
                     ticker=_mr["Ticker"],
                     precio_compra=_pc_mom,
                     fase="M3",
                     score=int(_mr.get("Score_Mom",50)),
-                    prob_nbis=float(str(_mr.get("Score_Mom",0) or 0)),  # Score como proxy de probabilidad
-                    area=_mr.get("Sector","-"),
+                    prob_nbis=float(str(_mr.get("Score_Mom",0) or 0)),
+                    area=_area_mom_fin,
                     tipo="Accion",
                     fuente="Momentum",
                     arrastradas="-",
@@ -12506,37 +12750,39 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
     _wl_sheets = leer_watchlist_sheets()
     # P5_OK = conectado exitosamente aunque session_state diga error
     _wl_diag = st.session_state.get("_wl_sheets_error","")
-    _wl_sheets_ok = (_wl_sheets is not None and not _wl_sheets.empty) or "P5_OK" in _wl_diag
+    # v19.3: P5_OK = datos cargados correctamente (aunque el df tenga issues de encoding)
+    _wl_sheets_ok = "P5_OK" in _wl_diag or (_wl_sheets is not None and not _wl_sheets.empty)
 
-    if _wl_sheets_ok:
-        _wl_col_ok1, _wl_col_ok2 = st.columns([4,1])
-        with _wl_col_ok1:
+    _wl_col_ok1, _wl_col_ok2 = st.columns([4,1])
+    with _wl_col_ok1:
+        if _wl_sheets_ok:
+            _n_wl = len(_wl_sheets) if _wl_sheets is not None and not _wl_sheets.empty else 0
+            _filas_wl = _wl_diag.split("filas")[0].split(":")[-1].strip() if "filas" in _wl_diag else str(_n_wl)
             st.markdown(
                 f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
                 f'border-radius:8px;padding:7px 14px;margin-bottom:8px;font-size:11px">'
                 f'✅ <strong style="color:#16A34A">GrekoTrader_Watchlist conectado</strong> — '
-                f'{len(_wl_sheets)} acciones · se actualiza automáticamente'
+                f'{_filas_wl} acciones · columna Ticket detectada automáticamente'
                 f'</div>', unsafe_allow_html=True)
-        with _wl_col_ok2:
-            _banner_mercado_macro()
+        else:
+            _wl_err = st.session_state.get("_wl_sheets_error", "Sin detalle")
+            _wl_id  = _get_sheet_id_from_secrets("watchlist_id")
+            st.markdown(
+                f'<div style="background:#FEF2F2;border:2px solid #FCA5A5;'
+                f'border-radius:10px;padding:12px 16px;margin-bottom:8px">'
+                f'<div style="font-size:12px;font-weight:700;color:#DC2626;margin-bottom:6px">'
+                f'⚠️ GrekoTrader_Watchlist no conectado</div>'
+                f'<div style="font-size:10px;color:#374151;line-height:1.8">'
+                f'<strong>Sheet ID:</strong> {"✅ " + _wl_id[:20] + "..." if _wl_id else "❌ watchlist_id no encontrado"}<br>'
+                f'<strong>Diagnóstico:</strong> <code>{_wl_err}</code>'
+                f'</div>'
+                f'</div>', unsafe_allow_html=True)
+    with _wl_col_ok2:
+        _banner_mercado_macro()
 
     if st.button("🔄 Recargar", key="btn_reload_wl", help="Forzar recarga desde Sheets"):
-                leer_watchlist_sheets.clear()
-                st.rerun()
-    else:
-        _wl_err = st.session_state.get("_wl_sheets_error", "Sin detalle")
-        _wl_id  = _get_sheet_id_from_secrets("watchlist_id")
-        st.markdown(
-            f'<div style="background:#FEF2F2;border:2px solid #FCA5A5;'
-            f'border-radius:10px;padding:12px 16px;margin-bottom:8px">'
-            f'<div style="font-size:12px;font-weight:700;color:#DC2626;margin-bottom:6px">'
-            f'⚠️ GrekoTrader_Watchlist no conectado</div>'
-            f'<div style="font-size:10px;color:#374151;line-height:1.8">'
-            f'<strong>Sheet ID:</strong> {"✅ " + _wl_id[:20] + "..." if _wl_id else "❌ watchlist_id no encontrado en Secrets"}<br>'
-            f'<strong>Diagnóstico:</strong> <code>{_wl_err}</code>'
-            f'</div>'
-            f'</div>',
-            unsafe_allow_html=True)
+        leer_watchlist_sheets.clear()
+        st.rerun()
 
     # ── Fallback: CSV upload ────────────────────────────────────
     # Solo mostrar CSV upload si Sheets NO está conectado
@@ -15043,6 +15289,45 @@ with tab_score:
 
     with st.expander("📋 ¿Qué busca este tab? — Cómo leer el Score MVALLE", expanded=False):
         st.markdown(
+            "<div style='font-size:11px;line-height:1.9'>"
+            "<strong style='color:#EA580C'>🎯 Tab Score MVALLE — ¿Qué acción entra a MVALLE mañana?</strong><br>"
+            "Usa a las <strong>16:00 hrs</strong> al cierre del mercado. Primero actualiza fases "
+            "(Tab Posiciones → 🔄 Actualizar Fases), luego recalcula aquí.<br><br>"
+
+            "<strong style='color:#1D4ED8'>🔄 MODELO REBOTE NBIS — Criterios de selección:</strong><br>"
+            "Busca acciones caídas que comienzan a rebotar con catalizador real.<br>"
+            "🔸 <strong>N1 Fase:</strong> M3 (confirmado) · M2 (en formación)<br>"
+            "🔸 <strong>N2 RSI:</strong> 35-52 → +3pts NBIS · 52-82 → +2pts · 82+ → +1pt<br>"
+            "🔸 <strong>N3 DD:</strong> ≤-25% → +3pts · ≤-15% → +2pts · ≤-10% → +1pt<br>"
+            "🔸 <strong>N4 Prob NBIS:</strong> 30-45% → +3pts · 45-50% → +2pts<br>"
+            "🔸 <strong>N5 MACD:</strong> positivo → +3pts · negativo → -1pt<br>"
+            "🔸 <strong>N6 SPY RSI:</strong> ≤60 → +2pts · ≤68 → +1pt · >68 → -2pts<br>"
+            "🔸 <strong>N7 Urgencia:</strong> Post-earn BEAT → +3 · Earn 3-7d → +2 · MISS → -2<br>"
+            "<strong>Gestión NBIS:</strong> Stop -7% · T1 +8% (vender 40%) · T2 +12% · Trailing -5%<br><br>"
+
+            "<strong style='color:#D97706'>⚡ MODELO MOMENTUM — Criterios de selección:</strong><br>"
+            "Busca acciones con catalizador activo subiendo con volumen y MACD+.<br>"
+            "🔸 <strong>M1 Fuente:</strong> Momentum scan · Sympathy · Watchlist RSI≥65<br>"
+            "🔸 <strong>M2 RSI:</strong> 65-75 → +3pts · 75-82 → +2pts · >82 → +1pt<br>"
+            "🔸 <strong>M3 MACD:</strong> positivo → +3pts · negativo → -2pts<br>"
+            "🔸 <strong>M4 Score:</strong> basado en señal del scan<br>"
+            "🔸 <strong>M5 SPY · M6 Prob · M7 Urgencia:</strong> igual que NBIS<br>"
+            "<strong>Gestión Momentum:</strong> 20-30% · Stop -5% · T1 +15% · T2 +30%<br><br>"
+
+            "<strong style='color:#16A34A'>✅ REGLA DE DECISIÓN (misma para ambos modelos):</strong><br>"
+            "🔴 <strong>WR histórico &lt;50%</strong> → 🚫 NO ENTRAR siempre · WR mide cuántas señales similares ganaron<br>"
+            "🟢 <strong>Score ≥15</strong> + WR≥50% + RE&lt;75 → ✅ ENTRAR · señal calificada<br>"
+            "🟡 <strong>Score ≥15</strong> + RE≥75 → ⚡ PARCIAL · extensión elevada, reducir tamaño<br>"
+            "🟡 <strong>Score 11-14</strong> + WR≥50% → 🟡 Buena Señal · evaluar, no entrar aún<br>"
+            "⚪ <strong>Score &lt;11</strong> → ⏳ Esperar · señal débil<br><br>"
+
+            "<strong>🔰 Riesgo Extensión (RE):</strong> NBIS: &lt;65 ok · ≥65 parcial · "
+            "Momentum: &lt;75 ok · ≥75 parcial<br>"
+            "<strong>📊 Rango Histórico:</strong> WR% y P50% de señales similares en tus 104 posiciones reales<br>"
+            "<strong>📈 Fundamentales:</strong> Rev YoY · Upside analistas · N° analistas<br>"
+            "<strong>🌡️ Régimen mercado:</strong> ajusta el umbral dinámicamente (Bull→13 · Normal→15 · Bear→17)"
+            "</div>", unsafe_allow_html=True)
+        st.markdown(
             "<div style='font-size:11px;line-height:1.8'>"
             "<strong style='color:#EA580C'>🎯 Tab Score MVALLE — Decisión para mañana al abrir mercado</strong><br>"
             "Úsalo a las <strong>16:00 hrs</strong> cuando cierra el mercado. "
@@ -15097,6 +15382,45 @@ with tab_score:
             "<strong>🚫 Bloqueos:</strong> Earnings HOY · Sin analistas (NBIS) · Precio sobre target<br>"
             "<strong>💥 Señal ideal:</strong> RSI LIVE 48-65 · DD ≤-25% · MACD+ · Rev &gt;30% · GTU N3-4"
             "</div>", unsafe_allow_html=True)
+    # ── Alerta de Régimen en Tab Posiciones ─────────────────
+    _reg_pos = st.session_state.get("_regimen_mercado", {})
+    if _reg_pos:
+        _rp_regimen  = _reg_pos.get("regimen","NEUTRO")
+        _rp_color    = _reg_pos.get("color","#64748B")
+        _rp_bg       = _reg_pos.get("color_bg","#F8FAFC")
+        _rp_bor      = _reg_pos.get("color_border","#CBD5E1")
+        _rp_accion   = _reg_pos.get("accion_pos","")
+        _rp_alertas  = _reg_pos.get("alertas",[])
+        _rp_urgencia = _reg_pos.get("urgencia",0)
+        if _rp_urgencia >= 2 or _rp_regimen in ("BEAR","ALERTA"):
+            st.markdown(
+                f'<div style="background:{_rp_bg};border:1px solid {_rp_bor};'
+                f'border-left:4px solid {_rp_color};border-radius:8px;'
+                f'padding:8px 14px;margin-bottom:8px">'
+                f'<div style="font-size:11px;font-weight:900;color:{_rp_color}">'
+                f'🌡️ {_reg_pos.get("titulo","")} — Acción recomendada:</div>'
+                f'<div style="font-size:11px;color:{_rp_color};margin-top:3px;font-weight:700">'
+                f'{_rp_accion}</div>'
+                + ''.join([f'<div style="font-size:10px;color:{_rp_color}90;margin-top:2px">{a}</div>'
+                           for a in _rp_alertas])
+                + f'</div>', unsafe_allow_html=True)
+
+    # ── Alerta de Régimen en Tab Posiciones ─────────────────
+    _reg_pos = st.session_state.get("_regimen_mercado", {})
+    if _reg_pos and _reg_pos.get("urgencia",0) >= 2:
+        _rp_c = _reg_pos.get("color","#64748B")
+        _rp_bg= _reg_pos.get("color_bg","#F8FAFC")
+        _rp_b = _reg_pos.get("color_border","#CBD5E1")
+        st.markdown(
+            f'<div style="background:{_rp_bg};border:1px solid {_rp_b};'
+            f'border-left:4px solid {_rp_c};border-radius:8px;'
+            f'padding:8px 14px;margin-bottom:8px">'
+            f'<div style="font-size:12px;font-weight:900;color:{_rp_c}">'
+            f'🌡️ {_reg_pos.get("titulo","")} — Acción en posiciones:</div>'
+            f'<div style="font-size:11px;color:{_rp_c};margin-top:3px">'
+            f'{_reg_pos.get("accion_pos","")}</div></div>',
+            unsafe_allow_html=True)
+
     # Banner macro con SPY RSI live (calculado en el batch)
     _spy_rsi_banner = st.session_state.get("_spy_rsi_for_banner", 0)
     _banner_mercado_macro(_spy_rsi_banner)
@@ -15115,17 +15439,31 @@ with tab_score:
                               use_container_width=True,
                               help="Actualiza RSI/MACD actuales (5-10 seg)")
 
-    # ── Contador SIEMPRE visible — fuera de todos los bloques condicionales ──
-    _cnt_sc = st.empty()
-
     # ── Cargar posiciones activas ────────────────────────────────
     import time as _time_score
     _cache_ts = st.session_state.get("_score_cache_ts", 0)
-    # TTL: limpiar caché si tiene más de 10 minutos (sin escribir timestamp aún)
+    # TTL: limpiar caché si tiene más de 10 minutos
     if _time_score.time() - _cache_ts > 600:
         st.session_state.pop("_score_rows_base", None)
 
+    # Umbral dinámico según régimen del mercado
+    _reg_sc    = st.session_state.get("_regimen_mercado", {})
+    _umbral_sc = _reg_sc.get("umbral_score", 15)
+    if _reg_sc:
+        _rc_sc = _reg_sc.get("color","#64748B")
+        _rb_sc = _reg_sc.get("color_bg","#F8FAFC")
+        st.markdown(
+            f'<div style="background:{_rb_sc};border-left:3px solid {_rc_sc};'
+            f'border-radius:6px;padding:6px 12px;margin-bottom:8px;font-size:11px">'
+            f'🌡️ <strong style="color:{_rc_sc}">{_reg_sc.get("titulo","")}</strong>'
+            f' · Score mínimo: <strong style="color:{_rc_sc}">≥{_umbral_sc}/20</strong>'
+            f'</div>', unsafe_allow_html=True)
+
     if "_score_rows_base" not in st.session_state:
+        # ── Contador AQUÍ — dentro del bloque de cálculo, antes del spinner ──
+        # Streamlit necesita que st.empty() y el spinner compartan el mismo
+        # contexto de renderizado para que los updates sean visibles en tiempo real
+        _cnt_sc = st.empty()
         # ── Mostrar progreso con spinner + empty (patrón Momentum) ──
         with st.spinner("📡 Calculando Score MVALLE..."):
             _cnt_sc.info("📋 1 de 3: Leyendo posiciones Greko + MVALLE...")
@@ -15159,10 +15497,14 @@ with tab_score:
                     _f  = str(row.get("Fase","-")).upper()
                     _s  = str(row.get("Fuente","")).upper()
                     _ts = str(row.get("Tipo_Señal","-")).upper()
-                    if any(x in _f for x in ["M3","FASE 3","FASE3","ENTRAR HOY",
-                                              "ENTRAR","M3-A","ANTICIPAR","RUPTURA","PRE-SEÑAL"]):
+                    # v19.3: incluir M2, M3, Momentum y todas las activas
+                    if any(x in _f for x in ["M3","M2","FASE 3","FASE3","FASE 2","FASE2",
+                                              "ENTRAR","M3-A","ANTICIPAR","MOMENTUM",
+                                              "SWING","SEGUIR","VIGILAR"]):
                         return True
-                    return "MOMENTUM" in _s or "MOMENTUM" in _ts or "SYMPATHY" in _s
+                    if "MOMENTUM" in _s or "MOMENTUM" in _ts or "SYMPATHY" in _s:
+                        return True
+                    return _f not in ("-","","NAN","NONE","M1")
 
                 _df_m3_sc  = _df_act_sc[_df_act_sc.apply(_es_m3_sc, axis=1)].copy()
                 _tks_sc    = [str(r.get("Ticker","")).upper().strip()
@@ -15180,7 +15522,7 @@ with tab_score:
                         import yfinance as _yf_sc_dl
                         _tks_dl = _tks_sc + ["SPY"]
                         _dl_sc  = _yf_sc_dl.download(
-                            " ".join(_tks_dl), period="6mo",
+                            " ".join(_tks_dl), period="1y",
                             auto_adjust=True, progress=False, threads=True)
                         _cl_sc  = _dl_sc.get("Close", _dl_sc)
 
@@ -15191,8 +15533,14 @@ with tab_score:
                                          else _cl_sc.dropna())
                                 if len(_s_dl) < 20: continue
                                 _pa_dl    = float(_s_dl.iloc[-1])
-                                _pico_dl  = float(_s_dl.rolling(120, min_periods=1).max().iloc[-1])
-                                _dd_dl    = round((_pa_dl-_pico_dl)/_pico_dl*100,1) if _pico_dl>0 else 0
+                                # DD 6m para N3
+                                _pico_6m    = float(_s_dl.iloc[-126:].max()) if len(_s_dl)>=126 else float(_s_dl.max())
+                                _dd_dl      = round((_pa_dl-_pico_6m)/_pico_6m*100,1) if _pico_6m>0 else 0
+                                # Dist_52W y EMA50 para RE
+                                _pico_52w   = float(_s_dl.rolling(252,min_periods=1).max().iloc[-1])
+                                _dist_52w_dl= round((_pa_dl-_pico_52w)/_pico_52w*100,1) if _pico_52w>0 else 0
+                                _ema50_v    = float(_s_dl.ewm(span=50,adjust=False).mean().iloc[-1])
+                                _dist_e50   = round((_pa_dl-_ema50_v)/_ema50_v*100,1) if _ema50_v>0 else 0
                                 _d_dl     = _s_dl.diff()
                                 _g_dl     = _d_dl.clip(lower=0).rolling(14).mean()
                                 _lo_dl    = (-_d_dl.clip(upper=0)).rolling(14).mean()
@@ -15204,7 +15552,9 @@ with tab_score:
                                 else:
                                     _live_sc[_tk_dl] = {
                                         "rsi": _rsi_dl, "macd": _macd_dl,
-                                        "dd": _dd_dl, "precio": round(_pa_dl, 2)
+                                        "dd":        _dd_dl,  "precio":  round(_pa_dl, 2),
+                                        "dist_52w":  _dist_52w_dl,
+                                        "dist_ema50":_dist_e50,
                                     }
                             except Exception: pass
                     except Exception: pass
@@ -15429,18 +15779,34 @@ with tab_score:
                         else:           _n5=0;_n5_l="MACD N/D"
 
                         _total=max(0,min(20,_n1+_n2+_n3+_n4+_n5+_c_spy+_urg))
-                        if _bloq:       _total=min(_total,8);_rec="🚫 BLOQUEADO";_rc="#6B7280"
-                        elif _total>=15:_rec="🔴 ENTRAR MAÑANA";_rc="#DC2626"
-                        elif _total>=11:_rec="🟡 Buena señal";_rc="#D97706"
-                        elif _total>=7: _rec="⚪ Esperar";_rc="#64748B"
-                        else:           _rec="⬇️ Baja prio";_rc="#94A3B8"
+                        if _bloq:
+                            _total=min(_total,8);_rec="🚫 BLOQUEADO";_rc="#6B7280"
+                        else:
+                            # v19.3: Score = gate principal · WR = filtro duro
+                            _rh_pre = _gtu_get_rh(_rsi_ac, abs(_dd_p), _prob)
+                            _wr_pre = _rh_pre.get("rh_wr", 50)
+                            _re_pre_nbis = _re_result.get("re",0) if "_re_result" in dir() else 50
+                            if _wr_pre < 50:
+                                # WR bajo = trampa de valor, nunca entrar
+                                _rec="🚫 No entrar";_rc="#EF4444"
+                            elif _total >= 15 and _re_pre_nbis < 65:
+                                _rec="✅ Entrar";_rc="#16A34A"
+                            elif _total >= 15:
+                                _rec="⚡ Parcial";_rc="#F97316"
+                            elif _total >= 11:
+                                _rec="🟡 Buena Señal";_rc="#D97706"
+                            elif _total >= 7:
+                                _rec="⚪ Esperar";_rc="#64748B"
+                            else:
+                                _rec="⬇️ Baja prio";_rc="#94A3B8"
 
-                        # GTU calculation
-                        _earn_flag = 1 if (_urg_l and "⚡" in _urg_l) else 0
-                        _gtu_result = calcular_gtu(
-                            rsi=_rsi_ac, prob_nbis=_prob,
-                            score_mvalle=_total, dd_abs=abs(_dd_p),
-                            earnings_flag=_earn_flag)
+                        # Riesgo Extensión NBIS
+                        _ld_re       = _live_sc.get(_tk, {})
+                        _dist_ema_re = _ld_re.get("dist_ema50", 0)
+                        _dist_52w_re = _ld_re.get("dist_52w", 0)
+                        _re_result   = calcular_riesgo_extension(
+                            rsi=_rsi_ac, dist_ema50=_dist_ema_re,
+                            dist_52w=_dist_52w_re, tipo="NBIS")
 
                         _nbis_rows_new.append({
                             "Ticker":_tk,"Sector":_area[:14],"Fase":_n1_l,
@@ -15455,7 +15821,7 @@ with tab_score:
                             "RevYoY":_rv_str,
                             "Alertas":_alerta_str,"Bloqueado":_bloq,
                             "Cartera":str(_r.get("_cartera","Greko")),
-                            "GTU":_gtu_result,
+                            "RE":_re_result,
                         })
                     else:
                         # Momentum
@@ -15489,18 +15855,32 @@ with tab_score:
                         else:           _m6=0;_m6_l="Pr N/D"
 
                         _total=max(0,min(20,_m1+_m2+_m3+_m4+_m5+_m6+_urg))
-                        if _bloq:       _total=min(_total,8);_rec="🚫 BLOQUEADO";_rc="#6B7280"
-                        elif _total>=15:_rec="🔴 ENTRAR MAÑANA";_rc="#DC2626"
-                        elif _total>=11:_rec="🟡 Buena señal";_rc="#D97706"
-                        elif _total>=7: _rec="⚪ Esperar";_rc="#64748B"
-                        else:           _rec="⬇️ Baja prio";_rc="#94A3B8"
-
-                        # GTU calculation
-                        _earn_flag_m = 1 if (_urg_l and "⚡" in _urg_l) else 0
-                        _gtu_result_m = calcular_gtu(
-                            rsi=_rsi_ac, prob_nbis=_prob,
-                            score_mvalle=_total, dd_abs=abs(_dd_p),
-                            earnings_flag=_earn_flag_m)
+                        if _bloq:
+                            _total=min(_total,8);_rec="🚫 BLOQUEADO";_rc="#6B7280"
+                        else:
+                            # v19.3: Score = gate principal · WR = filtro duro (Momentum)
+                            _rh_pre_m = _gtu_get_rh(_rsi_ac, abs(_dd_p), _prob)
+                            _wr_pre_m = _rh_pre_m.get("rh_wr", 50)
+                            _re_pre_m = _re_result_m.get("re",0) if "_re_result_m" in dir() else 50
+                            if _wr_pre_m < 50:
+                                _rec="🚫 No entrar";_rc="#EF4444"
+                            elif _total >= 15 and _re_pre_m < 75:
+                                _rec="✅ Entrar";_rc="#16A34A"
+                            elif _total >= 15:
+                                _rec="⚡ Parcial";_rc="#F97316"
+                            elif _total >= 11:
+                                _rec="🟡 Buena Señal";_rc="#D97706"
+                            elif _total >= 7:
+                                _rec="⚪ Esperar";_rc="#64748B"
+                            else:
+                                _rec="⬇️ Baja prio";_rc="#94A3B8"
+                        # Riesgo Extensión Momentum
+                        _ld_re_m       = _live_sc.get(_tk, {})
+                        _dist_ema_re_m = _ld_re_m.get("dist_ema50", 0)
+                        _dist_52w_re_m = _ld_re_m.get("dist_52w", 0)
+                        _re_result_m   = calcular_riesgo_extension(
+                            rsi=_rsi_ac, dist_ema50=_dist_ema_re_m,
+                            dist_52w=_dist_52w_re_m, tipo="Momentum")
 
                         _mom_rows_new.append({
                             "Ticker":_tk,"Sector":_area[:14],"Fuente":_m1_l,
@@ -15515,7 +15895,7 @@ with tab_score:
                             "RevYoY":_rv_str,
                             "Alertas":_alerta_str,"Bloqueado":_bloq,
                             "Cartera":str(_r.get("_cartera","Greko")),
-                            "GTU":_gtu_result_m,
+                            "RE":_re_result_m,
                         })
 
             _nbis_rows_new.sort(key=lambda x: x["TOTAL"], reverse=True)
@@ -15601,6 +15981,10 @@ with tab_score:
 
         # ══ SECCIÓN NBIS ══════════════════════════════════════
         if _nbis_rows:
+            # Mostrar resumen rápido: cuántas en cada estado
+            _n_entrar = sum(1 for r in _nbis_rows if r.get("Rec","").startswith("✅"))
+            _n_parcial= sum(1 for r in _nbis_rows if r.get("Rec","").startswith("⚡"))
+            _n_buena  = sum(1 for r in _nbis_rows if r.get("Rec","").startswith("🟡"))
             st.markdown(
                 f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;'
                 f'border-radius:8px 8px 0 0;padding:8px 14px;margin-top:12px">'
@@ -15624,14 +16008,36 @@ with tab_score:
                 f'<div style="text-align:center">Rev<br>YoY</div>'
                 f'<div>Recomendación / Alertas</div>'
                 f'</div>', unsafe_allow_html=True)
-            for _rn in _nbis_rows:
-                _bg = "#FFFBEB" if _rn["TOTAL"]>=15 else "#F8FAFF" if _rn["TOTAL"]>=11 else BG_CARD
-                _bl = "#FB923C" if _rn["TOTAL"]>=15 else "#93C5FD" if _rn["TOTAL"]>=11 else "#BFDBFE"
-                _sc = G if _rn["TOTAL"]>=15 else A if _rn["TOTAL"]>=11 else TXT_MUT
-                _gtu_rn = _rn.get("GTU", {})
-                _rev_rn = _rn.get("RevYoY","N/D")
-                _an_rn  = _rn.get("Analistas", 0)
-                _up_rn  = _rn.get("Upside","N/D")
+            # Agrupar por sector
+            # Agrupar por sector preservando orden por score (mejor primero)
+            _nbis_sectores = {}
+            for _rn in _nbis_rows:  # ya vienen ordenados desc por score
+                _sec_key = str(_rn.get("Sector","Other")).strip() or "Other"
+                _nbis_sectores.setdefault(_sec_key, []).append(_rn)
+            # Ordenar sectores por mejor score de cada grupo
+            _nbis_sectores_sorted = sorted(
+                _nbis_sectores.items(),
+                key=lambda kv: max(r["TOTAL"] for r in kv[1]), reverse=True)
+
+            for _sector_nbis, _rows_nbis in _nbis_sectores_sorted:
+                _best_sc_nbis = max(r["TOTAL"] for r in _rows_nbis)
+                if len(_nbis_sectores_sorted) > 1:
+                    st.markdown(
+                        f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;'
+                        f'padding:3px 10px;font-size:9px;font-weight:700;color:#1D4ED8;'
+                        f'border-top:none">🏭 {_sector_nbis} · Mejor score: {_best_sc_nbis}/20</div>',
+                        unsafe_allow_html=True)
+                for _rn in _rows_nbis:
+                    _bg = "#FFFBEB" if _rn["TOTAL"]>=15 else "#F8FAFF" if _rn["TOTAL"]>=11 else BG_CARD
+                    _bl = "#FB923C" if _rn["TOTAL"]>=15 else "#93C5FD" if _rn["TOTAL"]>=11 else "#BFDBFE"
+                    _sc = G if _rn["TOTAL"]>=15 else A if _rn["TOTAL"]>=11 else TXT_MUT
+                    _rev_rn = _rn.get("RevYoY","N/D")
+                    _an_rn  = _rn.get("Analistas", 0)
+                    _up_rn  = _rn.get("Upside","N/D")
+                # ── Fila principal de la tabla ──────────────────────────────
+                # Extraer valores del _rn para el render (no del loop de cálculo)
+                _rsi_rn  = float(_rn.get("RSI", 0) or 0)
+                _macd_rn = str(_rn.get("MACD", "-"))
                 st.markdown(
                     f'<div style="display:grid;grid-template-columns:{_CN};gap:3px;'
                     f'padding:7px 8px;background:{_bg};border:1px solid {_bl};'
@@ -15645,59 +16051,109 @@ with tab_score:
                     f'<div style="text-align:center;font-size:18px;font-weight:900;color:{_sc}">{_rn["TOTAL"]}</div>'
                     f'<div style="font-size:10px;font-weight:700;color:{_rn["Rc"]}">{_rn["Rec"]}</div>'
                     f'</div>', unsafe_allow_html=True)
-                # GTU + Rango Histórico + Fundamentales
-                if _gtu_rn:
-                    _rh_color = _gtu_rn.get("rh_color","#64748B")
-                    _rh_wr    = _gtu_rn.get("rh_wr",0)
-                    _rh_p50   = _gtu_rn.get("rh_p50",0)
-                    _rh_p25   = _gtu_rn.get("rh_p25",0)
-                    _rh_p75   = _gtu_rn.get("rh_p75",0)
-                    _rh_n     = _gtu_rn.get("rh_n",0)
-                    _rh_emoji = _gtu_rn.get("rh_emoji","—")
-                    _gtu_score= _gtu_rn.get("gtu",0)
-                    _gtu_emoji= _gtu_rn.get("emoji","")
-                    _gtu_rango= _gtu_rn.get("rango","")
-                    _gtu_nivel= _gtu_rn.get("nivel",1)
-                    _gtu_color= _gtu_rn.get("color","#64748B")
-                    _an_display = f"{_an_rn} analistas" if _an_rn > 0 else "Sin cobertura"
-                    _rev_display= _rev_rn if _rev_rn not in ("","None","nan") else "N/D"
-                    _up_display = _up_rn if _up_rn not in ("","None","nan","+0%") else "N/D"
-                    st.markdown(
-                        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;'
-                        f'padding:4px 8px 8px 8px;background:{_bg};border:1px solid {_bl};'
-                        f'border-top:none;border-left:3px solid {_bl};border-bottom:3px solid {_bl};'
-                        f'margin-bottom:4px">'
-                        # GTU GrekoTrader
-                        f'<div style="background:#0A1020;border:1px solid {_gtu_color}40;border-radius:6px;padding:5px 8px">'
-                        f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase;letter-spacing:.8px">🎯 GTU GrekoTrader</div>'
-                        f'<div style="font-size:13px;font-weight:800;color:{_gtu_color}">{_gtu_emoji} N{_gtu_nivel} · {_gtu_score:.0f}/100</div>'
-                        f'<div style="font-size:9px;color:#94A3B8">Rango estimado: <strong style="color:{_gtu_color}">{_gtu_rango}</strong></div>'
-                        f'</div>'
-                        # Rango Histórico
-                        f'<div style="background:#0A1020;border:1px solid {_rh_color}40;border-radius:6px;padding:5px 8px">'
-                        f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase;letter-spacing:.8px">📊 Rango Histórico</div>'
-                        f'<div style="font-size:13px;font-weight:800;color:{_rh_color}">{_rh_emoji} WR {_rh_wr:.0f}% · N={_rh_n}</div>'
-                        f'<div style="font-size:9px;color:#94A3B8">P25:{_rh_p25:+.0f}% · P50:{_rh_p50:+.0f}% · P75:{_rh_p75:+.0f}%</div>'
-                        f'</div>'
-                        # Fundamentales
-                        f'<div style="background:#0A1020;border:1px solid #2A3547;border-radius:6px;padding:5px 8px">'
-                        f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase;letter-spacing:.8px">📈 Fundamentales</div>'
-                        f'<div style="font-size:11px;font-weight:700;color:#E2E8F0">Rev: <span style="color:{"#22C55E" if _rev_display!="N/D" else "#64748B"}">{_rev_display}</span> · Up: <span style="color:{"#22C55E" if _up_display!="N/D" else "#64748B"}">{_up_display}</span></div>'
-                        f'<div style="font-size:9px;color:#94A3B8">{_an_display} · {_rn.get("Alertas","—")[:35]}</div>'
-                        f'</div>'
-                        f'</div>',
-                        unsafe_allow_html=True)
 
+                # ── Rango Histórico + Fundamentales + RE + Veredicto ──
+                _re_rn      = _rn.get("RE", {})
+                _an_display = f"{_an_rn} analistas" if _an_rn > 0 else "Sin cobertura"
+                _rev_display= _rev_rn if _rev_rn not in ("","None","nan") else "N/D"
+                _up_display = _up_rn if _up_rn not in ("","None","nan","+0%") else "N/D"
+                _rh_perfil  = _gtu_get_rh(_rsi_ac, abs(_dd_p), _prob)
+                _rh_wr      = _rh_perfil.get("rh_wr", 0)
+                _rh_p50     = _rh_perfil.get("rh_p50", 0)
+                _rh_p25     = _rh_perfil.get("rh_p25", 0)
+                _rh_p75     = _rh_perfil.get("rh_p75", 0)
+                _rh_n       = _rh_perfil.get("rh_n", 0)
+                _rh_color   = _rh_perfil.get("rh_color", "#64748B")
+                _rh_human   = ("📈 Favorable" if _rh_wr>=70 else "📊 Moderado" if _rh_wr>=50 else "⚠️ Historial débil")
+                _rh_n_note  = f"({_rh_n} casos)" if _rh_n >= 6 else "(pocos datos)"
+                _rev_num = 0
+                try: _rev_num = float(str(_rev_display).replace("%","").replace("+","").replace("N/D","0"))
+                except: pass
+                _up_num = 0
+                try: _up_num  = float(str(_up_display).replace("%","").replace("+","").replace("N/D","0"))
+                except: pass
+                if _rev_num>=15 and _up_num>=10:   _fund_human="✅ Sólidos"; _fund_color="#22C55E"
+                elif _up_num<0:                    _fund_human="🚫 Sobre target"; _fund_color="#EF4444"
+                elif _rev_num<0:                   _fund_human="⚠️ Revenue caída"; _fund_color="#F97316"
+                elif _rev_num>0 and _up_num>0:     _fund_human="🟡 Moderados"; _fund_color="#F59E0B"
+                else:                              _fund_human="📊 Sin datos"; _fund_color="#64748B"
+                _tiene_cat  = _rev_num>=15 or _up_num>=10
+                _nbis_score = int(_rn.get("TOTAL", 0))
+                _re_sc_nbis = float(_re_rn.get("re",0)) if _re_rn else 0
+                # REGLA UNIFICADA NBIS:
+                # GATE 1 — WR < 50% = trampa de valor, nunca entrar
+                # GATE 2 — Score ≥15 = señal calificada
+                # GATE 3 — RE ajusta tamaño si score ya califica
+                if _rh_wr < 50:
+                    _vered="🚫 NO ENTRAR"; _vc="#EF4444"; _vbg="#FEF2F2"
+                    _vreason=f"WR histórico {int(_rh_wr)}% — el {100-int(_rh_wr)}% de señales similares perdió"
+                elif _nbis_score >= 15 and _re_sc_nbis < 65:
+                    _vered="✅ ENTRAR"; _vc="#16A34A"; _vbg="#F0FDF4"
+                    _vreason=f"Score {_nbis_score} ✓ · WR {int(_rh_wr)}% · P50:{_rh_p50:+.0f}% · RE ok"
+                elif _nbis_score >= 15 and _re_sc_nbis >= 65:
+                    _vered="⚡ ENTRAR PARCIAL"; _vc="#F97316"; _vbg="#FFF7ED"
+                    _vreason=f"Score {_nbis_score} ✓ · RE {_re_sc_nbis:.0f} elevado — 50% del tamaño"
+                elif _nbis_score >= 11:
+                    _vered="🟡 BUENA SEÑAL"; _vc="#D97706"; _vbg="#FFFBEB"
+                    _vreason=f"Score {_nbis_score} — evaluar pero aún no cumple umbral ≥15 para entrar"
+                elif _nbis_score >= 7:
+                    _vered="⏳ ESPERAR"; _vc="#64748B"; _vbg="#F8FAFC"
+                    _vreason=f"Score {_nbis_score} bajo · esperar confirmación técnica"
+                else:
+                    _vered="⬇️ BAJA PRIO"; _vc="#94A3B8"; _vbg="#F8FAFC"
+                    _vreason="Señal débil"
+                _re_nivel  = _re_rn.get("nivel","") if _re_rn else ""
+                _re_score_n = float(_re_rn.get("re",0)) if _re_rn else 0
+                # v19.3: RE ≥ 65 baja un nivel en NBIS (umbral calibrado)
+                if _re_nivel == "NO_ENTRAR":
+                    _vered="⚡ ENTRAR PARCIAL"; _vc="#F97316"; _vbg="#FFF7ED"
+                    _vreason += " · RE sobreextendida"
+                elif _re_score_n >= 65 and _vered == "✅ ENTRAR":
+                    _vered="⚡ ENTRAR PARCIAL"; _vc="#F97316"; _vbg="#FFF7ED"
+                    _vreason += f" · RE {_re_score_n:.0f} elevado"
+                st.markdown(
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;'
+                    f'padding:4px 8px 0px 8px;background:{_bg};border:1px solid {_bl};'
+                    f'border-top:none;border-left:3px solid {_bl}">'
+                    f'<div style="background:{_rh_color}18;border:1px solid {_rh_color}50;border-radius:6px;padding:5px 8px">'
+                    f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase;letter-spacing:.8px">📊 Rango Histórico {_rh_n_note}</div>'
+                    f'<div style="font-size:12px;font-weight:800;color:{_rh_color}">{_rh_human} · WR {int(_rh_wr)}%</div>'
+                    f'<div style="font-size:9px;color:#94A3B8">Típico:{_rh_p50:+.0f}% · Bueno:{_rh_p75:+.0f}% · Malo:{_rh_p25:+.0f}%</div>'
+                    f'</div>'
+                    f'<div style="background:{_fund_color}18;border:1px solid {_fund_color}50;border-radius:6px;padding:5px 8px">'
+                    f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase;letter-spacing:.8px">📈 Fundamentales</div>'
+                    f'<div style="font-size:12px;font-weight:800;color:{_fund_color}">{_fund_human}</div>'
+                    f'<div style="font-size:9px;color:#94A3B8">Rev:{_rev_display} · Up:{_up_display} · {_an_display[:20]}</div>'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+                # RE badge NBIS
+                if _re_rn and _re_rn.get("badge_html"):
+                    st.markdown(
+                        f'<div style="padding:0px 8px 0px 8px;background:{_bg};'
+                        f'border:1px solid {_bl};border-top:none;border-left:3px solid {_bl}">'
+                        + _re_rn["badge_html"] + f'</div>', unsafe_allow_html=True)
+                # Veredicto NBIS
+                st.markdown(
+                    f'<div style="padding:6px 10px;margin-bottom:4px;background:{_vbg};'
+                    f'border:1px solid {_vc}60;border-top:none;border-left:3px solid {_vc};'
+                    f'border-bottom:3px solid {_vc};border-radius:0 0 6px 6px">'
+                    f'<span style="font-size:12px;font-weight:900;color:{_vc}">{_vered}</span>'
+                    f'<span style="font-size:10px;color:{_vc}90;margin-left:8px">{_vreason}</span>'
+                    f'</div>', unsafe_allow_html=True)
         # ══ SECCIÓN MOMENTUM ══════════════════════════════════
         if _mom_rows:
+            _m_entrar = sum(1 for r in _mom_rows if r.get("Rec","").startswith("✅"))
+            _m_parcial= sum(1 for r in _mom_rows if r.get("Rec","").startswith("⚡"))
+            _m_buena  = sum(1 for r in _mom_rows if r.get("Rec","").startswith("🟡"))
             st.markdown(
                 f'<div style="background:#FFFBEB;border:1px solid #FDE68A;'
-                f'border-radius:8px 8px 0 0;padding:8px 14px;margin-top:16px">'
-                f'<span style="font-size:13px;font-weight:800;color:#D97706">⚡ MOMENTUM — Catalizador</span>'
+                f'border-radius:8px 8px 0 0;padding:8px 14px;margin-top:12px">'
+                f'<span style="font-size:13px;font-weight:800;color:#D97706">⚡ MOMENTUM</span>'
                 f'<span style="font-size:10px;color:#64748B;margin-left:10px">'
                 f'Gestión: 20-30% · Stop -5% · T1 +15% · T2 +30%</span>'
                 f'</div>', unsafe_allow_html=True)
-            _CM = "70px 75px 70px 55px 55px 55px 50px 45px 45px 55px 55px 110px"
+            _CM = "70px 75px 40px 55px 55px 55px 50px 50px 45px 55px 55px 110px"
             st.markdown(
                 f'<div style="display:grid;grid-template-columns:{_CM};gap:3px;'
                 f'padding:5px 8px;background:#FFFEF0;border:1px solid #FDE68A;'
@@ -15713,76 +16169,239 @@ with tab_score:
                 f'<div style="text-align:center">Rev<br>YoY</div>'
                 f'<div>Recomendación / Alertas</div>'
                 f'</div>', unsafe_allow_html=True)
-            for _rm in _mom_rows:
-                _bg = "#FFFBEB" if _rm["TOTAL"]>=15 else "#FFFEF0" if _rm["TOTAL"]>=11 else BG_CARD
-                _bl = "#FB923C" if _rm["TOTAL"]>=15 else "#FDE68A" if _rm["TOTAL"]>=11 else "#FDE68A"
-                _sc = G if _rm["TOTAL"]>=15 else A if _rm["TOTAL"]>=11 else TXT_MUT
-                st.markdown(
-                    f'<div style="display:grid;grid-template-columns:{_CM};gap:3px;'
-                    f'padding:7px 8px;background:{_bg};border:1px solid {_bl};'
-                    f'border-top:none;border-left:3px solid {_bl}">'
-                    f'<div style="font-weight:800;font-size:12px">{_rm["Ticker"]}</div>'
-                    f'<div style="font-size:9px;color:{TXT_MUT}">{_rm["Sector"]}</div>'
-                    f'<div style="font-size:10px;color:#D97706;font-weight:700">{_rm["Fuente"]}</div>'
-                    f'{_cel(_rm["M2"],_rm["M2_l"])}{_cel(_rm["M3"],_rm["M3_l"])}'
-                    f'{_cel(_rm["M4"],_rm["M4_l"])}{_cel(_rm["M5"],_rm["M5_l"])}'
-                    f'{_cel(_rm["M6"],_rm["M6_l"])}'
-                    f'<div style="text-align:center;font-size:18px;font-weight:900;color:{_sc}">{_rm["TOTAL"]}</div>'
-                    f'<div style="font-size:10px;font-weight:700;color:{_rm["Rc"]}">{_rm["Rec"]}</div>'
-                    f'</div>', unsafe_allow_html=True)
+            # Agrupar por sector
+            # Agrupar por sector preservando orden por score
+            _mom_sectores = {}
+            for _rm in _mom_rows:  # ya vienen ordenados desc por score
+                _sec_key = str(_rm.get("Sector","Other")).strip() or "Other"
+                _mom_sectores.setdefault(_sec_key, []).append(_rm)
+            # Ordenar sectores por mejor score de cada grupo
+            _mom_sectores_sorted = sorted(
+                _mom_sectores.items(),
+                key=lambda kv: max(r["TOTAL"] for r in kv[1]), reverse=True)
 
-        # ══ CAPITAL ALLOCATOR ═════════════════════════════════
-        _top_nbis = [r for r in _nbis_rows  if r["TOTAL"] >= 11]
-        _top_mom  = [r for r in _mom_rows   if r["TOTAL"] >= 11]
+            for _sector_name, _sector_rows in _mom_sectores_sorted:
+                _best_sc_mom = max(r["TOTAL"] for r in _sector_rows)
+                if len(_mom_sectores_sorted) > 1:
+                    st.markdown(
+                        f'<div style="background:#FEF9C3;border:1px solid #FDE68A;'
+                        f'padding:3px 10px;font-size:9px;font-weight:700;color:#92400E;'
+                        f'border-top:none">🏭 {_sector_name} · Mejor score: {_best_sc_mom}/20</div>',
+                        unsafe_allow_html=True)
+                for _rm in _sector_rows:
+                    _bg_m = "#FFFBEB" if _rm["TOTAL"]>=15 else "#FFFEF0" if _rm["TOTAL"]>=11 else BG_CARD
+                    _bl_m = "#FB923C" if _rm["TOTAL"]>=15 else "#FDE68A" if _rm["TOTAL"]>=11 else "#FDE68A"
+                    _sc_m = G if _rm["TOTAL"]>=15 else A if _rm["TOTAL"]>=11 else TXT_MUT
+                    _re_rm   = _rm.get("RE", {})
+                    _rev_rm  = _rm.get("RevYoY","N/D")
+                    _an_rm   = _rm.get("Analistas", 0)
+                    _up_rm   = _rm.get("Upside","N/D")
+                    st.markdown(
+                        f'<div style="display:grid;grid-template-columns:{_CM};gap:3px;'
+                        f'padding:7px 8px;background:{_bg_m};border:1px solid {_bl_m};'
+                        f'border-top:none;border-left:3px solid {_bl_m}">'
+                        f'<div style="font-weight:800;font-size:12px">{_rm["Ticker"]}</div>'
+                        f'<div style="font-size:9px;color:{TXT_MUT}">{_rm["Sector"]}</div>'
+                        f'<div style="font-size:10px;color:#D97706;font-weight:700">{_rm["Fuente"]}</div>'
+                        f'{_cel(_rm["M2"],_rm["M2_l"])}{_cel(_rm["M3"],_rm["M3_l"])}'
+                        f'{_cel(_rm["M4"],_rm["M4_l"])}{_cel(_rm["M5"],_rm["M5_l"])}'
+                        f'{_cel(_rm["M6"],_rm["M6_l"])}'
+                        f'<div style="text-align:center;font-size:18px;font-weight:900;color:{_sc_m}">{_rm["TOTAL"]}</div>'
+                        f'<div style="font-size:10px;font-weight:700;color:{_rm["Rc"]}">{_rm["Rec"]}</div>'
+                        f'</div>', unsafe_allow_html=True)
+                    # Rango Histórico + Fundamentales + RE + Veredicto
+                    _rev_disp_m = _rev_rm if _rev_rm not in ("","None","nan") else "N/D"
+                    _up_disp_m  = _up_rm  if _up_rm  not in ("","None","nan","+0%") else "N/D"
+                    _an_disp_m  = f"{_an_rm} analistas" if _an_rm > 0 else "Sin cobertura"
+                    # v19.3 fix: usar DD real del dict, no RSI-50 como proxy
+                    _dd_rm_val  = abs(float(_rm.get("N3",0) or 0))  # N3 = DD puntuación proxy
+                    _rh_rm_p    = _gtu_get_rh(float(_rm.get("RSI",0) or 0), _dd_rm_val, float(_rm.get("M4",0) or 0))
+                    _rh_rm_wr   = _rh_rm_p.get("rh_wr",0); _rh_rm_p50=_rh_rm_p.get("rh_p50",0)
+                    _rh_rm_p25  = _rh_rm_p.get("rh_p25",0); _rh_rm_p75=_rh_rm_p.get("rh_p75",0)
+                    _rh_rm_n    = _rh_rm_p.get("rh_n",0);   _rh_rm_c  =_rh_rm_p.get("rh_color","#64748B")
+                    _rh_rm_human= "📈 Favorable" if _rh_rm_wr>=70 else "📊 Moderado" if _rh_rm_wr>=50 else "⚠️ Débil"
+                    _rev_num_m=0
+                    try: _rev_num_m=float(str(_rev_disp_m).replace("%","").replace("+","").replace("N/D","0"))
+                    except: pass
+                    _up_num_m=0
+                    try: _up_num_m=float(str(_up_disp_m).replace("%","").replace("+","").replace("N/D","0"))
+                    except: pass
+                    if _rev_num_m>=15 and _up_num_m>=10: _fm="✅ Sólidos"; _fc="#22C55E"
+                    elif _up_num_m<0: _fm="🚫 Sobre target"; _fc="#EF4444"
+                    elif _rev_num_m<0: _fm="⚠️ Revenue caída"; _fc="#F97316"
+                    elif _rev_num_m>0: _fm="🟡 Moderados"; _fc="#F59E0B"
+                    else: _fm="📊 Sin datos"; _fc="#64748B"
+                    _re_niv_m=_re_rm.get("nivel","NORMAL") if _re_rm else "NORMAL"
+                    _re_score_m = float(_re_rm.get("re",0)) if _re_rm else 0
+                    _rm_score   = int(_rm.get("TOTAL",0))
+                    # REGLA UNIFICADA MOMENTUM — misma lógica que badge
+                    if _rh_rm_wr < 50:
+                        _vm="🚫 NO ENTRAR"; _vmc="#EF4444"; _vmbg="#FEF2F2"
+                        _vmr=f"WR histórico {int(_rh_rm_wr)}% — señales similares perdieron {100-int(_rh_rm_wr)}%"
+                    elif _rm_score >= 15 and _re_score_m < 75:
+                        # Score ≥15 = señal calificada + RE ok
+                        _vm="✅ ENTRAR"; _vmc="#16A34A"; _vmbg="#F0FDF4"
+                        _vmr=f"Score {_rm_score} ✓ · WR {int(_rh_rm_wr)}% · P50:{_rh_rm_p50:+.0f}% · RE {_re_score_m:.0f} ok"
+                    elif _rm_score >= 15 and _re_score_m >= 75:
+                        # Score califica pero RE elevado → reducir tamaño
+                        _vm="⚡ PARCIAL"; _vmc="#F97316"; _vmbg="#FFF7ED"
+                        _vmr=f"Score {_rm_score} ✓ · RE {_re_score_m:.0f} elevado — 50% del tamaño"
+                    elif _rm_score >= 11:
+                        # Buena señal pero no llega al umbral de entrada
+                        _vm="🟡 BUENA SEÑAL"; _vmc="#D97706"; _vmbg="#FFFBEB"
+                        _vmr=f"Score {_rm_score} — evaluar, aún no cumple umbral ≥15 para entrar"
+                    elif _rm_score >= 7:
+                        _vm="⏳ ESPERAR"; _vmc="#64748B"; _vmbg="#F8FAFC"
+                        _vmr=f"Score {_rm_score} — esperar confirmación técnica"
+                    else:
+                        _vm="⬇️ BAJA PRIO"; _vmc="#94A3B8"; _vmbg="#F8FAFC"
+                        _vmr="Señal débil"
+                    st.markdown(
+                        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;'
+                        f'padding:4px 8px 0px 8px;background:{_bg_m};border:1px solid {_bl_m};'
+                        f'border-top:none;border-left:3px solid {_bl_m}">'
+                        f'<div style="background:{_rh_rm_c}18;border:1px solid {_rh_rm_c}50;border-radius:6px;padding:5px 8px">'
+                        f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase">📊 Rango Histórico ({_rh_rm_n} casos)</div>'
+                        f'<div style="font-size:12px;font-weight:800;color:{_rh_rm_c}">{_rh_rm_human} · WR {int(_rh_rm_wr)}%</div>'
+                        f'<div style="font-size:9px;color:#94A3B8">Típico:{_rh_rm_p50:+.0f}% · Bueno:{_rh_rm_p75:+.0f}% · Malo:{_rh_rm_p25:+.0f}%</div>'
+                        f'</div>'
+                        f'<div style="background:{_fc}18;border:1px solid {_fc}50;border-radius:6px;padding:5px 8px">'
+                        f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase">📈 Fundamentales</div>'
+                        f'<div style="font-size:12px;font-weight:800;color:{_fc}">{_fm}</div>'
+                        f'<div style="font-size:9px;color:#94A3B8">Rev:{_rev_disp_m} · Up:{_up_disp_m} · {_an_disp_m[:20]}</div>'
+                        f'</div>'
+                        f'</div>', unsafe_allow_html=True)
+                    if _re_rm and _re_rm.get("badge_html"):
+                        st.markdown(
+                            f'<div style="padding:0px 8px 0px 8px;background:{_bg_m};'
+                            f'border:1px solid {_bl_m};border-top:none;border-left:3px solid {_bl_m}">'
+                            + _re_rm["badge_html"] + f'</div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div style="padding:6px 10px;margin-bottom:4px;background:{_vmbg};'
+                        f'border:1px solid {_vmc}60;border-top:none;border-left:3px solid {_vmc};'
+                        f'border-bottom:3px solid {_vmc};border-radius:0 0 6px 6px">'
+                        f'<span style="font-size:12px;font-weight:900;color:{_vmc}">{_vm}</span>'
+                        f'<span style="font-size:10px;color:{_vmc}90;margin-left:8px">{_vmr}</span>'
+                        f'</div>', unsafe_allow_html=True)
+
+        # ══ CAPITAL ALLOCATOR — Candidatos para MVALLE ════════════
+        # Solo mostrar acciones con veredicto ✅ ENTRAR o ⚡ PARCIAL
+        # (Score ≥15 + WR ≥50%) — misma lógica que el badge
+        _top_nbis = sorted(
+            [r for r in _nbis_rows
+             if r["TOTAL"] >= 15 and
+             not str(r.get("Rec","")).startswith(("🚫","⏳","⬇️","🟡"))],
+            key=lambda x: x["TOTAL"], reverse=True)
+        _top_mom = sorted(
+            [r for r in _mom_rows
+             if r["TOTAL"] >= 15 and
+             not str(r.get("Rec","")).startswith(("🚫","⏳","⬇️","🟡"))],
+            key=lambda x: x["TOTAL"], reverse=True)
 
         if _top_nbis or _top_mom:
-            st.markdown(f'<div style="margin-top:16px;font-size:13px;font-weight:800;color:{TXT}">💰 Candidatos para MVALLE</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="margin-top:16px;font-size:13px;font-weight:800;color:{TXT}">💰 Candidatos para MVALLE</div>'
+                f'<div style="font-size:10px;color:{TXT_MUT};margin-bottom:8px">'
+                f'Score ≥15 + veredicto Entrar/Parcial · '
+                f'{len(_top_nbis)} NBIS 🔵 + {len(_top_mom)} Momentum 🟡</div>',
+                unsafe_allow_html=True)
 
-            for _ii, _rv in enumerate(_top_nbis[:3]):
-                _ca, _cb, _cc = st.columns([2,1,1])
-                with _ca:
-                    st.markdown(
-                        f'<div style="padding:7px 12px;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px">'
-                        f'<strong>{_rv["Ticker"]}</strong> <span style="color:{TXT_MUT};font-size:11px">🔄 NBIS · {_rv["Fase"]} · RSI {_rv["RSI"]:.0f} · MACD {_rv["MACD"]}</span>'
-                        f'<br><span style="font-size:9px;color:#64748B">{_rv["Gestion"]}</span></div>',
-                        unsafe_allow_html=True)
-                with _cb:
-                    _sc2 = G if _rv["TOTAL"]>=15 else A
-                    st.markdown(f'<div style="padding:7px;text-align:center;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;font-size:16px;font-weight:900;color:{_sc2}">{_rv["TOTAL"]}/20</div>', unsafe_allow_html=True)
-                with _cc:
-                    if st.button("✅ → MVALLE", key=f"mvnbis_{_rv['Ticker']}_{_ii}", use_container_width=True, type="primary"):
-                        st.session_state[f"_prefill_mvalle_{_rv['Ticker']}"] = _rv
-                        st.success(f"✅ {_rv['Ticker']} marcado NBIS → Tab 💼 Posiciones → MVALLE")
+            # ── Sección NBIS (azul) ─────────────────────────────────
+            if _top_nbis:
+                st.markdown(
+                    f'<div style="background:#EFF6FF;border:1px solid #93C5FD;'
+                    f'border-radius:6px 6px 0 0;padding:5px 12px;margin-top:6px;'
+                    f'font-size:10px;font-weight:700;color:#1D4ED8">'
+                    f'🔄 REBOTE NBIS · {len(_top_nbis)} candidatas</div>',
+                    unsafe_allow_html=True)
+                for _ii, _rv in enumerate(_top_nbis[:4]):
+                    _rh_rv_p   = _gtu_get_rh(float(_rv.get("RSI",0) or 0),
+                                             abs(float(_rv.get("N3",0) or 0)),
+                                             float(_rv.get("N4",0) or 0))
+                    _rh_wr_rv  = _rh_rv_p.get("rh_wr",0)
+                    _rh_p50_rv = _rh_rv_p.get("rh_p50",0)
+                    _re_rv     = _rv.get("RE",{})
+                    _re_sc_rv  = _re_rv.get("re",0) if _re_rv else 0
+                    _rec_rv    = str(_rv.get("Rec",""))
+                    _rec_color = "#16A34A" if _rec_rv.startswith("✅") else "#F97316"
+                    _sc_c      = "#16A34A" if _rv["TOTAL"]>=15 else "#D97706"
+                    _ca, _cb, _cc = st.columns([3,1,1])
+                    with _ca:
+                        st.markdown(
+                            f'<div style="padding:7px 12px;background:#EFF6FF;'
+                            f'border:1px solid #BFDBFE;border-top:none;border-radius:0">'
+                            f'<strong style="color:#1D4ED8">{_rv["Ticker"]}</strong> '
+                            f'<span style="font-size:10px;color:{TXT_MUT}">Fase:{_rv.get("Fase","-")} · RSI:{_rv.get("RSI",0):.0f}</span>'
+                            f'<br><span style="font-size:9px;color:#64748B">'
+                            f'WR {int(_rh_wr_rv)}% · P50:{_rh_p50_rv:+.0f}% · RE:{_re_sc_rv:.0f} · '
+                            f'Rev:{_rv.get("RevYoY","N/D")} · {_rv.get("Analistas",0)}anal.</span>'
+                            f'</div>', unsafe_allow_html=True)
+                    with _cb:
+                        st.markdown(
+                            f'<div style="padding:7px;text-align:center;background:#EFF6FF;'
+                            f'border:1px solid #BFDBFE;border-top:none;'
+                            f'font-size:14px;font-weight:900;color:{_sc_c}">'
+                            f'{_rv["TOTAL"]}/20<br>'
+                            f'<span style="font-size:9px;font-weight:700;color:{_rec_color}">{_rec_rv}</span>'
+                            f'</div>', unsafe_allow_html=True)
+                    with _cc:
+                        if st.button("✅ → MVALLE", key=f"mv_nbis_{_rv['Ticker']}_{_ii}",
+                                     use_container_width=True, type="primary"):
+                            st.session_state[f"_prefill_mvalle_{_rv['Ticker']}"] = _rv
+                            st.success(f"✅ {_rv['Ticker']} (NBIS) marcado → MVALLE")
 
-            for _jj, _rv in enumerate(_top_mom[:3]):
-                _ca, _cb, _cc = st.columns([2,1,1])
-                with _ca:
-                    _gtu_rv   = _rv.get("GTU", {})
-                    _gtu_e_rv = _gtu_rv.get("emoji","") if _gtu_rv else ""
-                    _gtu_n_rv = _gtu_rv.get("nivel",0) if _gtu_rv else 0
-                    _gtu_r_rv = _gtu_rv.get("rango","") if _gtu_rv else ""
-                    _rh_p50_rv= _gtu_rv.get("rh_p50",0) if _gtu_rv else 0
-                    _rh_wr_rv = _gtu_rv.get("rh_wr",0) if _gtu_rv else 0
-                    _rev_rv   = _rv.get("RevYoY","N/D")
-                    _an_rv    = _rv.get("Analistas",0)
-                    _up_rv    = _rv.get("Upside","N/D")
-                    st.markdown(
-                        f'<div style="padding:7px 12px;background:#FFFBEB;border:1px solid #FDE68A;border-radius:8px">'
-                        f'<strong>{_rv["Ticker"]}</strong> <span style="color:{TXT_MUT};font-size:11px">⚡ Momentum · {_rv["Fuente"]} · RSI {_rv["RSI"]:.0f} · MACD {_rv["MACD"]}</span>'
-                        f'<br><span style="font-size:9px;color:#64748B">{_rv["Gestion"]}</span>'
-                        + (f'<br><span style="font-size:9px;font-weight:600">'
-                           f'🎯 GTU: {_gtu_e_rv}N{_gtu_n_rv} {_gtu_r_rv} · '
-                           f'📊 Hist WR {_rh_wr_rv:.0f}% P50:{_rh_p50_rv:+.0f}% · '
-                           f'Rev:{_rev_rv} Up:{_up_rv} {_an_rv}analistas</span>' if _gtu_rv else '')
-                        + f'</div>',
-                        unsafe_allow_html=True)
-                with _cb:
-                    _sc2 = G if _rv["TOTAL"]>=15 else A
-                    st.markdown(f'<div style="padding:7px;text-align:center;background:#FFFBEB;border:1px solid #FDE68A;border-radius:8px;font-size:16px;font-weight:900;color:{_sc2}">{_rv["TOTAL"]}/20</div>', unsafe_allow_html=True)
-                with _cc:
-                    if st.button("✅ → MVALLE", key=f"mvmom_{_rv['Ticker']}_{_jj}", use_container_width=True, type="primary"):
-                        st.session_state[f"_prefill_mvalle_{_rv['Ticker']}"] = _rv
-                        st.success(f"✅ {_rv['Ticker']} marcado Momentum → Tab 💼 Posiciones → MVALLE")
+            # ── Sección Momentum (amarillo) ────────────────────────
+            if _top_mom:
+                st.markdown(
+                    f'<div style="background:#FFFBEB;border:1px solid #FDE68A;'
+                    f'border-radius:6px 6px 0 0;padding:5px 12px;margin-top:10px;'
+                    f'font-size:10px;font-weight:700;color:#D97706">'
+                    f'⚡ MOMENTUM · {len(_top_mom)} candidatas</div>',
+                    unsafe_allow_html=True)
+                for _jj, _rv in enumerate(_top_mom[:4]):
+                    _rh_rv_p   = _gtu_get_rh(float(_rv.get("RSI",0) or 0),
+                                             abs(float(_rv.get("N3",0) or 0)),
+                                             float(_rv.get("N4",0) or 0))
+                    _rh_wr_rv  = _rh_rv_p.get("rh_wr",0)
+                    _rh_p50_rv = _rh_rv_p.get("rh_p50",0)
+                    _re_rv     = _rv.get("RE",{})
+                    _re_sc_rv  = _re_rv.get("re",0) if _re_rv else 0
+                    _rec_rv    = str(_rv.get("Rec",""))
+                    _rec_color = "#16A34A" if _rec_rv.startswith("✅") else "#F97316"
+                    _sc_c      = "#16A34A" if _rv["TOTAL"]>=15 else "#D97706"
+                    _ca, _cb, _cc = st.columns([3,1,1])
+                    with _ca:
+                        st.markdown(
+                            f'<div style="padding:7px 12px;background:#FFFBEB;'
+                            f'border:1px solid #FDE68A;border-top:none;border-radius:0">'
+                            f'<strong style="color:#D97706">{_rv["Ticker"]}</strong> '
+                            f'<span style="font-size:10px;color:{TXT_MUT}">Fase:{_rv.get("Fase","-")} · RSI:{_rv.get("RSI",0):.0f}</span>'
+                            f'<br><span style="font-size:9px;color:#64748B">'
+                            f'WR {int(_rh_wr_rv)}% · P50:{_rh_p50_rv:+.0f}% · RE:{_re_sc_rv:.0f} · '
+                            f'Rev:{_rv.get("RevYoY","N/D")} · {_rv.get("Analistas",0)}anal.</span>'
+                            f'</div>', unsafe_allow_html=True)
+                    with _cb:
+                        st.markdown(
+                            f'<div style="padding:7px;text-align:center;background:#FFFBEB;'
+                            f'border:1px solid #FDE68A;border-top:none;'
+                            f'font-size:14px;font-weight:900;color:{_sc_c}">'
+                            f'{_rv["TOTAL"]}/20<br>'
+                            f'<span style="font-size:9px;font-weight:700;color:{_rec_color}">{_rec_rv}</span>'
+                            f'</div>', unsafe_allow_html=True)
+                    with _cc:
+                        if st.button("✅ → MVALLE", key=f"mv_mom_{_rv['Ticker']}_{_jj}",
+                                     use_container_width=True, type="primary"):
+                            st.session_state[f"_prefill_mvalle_{_rv['Ticker']}"] = _rv
+                            st.success(f"✅ {_rv['Ticker']} (Momentum) marcado → MVALLE")
+
+        elif _nbis_rows or _mom_rows:
+            st.markdown(
+                f'<div style="background:#F8FAFC;border:1px solid #CBD5E1;'
+                f'border-radius:8px;padding:10px 14px;margin-top:12px;font-size:11px;color:#64748B">'
+                f'📊 Sin candidatos con Score ≥15 hoy · '
+                f'Las señales activas están en etapa de evaluación (🟡 Buena Señal)<br>'
+                f'<span style="font-size:10px">Espera que alguna suba a Score ≥15 o revisa mañana al cierre.</span>'
+                f'</div>', unsafe_allow_html=True)
 
 with tab9:
     # ══ TAB 9 — BACKTESTING Y ATR SIZING v19 ══════════════════
