@@ -3031,27 +3031,27 @@ def calcular_riesgo_extension(rsi: float, dist_ema50: float,
         if _re >= _thresh_parcial:
             _nivel   = "NO_ENTRAR"
             _emoji   = "🚫"
-            _label   = "No entrar"
+            _label   = "RE muy elevado"
             _color   = "#EF4444"
             _bg      = "#FEF2F2"
             _border  = "#FECACA"
-            _tip     = "Señal muy extendida — esperar corrección"
+            _tip     = "Señal muy extendida — ver veredicto final abajo"
         elif _re >= _thresh_normal:
             _nivel   = "PARCIAL"
             _emoji   = "⚡"
-            _label   = "Entrada parcial"
+            _label   = "RE moderado"
             _color   = "#F97316"
             _bg      = "#FFF7ED"
             _border  = "#FDBA74"
-            _tip     = "Extendida — considerar 50% del tamaño habitual"
+            _tip     = "Extendida — el veredicto final considera el Score"
         else:
             _nivel   = "NORMAL"
             _emoji   = "✅"
-            _label   = "Entrada normal"
+            _label   = "RE bajo"
             _color   = "#16A34A"
             _bg      = "#F0FDF4"
             _border  = "#86EFAC"
-            _tip     = "Dentro de rangos sanos"
+            _tip     = "Dentro de rangos sanos — sin restricción"
 
         # Barra de progreso
         _bar_pct   = min(int(_re), 100)
@@ -16213,8 +16213,11 @@ with tab_score:
                     _rev_disp_m = _rev_rm if _rev_rm not in ("","None","nan") else "N/D"
                     _up_disp_m  = _up_rm  if _up_rm  not in ("","None","nan","+0%") else "N/D"
                     _an_disp_m  = f"{_an_rm} analistas" if _an_rm > 0 else "Sin cobertura"
-                    # v19.3 fix: usar DD real del dict, no RSI-50 como proxy
-                    _dd_rm_val  = abs(float(_rm.get("N3",0) or 0))  # N3 = DD puntuación proxy
+                    # v19.3 fix: usar Dist_ATH como DD real para Momentum
+                    # Dist_ATH = distancia desde máximo 52 semanas (ej: -23% → DD=23)
+                    _dist_ath_rm = str(_rm.get("Dist_ATH","0%")).replace("%","").replace("+","")
+                    try: _dd_rm_val = abs(float(_dist_ath_rm))
+                    except: _dd_rm_val = 0
                     _rh_rm_p    = _gtu_get_rh(float(_rm.get("RSI",0) or 0), _dd_rm_val, float(_rm.get("M4",0) or 0))
                     _rh_rm_wr   = _rh_rm_p.get("rh_wr",0); _rh_rm_p50=_rh_rm_p.get("rh_p50",0)
                     _rh_rm_p25  = _rh_rm_p.get("rh_p25",0); _rh_rm_p75=_rh_rm_p.get("rh_p75",0)
