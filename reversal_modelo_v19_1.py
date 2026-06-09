@@ -17834,48 +17834,55 @@ with tab_score:
                     import pandas as _pd_dl
                     _df_dl = _pd_dl.DataFrame(_rows_dl)
 
-                    # ── Generar Excel en memoria ──────────────
+                    # ── Generar Excel en memoria (con fallback a CSV) ──
                     _buf_dl = _io.BytesIO()
-                    with _pd_dl.ExcelWriter(_buf_dl, engine="openpyxl") as _wr:
-                        _df_dl.to_excel(_wr, index=False, sheet_name="Candidatos_MVALLE")
-                        _ws = _wr.sheets["Candidatos_MVALLE"]
-
-                        # Ancho de columnas
-                        _col_widths = {
-                            "A":8,"B":8,"C":12,"D":12,"E":9,"F":18,
-                            "G":8,"H":8,"I":8,"J":9,"K":7,
-                            "L":10,"M":10,"N":10,"O":18,"P":10,
-                            "Q":16,"R":14,"S":22,"T":20,"U":25
-                        }
-                        for _col, _w in _col_widths.items():
-                            _ws.column_dimensions[_col].width = _w
-
-                        # Header amarillo para NBIS, naranja para Momentum
+                    try:
+                        import openpyxl
                         from openpyxl.styles import PatternFill, Font, Alignment
-                        _fill_nbis = PatternFill("solid", start_color="DBEAFE")
-                        _fill_mom  = PatternFill("solid", start_color="FEF3C7")
-                        _fill_hdr  = PatternFill("solid", start_color="1E293B")
-                        _font_hdr  = Font(bold=True, color="FFFFFF", size=10)
-
-                        for _cell in _ws[1]:
-                            _cell.fill = _fill_hdr
-                            _cell.font = _font_hdr
-                            _cell.alignment = Alignment(horizontal="center")
-
-                        for _row_idx, _row_data in enumerate(_rows_dl, 2):
-                            _fill = _fill_nbis if _row_data["Tipo"] == "NBIS" else _fill_mom
-                            for _cell in _ws[_row_idx]:
-                                _cell.fill = _fill
-
-                    _buf_dl.seek(0)
-                    st.download_button(
-                        label=f"📥 Descargar Candidatos ({len(_rows_dl)} acciones) · {_hoy_dl}",
-                        data=_buf_dl.getvalue(),
-                        file_name=f"CandidatosMVALLE_{_hoy_dl.replace('-','')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="btn_download_candidatos"
-                    )
+                        with _pd_dl.ExcelWriter(_buf_dl, engine="openpyxl") as _wr:
+                            _df_dl.to_excel(_wr, index=False, sheet_name="Candidatos_MVALLE")
+                            _ws = _wr.sheets["Candidatos_MVALLE"]
+                            _col_widths = {
+                                "A":8,"B":8,"C":12,"D":12,"E":9,"F":18,
+                                "G":8,"H":8,"I":8,"J":9,"K":7,
+                                "L":10,"M":10,"N":10,"O":18,"P":10,
+                                "Q":16,"R":14,"S":22,"T":20,"U":25
+                            }
+                            for _col, _w in _col_widths.items():
+                                _ws.column_dimensions[_col].width = _w
+                            _fill_nbis = PatternFill("solid", start_color="DBEAFE")
+                            _fill_mom  = PatternFill("solid", start_color="FEF3C7")
+                            _fill_hdr  = PatternFill("solid", start_color="1E293B")
+                            _font_hdr  = Font(bold=True, color="FFFFFF", size=10)
+                            for _cell in _ws[1]:
+                                _cell.fill = _fill_hdr
+                                _cell.font = _font_hdr
+                                _cell.alignment = Alignment(horizontal="center")
+                            for _row_idx, _row_data in enumerate(_rows_dl, 2):
+                                _fill = _fill_nbis if _row_data["Tipo"] == "NBIS" else _fill_mom
+                                for _cell in _ws[_row_idx]:
+                                    _cell.fill = _fill
+                        _buf_dl.seek(0)
+                        st.download_button(
+                            label=f"📥 Descargar Excel ({len(_rows_dl)} acciones) · {_hoy_dl}",
+                            data=_buf_dl.getvalue(),
+                            file_name=f"CandidatosMVALLE_{_hoy_dl.replace('-','')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="btn_download_candidatos"
+                        )
+                    except ImportError:
+                        # openpyxl no instalado → fallback a CSV
+                        _csv_buf = _df_dl.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            label=f"📥 Descargar CSV ({len(_rows_dl)} acciones) · {_hoy_dl}",
+                            data=_csv_buf,
+                            file_name=f"CandidatosMVALLE_{_hoy_dl.replace('-','')}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="btn_download_candidatos"
+                        )
+                        st.caption("💡 Agrega openpyxl a requirements.txt para descarga en Excel")
 
         elif _nbis_rows or _mom_rows:
             st.markdown(
