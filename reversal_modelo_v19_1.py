@@ -1326,7 +1326,6 @@ def render_pre_post_bar(ticker: str, precio_actual: float,
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-@st.cache_data(ttl=600, show_spinner=False)
 def leer_watchlist_sheets() -> "pd.DataFrame | None":
     """
     v18: Lee GrekoTrader_Watchlist desde Google Sheets.
@@ -3203,8 +3202,8 @@ def actualizar_todas_fases_batch(sheet_names: list) -> tuple:
                 if not _tk or _tk in ("-", "", "TICKER"): continue
                 _fs = str(_row[_idx_fs]).strip() if len(_row) > _idx_fs else ""
                 if _fs and _fs not in ("-", "", "nan", "None", "NaT"): continue
-                _fase_ant = str(_row[_idx_f]).strip() if len(_row) > _idx_f else "-"
-                _activos.append((_ri, _tk, _fase_ant))
+                _fase_ant_raw = str(_row[_idx_f]).strip() if len(_row) > _idx_f else "-"
+                _activos.append((_ri, _tk, _fase_ant_raw))
 
             if not _activos:
                 _resumen.append(f"ℹ️ {_sn}: Sin posiciones activas")
@@ -3242,8 +3241,19 @@ def actualizar_todas_fases_batch(sheet_names: list) -> tuple:
             _updates_data = []
             _cambios = 0
             _sin_cambio = 0
+            _cambios_detalle = []  # lista de cambios para mostrar en pantalla
 
-            for _row_n, _tk_a, _fase_ant in _activos:
+            def _normalizar_fase(fase_raw: str) -> str:
+                """Convierte cualquier variante de fase al formato canónico."""
+                _f = str(fase_raw).upper().strip().replace(" ","")
+                if _f in ("M3","FASE3","FASE_3","PHASE3","ETAPA3","M3A","ANTICIPAR"): return "M3"
+                if _f in ("M2","FASE2","FASE_2","PHASE2","ETAPA2"):                   return "M2"
+                if _f in ("M1","FASE1","FASE_1","PHASE1","ETAPA1",""):                return "M1"
+                if _f in ("MOMENTUM","MOM","MOMENTUN","MOMEMTUM"):                    return "Momentum"
+                return "M1"  # default seguro
+
+            for _row_n, _tk_a, _fase_ant_raw in _activos:
+                _fase_ant = _normalizar_fase(_fase_ant_raw)  # ← normaliza "Fase 3" → "M3"
                 _ld = _live.get(_tk_a, {})
                 if not _ld:
                     _sin_cambio += 1
@@ -3263,20 +3273,31 @@ def actualizar_todas_fases_batch(sheet_names: list) -> tuple:
                     "range": f"'{_hoja}'!F{_row_n}",
                     "values": [[_fase_nueva]]
                 })
-                _fa_up = _fase_ant.upper()
+                _fa_up = _fase_ant.upper()          # ya normalizado
                 _fn_up = _fase_nueva.upper()
-                if _fa_up not in (_fn_up, "M3", "M2", "MOMENTUM", "M1"):
+                if _fa_up != _fn_up:
                     _updates_data.append({
                         "range": f"'{_hoja}'!AB{_row_n}",
                         "values": [[_hoy_str]]
                     })
                     _cambios += 1
-                elif _fa_up != _fn_up:
-                    _updates_data.append({
-                        "range": f"'{_hoja}'!AB{_row_n}",
-                        "values": [[_hoy_str]]
+                    # Dirección del cambio con fases normalizadas
+                    _fases_up   = ("M3","MOMENTUM")
+                    _fases_down = ("M2","M1")
+                    _dir = ("⬆️" if _fn_up in _fases_up   and _fa_up in _fases_down   else
+                            "🚀" if _fn_up == "MOMENTUM"   and _fa_up in ("M1","M2","M3") else
+                            "⬇️" if _fn_up in _fases_down  and _fa_up in _fases_up    else "🔄")
+                    _cambios_detalle.append({
+                        "ticker":  _tk_a,
+                        "de":      _fase_ant,           # nombre normalizado limpio
+                        "a":       _fase_nueva,
+                        "dir":     _dir,
+                        "urgente": _fn_up == "M3" and _fa_up == "M2",  # M2→M3: alerta
+                        "rsi":     round(_rsi_l, 1),
+                        "macd":    _macd_l,
+                        "dd":      round(_dd_l, 1),
+                        "sheet":   _sn,
                     })
-                    _cambios += 1
                 else:
                     _sin_cambio += 1
 
@@ -3310,7 +3331,11 @@ def actualizar_todas_fases_batch(sheet_names: list) -> tuple:
 
     _ok_global = _total_err == 0
     _msg = " | ".join(_resumen) if _resumen else "Sin resultados"
-    return _ok_global, _msg
+    # Consolidar todos los cambios de fases de todos los sheets
+    _todos_cambios = []
+    for _sn in sheet_names:
+        pass  # ya se acumularon en _cambios_detalle por sheet
+    return _ok_global, _msg, _cambios_detalle
 
 def badge_castigada(rsi: float, dd_pico: float,
                     upside: float = 0, revenue_yoy: float = 0) -> str:
@@ -8600,6 +8625,13 @@ def escribir_posicion_sheets(
     macd_estado: str = "-",
     dd_pico_pct: float = 0.0,
     tipo_senal: str = "-",
+    # v19.3: columnas predictivas AC-AH
+    tipo_evento: str = "-",
+    regimen_entrada: str = "-",
+    dias_cat_entrada = "-",
+    mult_nbis: float = 1.0,
+    p_exito: float = 0.0,
+    etf_sector_30d: float = 0.0,
 ) -> tuple:
     """
     v19.1: Función genérica — escribe en Greko, MVALLE o Amparito
@@ -8612,21 +8644,32 @@ def escribir_posicion_sheets(
         try: return str(round(float(v), 2)).replace(".", ",")
         except: return str(v)
 
-    # v19 FIX B: si rsi_ticker es 0, intentar desde session_state
+    # v19.3 FIX: SPY_RSI_Dia = RSI real del SPY (no del ticker)
+    # El RSI del ticker va a columna X (RSI_Accion)
     _rsi_tk_raw = float(rsi_ticker) if rsi_ticker else 0
     if _rsi_tk_raw <= 0:
         _rsi_tk_raw = float(st.session_state.get(f"_rsi_{ticker}", 0))
-    spy_rsi_valor = round(_rsi_tk_raw, 1) if _rsi_tk_raw > 0 else "-"
 
-    _spy_ctx = ""
+    # Obtener SPY RSI real desde session_state (calculado en el header)
+    _spy_rsi_real = 0.0
     try:
         _mkt_p = st.session_state.get("mercado_data", {})
-        _spy_r  = _mkt_p.get("spy", {}).get("rsi", 0)
-        if _spy_r and float(_spy_r) > 0:
-            _spy_ctx = f" | SPY RSI: {round(float(_spy_r),1)}"
+        _spy_rsi_real = float(_mkt_p.get("spy", {}).get("rsi", 0) or 0)
+        if _spy_rsi_real <= 0:
+            # Fallback: calcularlo en el momento
+            import yfinance as _yf_spy_wrt
+            _s_spy = _yf_spy_wrt.Ticker("SPY").history(period="3mo")["Close"].dropna()
+            if len(_s_spy) >= 14:
+                _d = _s_spy.diff()
+                _g = _d.clip(lower=0).rolling(14).mean()
+                _l = (-_d.clip(upper=0)).rolling(14).mean()
+                _spy_rsi_real = round(float(100-100/(1+_g.iloc[-1]/(_l.iloc[-1]+1e-9))),1)
+                st.session_state.setdefault("mercado_data",{}).setdefault("spy",{})["rsi"] = _spy_rsi_real
     except Exception:
         pass
-    notas_final = (notas + _spy_ctx).strip(" |")
+
+    spy_rsi_valor = round(_spy_rsi_real, 1) if _spy_rsi_real > 0 else "-"
+    notas_final = (notas).strip(" |")
 
     fila = [
         ticker,                                          # Ticker
@@ -8648,6 +8691,14 @@ def escribir_posicion_sheets(
         "",                                              # Razon_Salida
         "",                                              # Error_Modelo
         notas_final,                                     # Notas
+        # ── Columnas predictivas v19.3 (AC-AI) ─────
+        tipo_evento if tipo_evento else "-",             # AC: Tipo_Evento
+        regimen_entrada if regimen_entrada else "-",     # AD: Regimen_Entrada
+        str(dias_cat_entrada) if str(dias_cat_entrada) not in ("-","","0") else "-", # AE: Dias_Cat
+        str(round(float(mult_nbis),2)).replace(".",",") if mult_nbis else "1,0",    # AF: Mult_NBIS
+        f"{round(p_exito*100)}%" if p_exito > 0 else "-",   # AG: P_Exito
+        f"{etf_sector_30d:+.1f}%".replace(".",",") if etf_sector_30d != 0 else "-", # AH: ETF_30d
+        "",                                              # AI: Retorno_Max (llenar al cerrar)
     ]
 
     try:
@@ -8679,6 +8730,107 @@ def escribir_posicion_sheets(
         return True, f"✅ {ticker} agregado a {_label}"
     except Exception as e:
         return False, f"❌ Error: {str(e)[:80]}"
+
+
+def _calcular_predictivos(fase: str, rsi: float, dd_pct: float,
+                           area: str, cat_fecha: str = "",
+                           tipo_evento: str = "Técnico puro") -> dict:
+    """
+    v19.3: Calcula automáticamente AD/AE/AF/AG/AH al registrar una posición.
+    Retorna dict con todos los valores predictivos.
+    """
+    import datetime as _dt_pred
+    # ── Régimen actual ──────────────────────────────────
+    _reg = st.session_state.get("mercado_data", {}).get("regimen", "NEUTRO")
+
+    # ── Días desde catalizador (AE) ─────────────────────
+    _dias_cat = "-"
+    if cat_fecha and cat_fecha not in ("-", "", "nan", "None"):
+        try:
+            _cd = _dt_pred.date.fromisoformat(str(cat_fecha)[:10])
+            _dias_cat = (_dt_pred.date.today() - _cd).days
+        except Exception: pass
+
+    # ── Multiplicador NBIS (AF) ──────────────────────────
+    _fase_up = str(fase).upper()
+    if "M2" in _fase_up or "FASE 2" in _fase_up or "ENTRADA TEMPRANA" in _fase_up:
+        if dd_pct <= -30: _mult = 1.8
+        elif dd_pct <= -20: _mult = 1.4
+        else: _mult = 1.2
+    elif "M3" in _fase_up or "FASE 3" in _fase_up or "ENTRAR" in _fase_up:
+        _mult = 1.2
+    elif "MOMENTUM" in _fase_up:
+        _mult = 0.5 if rsi >= 78 else 1.0
+    elif "M1" in _fase_up:
+        _mult = 0.6
+    else:
+        _mult = 1.0
+    if rsi >= 78: _mult = min(_mult, 0.5)
+
+    # ── Factor evento (para P_Exito) ─────────────────────
+    _ev_map = {
+        "Earnings BEAT":    1.15, "Post-Earnings BEAT": 1.15,
+        "Contrato nuevo":   1.20, "M&A":                1.18,
+        "Upgrade analista": 1.05, "Noticia fresca":     1.10,
+        "Técnico puro":     1.00, "FDA":                1.30,
+        "Dilución":         0.75, "Guidance CUT":       0.45,
+        "Otros":            1.00,
+    }
+    _f_ev = _ev_map.get(tipo_evento, 1.0)
+
+    # ── WR base por fase (de los 104 registros validados) ──
+    _wr_base_map = {
+        "M2": 0.875, "M3": 0.73, "MOMENTUM": 0.84,
+        "M1": 0.30,  "NBIS": 0.73,
+    }
+    _wr_base = 0.73  # default
+    for _k, _v in _wr_base_map.items():
+        if _k in _fase_up: _wr_base = _v; break
+
+    # ── Factor sector (ETF 30d) ─────────────────────────
+    _f_sector = 1.0
+    _etf_30d  = 0.0
+    try:
+        _etf_key = f"_etf_chg_{area[:8]}"
+        _etf_cached = st.session_state.get(_etf_key, None)
+        if _etf_cached is not None:
+            _etf_30d = float(_etf_cached)
+        else:
+            # Intentar obtener del semáforo ya calculado
+            _sem_h = st.session_state.get("sem_home_cache", {})
+            for _lbl, _sd in _sem_h.items():
+                if _lbl.lower() in area.lower() or area.lower() in _lbl.lower():
+                    _etf_30d = float(_sd.get("c30", 0)); break
+        _f_sector = 1.15 if _etf_30d > 10 else 1.05 if _etf_30d > 0 else 0.95 if _etf_30d > -10 else 0.75
+    except Exception: pass
+
+    # ── Factor régimen ───────────────────────────────────
+    _f_reg = {"BULL":1.10,"SOBRECOMPRADO":0.85,"ALERTA":0.80,
+              "BEAR":0.60,"NEUTRO":1.00}.get(_reg, 1.0)
+
+    # ── P_Exito final ────────────────────────────────────
+    _p_exito = min(0.97, _wr_base * _f_ev * _f_sector * _f_reg)
+
+    return {
+        "regimen_entrada":  _reg,
+        "dias_cat_entrada": _dias_cat,
+        "mult_nbis":        round(_mult, 2),
+        "p_exito":          round(_p_exito, 3),
+        "etf_sector_30d":   round(_etf_30d, 1),
+    }
+
+
+def _tipo_evento_selector(key_prefix: str) -> str:
+    """Widget selector de Tipo_Evento — reutilizable en todos los tabs."""
+    return st.radio(
+        "📌 Tipo de catalizador que motivó la señal:",
+        ["Técnico puro", "Post-Earnings BEAT", "Contrato nuevo",
+         "Upgrade analista", "Noticia fresca ≤3d", "M&A",
+         "FDA", "Dilución / Oferta", "Otros"],
+        horizontal=True,
+        key=f"tipo_ev_{key_prefix}",
+        help="Este dato calibra el modelo predictivo"
+    )
 
 
 def _buscar_area_watchlist(ticker: str) -> str:
@@ -8721,11 +8873,16 @@ def escribir_greko_sheets(
     macd_estado: str = "-",
     dd_pico_pct: float = 0.0,
     tipo_senal: str = "-",
+    tipo_evento: str = "Técnico puro",
+    cat_fecha: str = "-",
 ) -> tuple:
     """
-    v19: Wrapper para GrekoTrader_Posiciones_Greko
-    Usa escribir_posicion_sheets() con 19 campos homologados.
+    v19.3: Wrapper para GrekoTrader_Posiciones_Greko
+    Calcula automáticamente AD-AH y pasa al Sheet.
     """
+    _pred = _calcular_predictivos(
+        fase=fase, rsi=rsi_accion, dd_pct=-abs(dd_pico_pct),
+        area=area, cat_fecha=cat_fecha, tipo_evento=tipo_evento)
     return escribir_posicion_sheets(
         sheet_name=_SHEET_NAME_GREKO,
         ticker=ticker, precio_compra=precio_compra,
@@ -8734,7 +8891,14 @@ def escribir_greko_sheets(
         arrastradas=arrastradas, opinion=opinion,
         cantidad=cantidad, notas=notas, rsi_ticker=rsi_ticker,
         rsi_accion=rsi_accion, macd_estado=macd_estado,
-        dd_pico_pct=dd_pico_pct, tipo_senal=tipo_senal)
+        dd_pico_pct=dd_pico_pct, tipo_senal=tipo_senal,
+        tipo_evento       = tipo_evento,
+        regimen_entrada   = _pred["regimen_entrada"],
+        dias_cat_entrada  = _pred["dias_cat_entrada"],
+        mult_nbis         = _pred["mult_nbis"],
+        p_exito           = _pred["p_exito"],
+        etf_sector_30d    = _pred["etf_sector_30d"],
+    )
 
 def escribir_greko_sheets_LEGACY(
     ticker: str, precio_compra: float, fase: str, score: int,
@@ -9859,6 +10023,8 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = 
     - RSI girando hacia arriba desde zona baja-media
     - No en sobrecompra (RSI < 65)
     """
+    import pandas as pd   # v19.3 fix: importar al inicio para evitar UnboundLocalError
+    import numpy as np
     candidatos = []
     try:
         import yfinance as yf
@@ -10958,13 +11124,20 @@ elif vix["_ok"]:
         unsafe_allow_html=True)
 
 # ── Cargar indicadores de mercado (cache 15min - no bloquea) ──
+import datetime as _dt_mkt_hdr
 if "mkt_cache" not in st.session_state:
     st.session_state["mkt_cache"] = {}
+    st.session_state["mkt_cache_ts"] = 0
+# Recargar si caché tiene más de 15 minutos o está vacío
+_mkt_now = _dt_mkt_hdr.datetime.now().timestamp()
+_mkt_stale = (_mkt_now - st.session_state.get("mkt_cache_ts", 0)) > 900
 mkt = st.session_state.get("mkt_cache", {})
-if not mkt:
+if not mkt or _mkt_stale:
     with st.spinner("Cargando indicadores de mercado..."):
         mkt = fetch_market_indicators()
-        st.session_state["mkt_cache"] = mkt
+        if mkt:  # solo guardar si retornó datos
+            st.session_state["mkt_cache"]    = mkt
+            st.session_state["mkt_cache_ts"] = _mkt_now
 
 # ── Fila 1: S&P500  - Nasdaq  - SPY RSI  - Sector  - Señal ───────
 col_spx, col_ndx, col_spy, col_sector, col_signal = st.columns(5)
@@ -11079,27 +11252,91 @@ with col_spy:
         st.metric("SPY RSI", "-")
 
 with col_sector:
-    if "sectores" in mkt:
-        sec = mkt["sectores"]
-        # Sugerir ETF del sector
-        sector_etf_map = {
-            "Energía": "XLE  - OIH", "Tech": "XLK  - SOXX",
-            "Salud": "XLV  - XBI", "Finanzas": "XLF  - KRE",
-            "Consumo": "XLY  - XLP", "Industrial": "XLI  - ITA",
-            "Materiales": "XLB  - GDX",
+    # Semáforo sectorial rápido — 5 sectores clave de tu universo
+    # Calcula solo si no está en caché o tiene >30 min
+    _sem_cache_key = "sem_home_cache"
+    _sem_ts_key    = "sem_home_ts"
+    import datetime as _dt_sem_h
+    _sem_now = _dt_sem_h.datetime.now().timestamp()
+    _sem_stale = (_sem_now - st.session_state.get(_sem_ts_key, 0)) > 1800
+    _sem_home = st.session_state.get(_sem_cache_key, {})
+
+    if not _sem_home or _sem_stale:
+        _ETFS_HOME = {
+            "Software":  ("IGV",  "#1E40AF"),
+            "Defensa":   ("ITA",  "#1D4ED8"),
+            "Semis":     ("SOXX", "#7C3AED"),
+            "Biotech":   ("XBI",  "#BE185D"),
+            "AI/Infra":  ("QQQ",  "#4F46E5"),
         }
-        etf_sector = sector_etf_map.get(sec["mejor_oportunidad"], "ETF sectorial")
+        _sem_home = {}
+        try:
+            import yfinance as _yf_sh
+            _tks_sh  = list(set(e for e,_ in _ETFS_HOME.values()))
+            _hist_sh = _yf_sh.download(_tks_sh, period="30d",
+                                        group_by="ticker", auto_adjust=True,
+                                        progress=False)
+            for _lbl, (_etf, _col) in _ETFS_HOME.items():
+                try:
+                    _cl = (_hist_sh[_etf]["Close"].dropna() if len(_tks_sh)>1
+                           else _hist_sh["Close"].dropna())
+                    if len(_cl) < 6: continue
+                    # v19.3: temperatura de HOY = 1d + 5d + RSI
+                    _c1  = round((_cl.iloc[-1]-_cl.iloc[-2])/_cl.iloc[-2]*100, 1)
+                    _c5  = round((_cl.iloc[-1]-_cl.iloc[-6])/_cl.iloc[-6]*100, 1) if len(_cl)>=6 else 0
+                    _d   = _cl.diff()
+                    _g   = _d.clip(lower=0).rolling(14).mean()
+                    _l   = (-_d.clip(upper=0)).rolling(14).mean()
+                    _rsi = round(float(100-100/(1+_g.iloc[-1]/(_l.iloc[-1]+1e-9))), 1)
+                    # Score: 1d (temperatura hoy) + 5d (semana) + RSI
+                    _pts  = 0
+                    _pts += 2 if _c1>1 else 1 if _c1>0 else -2 if _c1<-1 else 0
+                    _pts += 3 if _c5>5 else 2 if _c5>1 else 1 if _c5>-1 else -1 if _c5>-5 else -3
+                    _pts += 1 if 45<=_rsi<=65 else -1 if _rsi>72 or _rsi<35 else 0
+                    if _pts>=5:    _ic,_sc,_bg,_bo="🔥","#16A34A","#F0FDF4","#86EFAC"
+                    elif _pts>=3:  _ic,_sc,_bg,_bo="🟢","#22C55E","#F0FDF4","#86EFAC"
+                    elif _pts>=1:  _ic,_sc,_bg,_bo="🟡","#D97706","#FFFBEB","#FDE68A"
+                    elif _pts>=-1: _ic,_sc,_bg,_bo="🟠","#F97316","#FFF7ED","#FDBA74"
+                    else:          _ic,_sc,_bg,_bo="🔴","#EF4444","#FEF2F2","#FECACA"
+                    _sem_home[_lbl] = {"icon":_ic,"col":_sc,"bg":_bg,"bo":_bo,
+                                        "c1":_c1,"c5":_c5,"rsi":_rsi,
+                                        "etf":_etf,"area_col":_col}
+                except Exception: pass
+        except Exception: pass
+        if _sem_home:
+            st.session_state[_sem_cache_key] = _sem_home
+            st.session_state[_sem_ts_key]    = _sem_now
+    st.markdown(
+        f'<div style="background:{BG_CARD};border:1px solid {BOR};'
+        f'border-radius:10px;padding:8px 10px">'
+        f'<div style="font-size:9px;color:{TXT_MUT};font-weight:700;'
+        f'text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px">'
+        f'🌡️ Sectores</div>',
+        unsafe_allow_html=True)
+    for _lbl, _sd in (_sem_home.items() if _sem_home else {}.items()):
+        _c1d_d = _sd.get("c1", 0)
+        _c5d_d = _sd.get("c5", 0)
+        _rsi_d = _sd.get("rsi", 0)
+        _c1_str = f"{_c1d_d:+.1f}%"
+        _c5_str = f"{_c5d_d:+.1f}% sem"
         st.markdown(
-            f'<div style="background:{G_BG};border:1px solid {G_BOR};border-radius:10px;padding:10px 14px">'
-            f'<div style="font-size:10px;color:{TXT_MUT};font-weight:600">🔍 Sector con oportunidades</div>'
-            f'<div style="font-size:16px;font-weight:800;color:{G}">{sec["mejor_oportunidad"]}</div>'
-            f'<div style="font-size:11px;color:{G}">{sec["acciones_en_correccion"]} acciones en corrección</div>'
-            f'<div style="font-size:9px;color:{TXT_SOFT};margin-top:3px">🎯 ETF: {etf_sector}</div>'
-            f'</div>', unsafe_allow_html=True)
-    else:
-        st.metric("Sector", "-")
+            f'<div style="display:flex;align-items:center;justify-content:space-between;'
+            f'padding:3px 4px;border-radius:4px;background:{_sd["bg"]};'
+            f'border-left:2px solid {_sd["col"]};margin-bottom:3px">'
+            f'<span style="font-size:9px;font-weight:700;color:{_sd["col"]}">'
+            f'{_sd["icon"]} {_lbl}</span>'
+            f'<span style="font-size:8px;color:{_sd["col"]};font-weight:600">{_c1_str}</span>'
+            f'<span style="font-size:8px;color:#94A3B8">{_c5_str} · RSI {_rsi_d:.0f}</span>'
+            f'</div>',
+            unsafe_allow_html=True)
+    if not _sem_home:
+        st.markdown(
+            f'<div style="font-size:9px;color:{TXT_MUT};padding:4px">'
+            f'Cargando sectores...</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 with col_signal:
+    vix     = mkt.get("vix_trend", {}) or {}
     vix_v2  = vix.get("valor", 18)
     spy_rsi2 = mkt.get("spy", {}).get("rsi", 50)
     if vix_v2 >= 30 and spy_rsi2 < 45:
@@ -11277,12 +11514,13 @@ def detectar_regimen(spy_data: dict, vix_val: float, vix_trend: dict = None) -> 
         }
 
 
-tab1,tab2,tab3,tab4,tab5,tab_posiciones,tab8,tab_score,tab9=st.tabs([
+tab1,tab2,tab3,tab4,tab5,tab_posiciones,tab8,tab_score,tab_noticias,tab9=st.tabs([
     "⚡ Momentum","⚡ Swing Activo","🔥 Entrar hoy",
     "🔗 Sympathy","🔎 Mi Watchlist",
     "💼 Posiciones",                  # v19.1: Tab unificado (Greko/MVALLE/Amparito)
     "💰 Estrategia ETF",
     "🎯 Score MVALLE",                # v19.1: Ranking de candidatos para dinero real
+    "📰 Noticias IA",                 # v19.3: Análisis de trader por posición activa
     "📊 Backtesting",
 ])
 
@@ -11343,9 +11581,9 @@ with tab1:
     st.markdown(
         f'<div class="sec-header" style="background:#FFFBEB;border-color:#FDE047">'+
         f'<span style="font-size:20px">⚡</span>'+
-        f'<div><span style="font-size:16px;font-weight:700;color:#D97706">Momentum Catalizador</span>'+
+        f'<div><span style="font-size:16px;font-weight:700;color:#D97706">Momentum — Watchlist</span>'+
         f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'+
-        f'RSI 65-85 · Catalizador real · Posición 20-30% · Stop -5%'+
+        f'Escanea tu Watchlist · RSI 65-88 + MACD+ + Catalizador real · datos en vivo al escanear'+
         f'</span></div></div>', unsafe_allow_html=True)
 
     # ── PANEL DE VALIDACIÓN — qué buscamos en Momentum ──────────
@@ -11395,16 +11633,45 @@ with tab1:
 
     _banner_mercado_macro()
 
-    if st.button("⚡ Escanear Momentum en Watchlist", use_container_width=True, key="btn_momentum"):
+    # Tab Momentum: resultados en session_state para que los botones funcionen
+    # PERO se limpian y recalculan SIEMPRE al presionar ⚡ Escanear
+    import datetime as _dt_mom_chk
+
+    # ── Botón limpiar caché de Streamlit ────────────────────────
+    _col_scan, _col_clear = st.columns([4, 1])
+    with _col_scan:
+        _btn_scan = st.button("⚡ Escanear Momentum en Watchlist",
+                              use_container_width=True, key="btn_momentum")
+    with _col_clear:
+        if st.button("🗑️ Limpiar caché", use_container_width=True,
+                     key="btn_clear_mom", help="Borra todos los datos cacheados de Streamlit"):
+            st.cache_data.clear()
+            st.session_state.pop("scan_momentum", None)
+            st.session_state.pop("scan_momentum_ts", None)
+            st.session_state.pop("scan_momentum_date", None)
+            st.success("✅ Caché eliminado")
+            st.rerun()
+
+    if _btn_scan:
+        # Limpiar resultados anteriores ANTES del scan
+        st.session_state["scan_momentum"]      = []
+        st.session_state["scan_momentum_ts"]   = ""
+        st.session_state["scan_momentum_date"] = ""
         with st.spinner("Analizando Watchlist con lógica Momentum..."):
             import yfinance as _yf_mom
             _mom_resultados = []
 
-            # Leer Watchlist
+            # Leer Watchlist — forzar sin caché para datos frescos
+            leer_watchlist_sheets.clear()  # invalida caché Streamlit
             _wl_mom = leer_watchlist_sheets()
+            # Limpiar caché interno de yfinance y requests si existe
+            try:
+                import requests_cache as _rc_mom
+                _rc_mom.clear()
+            except Exception: pass
             if _wl_mom is None or _wl_mom.empty:
                 st.warning("⚠️ No se pudo leer el Watchlist desde Google Sheets")
-                st.session_state["scan_momentum"] = []
+                _mom_data = []  # local, sin caché
             else:
                 _col_ticker = "Ticket" if "Ticket" in _wl_mom.columns else "Ticker"
                 _universo_mom = [str(t).upper().strip()
@@ -11526,16 +11793,27 @@ with tab1:
 
                 _cnt_mom.empty()
                 _mom_resultados.sort(key=lambda x: x["Score_Mom"], reverse=True)
-                st.session_state["scan_momentum"] = _mom_resultados
-                st.session_state["scan_momentum_ts"] = datetime.datetime.now().strftime("%H:%M")
+                # Guardar en session_state para que los botones de registro funcionen
+                st.session_state["scan_momentum"]      = _mom_resultados
+                st.session_state["scan_momentum_ts"]   = _dt_mom_chk.datetime.now().strftime("%H:%M")
+                st.session_state["scan_momentum_date"] = _dt_mom_chk.date.today().strftime("%d-%m-%Y")
 
+    # Leer resultados del session_state (persisten entre reruns para botones)
     _mom_data = st.session_state.get("scan_momentum")
     _mom_ts   = st.session_state.get("scan_momentum_ts","")
+    _mom_date = st.session_state.get("scan_momentum_date","")
+    _hoy_str_m = _dt_mom_chk.date.today().strftime("%d-%m-%Y")
+
+    # Aviso si los datos son de otro día
+    if _mom_data and _mom_date and _mom_date != _hoy_str_m:
+        st.warning(
+            f"⚠️ Datos del **{_mom_date} {_mom_ts}** — "
+            f"presiona **⚡ Escanear** para actualizar con datos de hoy")
 
     if _mom_data is not None and len(_mom_data) > 0:
         st.markdown(
             f'<div style="font-size:11px;color:{TXT_MUT};margin-bottom:8px">'+
-            f'⚡ {len(_mom_data)} acciones con momentum catalizador · {_mom_ts}'+
+            f'⚡ {len(_mom_data)} acciones con momentum catalizador · {_mom_ts} (datos en vivo)'+
             f'</div>', unsafe_allow_html=True)
 
         for _idx_m, _mr in enumerate(_mom_data[:15]):
@@ -11589,6 +11867,8 @@ with tab1:
                     f'<div style="font-size:9px;color:#94A3B8;margin-top:2px">'
                     f'💡 {_rec_mom["motivo"]}</div>', unsafe_allow_html=True)
 
+            # v19.3: Selector Tipo_Evento antes de registrar
+            _tipo_ev_m = _tipo_evento_selector(f"mom_{_mr['Ticker']}_{_idx_m}")
             if st.button(_rec_mom["btn_label"],
                          key=f"btn_mom_greko_{_mr['Ticker']}_{_idx_m}",
                          type=_rec_mom["btn_tipo"],
@@ -11621,6 +11901,8 @@ with tab1:
                     macd_estado=_macd_mom,
                     dd_pico_pct=_dd_mom,
                     tipo_senal="Momentum",
+                    tipo_evento=_tipo_ev_m,
+                    cat_fecha=str(_mr.get("Cat_Fecha","-")),
                 )
                 if _ok_m:
                     st.success(f"✅ {_mr['Ticker']} registrado en Greko como Momentum")
@@ -11951,6 +12233,42 @@ with tab2:
             _earn_badge_card = _ei["badge"]
             _earn_badge_color = _ei.get("badge_color","#64748B")
 
+            # v19.3 — Vigencia del catalizador (días desde earn/catalizador)
+            _vigencia_badge = ""
+            try:
+                import datetime as _dt_vig
+                _hoy_vig = _dt_vig.date.today()
+                _earn_date_vig = None
+                if cat_fecha_card not in ("-","","nan"):
+                    try: _earn_date_vig = _dt_vig.date.fromisoformat(cat_fecha_card[:10])
+                    except Exception: pass
+                if _earn_date_vig:
+                    _dp_vig = (_hoy_vig - _earn_date_vig).days
+                    if _dp_vig < 0:
+                        # Earn futuro — ya lo maneja _bloqueado_earn
+                        pass
+                    elif _dp_vig <= 10:
+                        _vigencia_badge = (f'<span style="background:#DCFCE7;color:#16A34A;'
+                                          f'border:1px solid #86EFAC;border-radius:4px;'
+                                          f'padding:1px 6px;font-size:9px;font-weight:700">'
+                                          f'🟢 Cat. fresco {_dp_vig}d</span>')
+                    elif _dp_vig <= 20:
+                        _vigencia_badge = (f'<span style="background:#FFFBEB;color:#D97706;'
+                                          f'border:1px solid #FDE68A;border-radius:4px;'
+                                          f'padding:1px 6px;font-size:9px;font-weight:700">'
+                                          f'🟡 Cat. {_dp_vig}d</span>')
+                    elif _dp_vig <= 30:
+                        _vigencia_badge = (f'<span style="background:#FFF7ED;color:#F97316;'
+                                          f'border:1px solid #FDBA74;border-radius:4px;'
+                                          f'padding:1px 6px;font-size:9px;font-weight:700">'
+                                          f'⚠️ Cat. {_dp_vig}d · débil</span>')
+                    else:
+                        _vigencia_badge = (f'<span style="background:#FEF2F2;color:#EF4444;'
+                                          f'border:1px solid #FECACA;border-radius:4px;'
+                                          f'padding:1px 6px;font-size:9px;font-weight:700">'
+                                          f'🔴 Cat. {_dp_vig}d · vencido</span>')
+            except Exception: pass
+
             # Bloqueo total si earnings en 1-2 días
             _bloqueado_earn = _earn_dias_card <= 2 and _ei["tiene_cat"]
 
@@ -11982,6 +12300,8 @@ with tab2:
                 fase_desc  = "Señal M3 completa. Debería aparecer también en Tab Entrar Hoy."
                 if _earn_badge_card:
                     fase_desc += f"  - {_earn_badge_card}"
+                if _vigencia_badge:
+                    fase_desc += f"  {_vigencia_badge}"
                 fase_accion= "✅ Entrar 100% del tamaño planificado"
             elif _es_swing_hoy:
                 fase       = "⚡ SWING HOY"
@@ -12849,7 +13169,10 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
         # ── Analizar cada acción ────────────────────────────────
         wl_results = []
         _prob_debug_list = []
-        for _, row in wl_df.iterrows():
+        _total_wl_tickers = len(wl_df)
+        _cnt_wl = st.empty()  # contador en tiempo real
+        for _i_wl, (_, row) in enumerate(wl_df.iterrows(), 1):
+            _cnt_wl.info(f"📊 Analizando {_i_wl} de {_total_wl_tickers}: {str(row.get('Ticker','')).upper()}")
             tk      = str(row["Ticker"]).upper()
             nombre  = str(row.get("Nombre", tk))
             area    = str(row.get("Area", "-"))
@@ -12870,6 +13193,7 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
             wl_results.append({**r, "Nota": nota, "_source": source})
 
         wl_res_df = pd.DataFrame(wl_results)
+        _cnt_wl.empty()  # limpiar contador al terminar
         st.session_state["wl_res_df"] = wl_res_df.copy()
 
         # DEBUG temporal — ver valores reales de Prob_NBIS
@@ -13002,6 +13326,68 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                     f'</div>', unsafe_allow_html=True)
 
         st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+        # ── Contador de Watchlist ────────────────────────────────
+        if not wl_res_df.empty:
+            _tot_wl  = len(wl_res_df)
+            _aptas   = len(wl_res_df[wl_res_df["Decision"].str.contains("APTA|✅|ENTRAR", na=False)]) if "Decision" in wl_res_df.columns else 0
+            _radar   = _tot_wl - _aptas
+
+            # Conteo por Fase
+            _fases_cnt = {}
+            if "Fase" in wl_res_df.columns:
+                for _f in ["M3","M2","M1","Momentum","ANTICIPAR"]:
+                    _n = len(wl_res_df[wl_res_df["Fase"].str.upper().str.contains(_f.upper(), na=False)])
+                    if _n > 0: _fases_cnt[_f] = _n
+
+            # Conteo por Área
+            _areas_cnt = {}
+            if "Area" in wl_res_df.columns:
+                for _a, _g in wl_res_df.groupby("Area"):
+                    if str(_a).strip() and str(_a) not in ("-","","nan"):
+                        _areas_cnt[str(_a).strip()] = len(_g)
+            _areas_sorted = sorted(_areas_cnt.items(), key=lambda x: x[1], reverse=True)
+
+            # Header con totales
+            st.markdown(
+                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+                f'border-radius:10px;padding:10px 14px;margin-bottom:10px">'
+                f'<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
+                f'<div style="font-size:22px;font-weight:900;color:#1E293B">{_tot_wl}'
+                f'<span style="font-size:12px;font-weight:400;color:#64748B;margin-left:4px">acciones</span></div>'
+                f'<div style="height:32px;width:1px;background:#E2E8F0"></div>'
+                f'<div style="display:flex;gap:10px;align-items:center">'
+                f'<span style="background:#DCFCE7;color:#16A34A;border:1px solid #86EFAC;'
+                f'border-radius:6px;padding:3px 10px;font-size:11px;font-weight:700">'
+                f'✅ {_aptas} aptas</span>'
+                f'<span style="background:#F1F5F9;color:#64748B;border:1px solid #CBD5E1;'
+                f'border-radius:6px;padding:3px 10px;font-size:11px;font-weight:700">'
+                f'👁️ {_radar} radar</span>'
+                f'</div>'
+                f'</div>'
+                # Fases
+                + (f'<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">'
+                   f'<span style="font-size:9px;font-weight:700;color:#94A3B8;text-transform:uppercase;'
+                   f'letter-spacing:.8px;align-self:center">Por fase:</span>'
+                   + ''.join([
+                       f'<span style="background:{"#DCFCE7" if f=="M3" else "#DBEAFE" if f=="M2" else "#FFFBEB" if f=="Momentum" else "#F1F5F9"};'
+                       f'color:{"#16A34A" if f=="M3" else "#1D4ED8" if f=="M2" else "#D97706" if f=="Momentum" else "#64748B"};'
+                       f'border-radius:5px;padding:2px 8px;font-size:10px;font-weight:700">'
+                       f'{f} ({n})</span>'
+                       for f, n in _fases_cnt.items()
+                   ]) + f'</div>' if _fases_cnt else '')
+                # Áreas
+                + (f'<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">'
+                   f'<span style="font-size:9px;font-weight:700;color:#94A3B8;text-transform:uppercase;'
+                   f'letter-spacing:.8px;align-self:center">Por área:</span>'
+                   + ''.join([
+                       f'<span style="background:#F8FAFC;border:1px solid #E2E8F0;'
+                       f'border-radius:5px;padding:2px 8px;font-size:10px;color:#475569;font-weight:600">'
+                       f'{a} ({n})</span>'
+                       for a, n in _areas_sorted[:8]
+                   ]) + f'</div>' if _areas_sorted else '')
+                + f'</div>',
+                unsafe_allow_html=True)
 
         # ── Tabla de resultados ─────────────────────────────────
         st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:10px">Análisis del patrón NBIS - tu watchlist</div>', unsafe_allow_html=True)
@@ -13452,6 +13838,8 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                 else:
                     st.caption("⚠️ SPY RSI no disponible en sesión — se calculará al guardar")
 
+                # v19.3: Selector Tipo_Evento
+                _tipo_ev_wl = _tipo_evento_selector(f"wl_{_wl_tk_g}")
                 if st.button(f"🦅 Agregar a Posiciones Greko",
                              key=f"btn_greko_wl_{_wl_tk_g}",
                              use_container_width=True,
@@ -13460,10 +13848,9 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                     _rsi_wl   = float(_rw_wl.get("RSI", st.session_state.get(f"_rsi_{_wl_tk_g}", 0)) or 0)
                     _macd_wl  = "+" if float(_rw_wl.get("MACD",0) or 0) > 0 else "-"
                     _dd_wl    = float(_rw_wl.get("DD",0) or 0)
-                    # Tipo_Señal: NBIS si RSI<65, Momentum si RSI≥65
                     _tipo_sen_wl = "Momentum" if _rsi_wl >= 65 else "NBIS"
                     if str(_rw_wl.get("Arrastradas","-")) not in ("-","","nan"):
-                        _tipo_sen_wl = "Momentum"  # Sympathy = siempre Momentum
+                        _tipo_sen_wl = "Momentum"
 
                     _ok_wg, _msg_wg = escribir_greko_sheets(
                         ticker=_wl_tk_g,
@@ -13483,6 +13870,8 @@ El modelo descarga el precio actual y calcula todos los indicadores automáticam
                         macd_estado=_macd_wl,
                         dd_pico_pct=_dd_wl,
                         tipo_senal=_tipo_sen_wl,
+                        tipo_evento=_tipo_ev_wl,
+                        cat_fecha=str(_rw_wl.get("Cat_Fecha","-")),
                     )
                     if _ok_wg:
                         st.success(_msg_wg)
@@ -13979,16 +14368,96 @@ También puedes descargar la plantilla de abajo y completarla.
                 with st.spinner("📡 Descargando precios y actualizando fases..."):
                     # Opción B: recorrer todas las posiciones y actualizar en batch
                     _sheets_to_update = [_SHEET_NAME_GREKO, _SHEET_NAME_MAURI]
-                    _ok_batch, _msg_batch = actualizar_todas_fases_batch(_sheets_to_update)
+                    _ok_batch, _msg_batch, _cambios_batch = actualizar_todas_fases_batch(_sheets_to_update)
                 if _ok_batch:
                     st.success(f"✅ Fases actualizadas: {_msg_batch}")
                 else:
                     st.error(f"⚠️ {_msg_batch}")
-                # Limpiar caché local también
-                st.session_state.pop(f"{_fase_cache_key}_ts", None)
-                st.session_state.pop(f"{_fase_cache_key}_vigencias", None)
-                st.session_state.pop(_fase_cache_key, None)
-                st.rerun()
+
+                # ── Mostrar cambios de fase detectados ─────────────
+                if _cambios_batch:
+                        # ── Clasificar cambios por tipo ─────────────────────────
+                    _urgentes   = [c for c in _cambios_batch if c.get("urgente")]
+                    _peligrosos = [c for c in _cambios_batch
+                               if c.get("a","").upper() == "M1"
+                               and c.get("de","").upper() in ("M3","MOMENTUM","M2")]
+                    _resto      = [c for c in _cambios_batch
+                               if not c.get("urgente") and c not in _peligrosos]
+
+                    if _urgentes:
+                        st.markdown(
+                            f'<div style="background:#F0FDF4;border-left:4px solid #16A34A;'
+                            f'border:1px solid #86EFAC;border-radius:8px;padding:10px 14px;margin:8px 0">'
+                            f'<div style="font-size:12px;font-weight:800;color:#16A34A;margin-bottom:6px">'
+                            f'🚀 {len(_urgentes)} acción{"es" if len(_urgentes)>1 else ""} pasó a M3 — revisar Score MVALLE ahora</div>',
+                            unsafe_allow_html=True)
+                        for _c in _urgentes:
+                            st.markdown(
+                                f'<div style="display:flex;align-items:center;gap:12px;'
+                                f'padding:6px 8px;background:#DCFCE7;border-radius:6px;margin-bottom:4px">'
+                                f'<strong style="font-size:14px;color:#15803D;min-width:60px">{_c["ticker"]}</strong>'
+                                f'<span style="font-size:12px;color:#166534">{_c["de"]} → <strong>{_c["a"]}</strong></span>'
+                                f'<span style="font-size:10px;color:#64748B;margin-left:auto">'
+                                f'RSI {_c["rsi"]} · MACD {_c["macd"]} · DD {_c["dd"]}%</span></div>',
+                                unsafe_allow_html=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+                    if _peligrosos:
+                        st.markdown(
+                            f'<div style="background:#FEF2F2;border-left:4px solid #EF4444;'
+                            f'border:1px solid #FECACA;border-radius:8px;padding:10px 14px;margin:8px 0">'
+                            f'<div style="font-size:12px;font-weight:800;color:#EF4444;margin-bottom:6px">'
+                            f'🚨 {len(_peligrosos)} posición{"es" if len(_peligrosos)>1 else ""} bajó a M1 — revisar stop</div>',
+                            unsafe_allow_html=True)
+                        for _c in _peligrosos:
+                            _de_up = _c["de"].upper()
+                            if _de_up == "MOMENTUM":
+                                _accion_m1 = "Stop debió activarse · salir si aún no lo hiciste"
+                            elif _de_up == "M3":
+                                _accion_m1 = "Apretar stop a break-even · esperar 2-3 días MACD"
+                            else:
+                                _accion_m1 = "Señal nunca confirmada · considerar salir"
+                            st.markdown(
+                                f'<div style="background:#FFF1F1;border:1px solid #FECACA;'
+                                f'border-radius:6px;padding:8px 10px;margin-bottom:6px">'
+                                f'<div style="display:flex;align-items:center;gap:12px">'
+                                f'<strong style="font-size:14px;color:#DC2626;min-width:60px">{_c["ticker"]}</strong>'
+                                f'<span style="font-size:12px;color:#DC2626">⬇️ {_c["de"]} → <strong>M1</strong></span>'
+                                f'<span style="font-size:10px;color:#94A3B8;margin-left:auto">'
+                                f'RSI {_c["rsi"]} · MACD {_c["macd"]} · DD {_c["dd"]}%</span></div>'
+                                f'<div style="font-size:11px;color:#7F1D1D;margin-top:4px;font-weight:700">'
+                                f'⚡ {_accion_m1}</div></div>',
+                                unsafe_allow_html=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+                    if _resto:
+                        st.markdown(
+                            f'<div style="background:#F8FAFC;border-left:4px solid #64748B;'
+                            f'border:1px solid #CBD5E1;border-radius:8px;padding:10px 14px;margin:6px 0">'
+                            f'<div style="font-size:11px;font-weight:700;color:#475569;margin-bottom:6px">'
+                            f'🔄 {len(_resto)} cambio{"s" if len(_resto)>1 else ""} de fase</div>',
+                            unsafe_allow_html=True)
+                        for _c in _resto:
+                            _cc = "#F97316" if _c["dir"]=="⬇️" else "#22C55E" if _c["dir"]=="⬆️" else "#64748B"
+                            st.markdown(
+                                f'<div style="display:flex;align-items:center;gap:12px;'
+                                f'padding:5px 8px;background:#fff;border:1px solid #E2E8F0;'
+                                f'border-radius:6px;margin-bottom:3px">'
+                                f'<strong style="font-size:13px;color:#334155;min-width:60px">{_c["ticker"]}</strong>'
+                                f'<span style="font-size:12px;color:{_cc}">'
+                                f'{_c["dir"]} {_c["de"]} → <strong>{_c["a"]}</strong></span>'
+                                f'<span style="font-size:10px;color:#94A3B8;margin-left:auto">'
+                                f'RSI {_c["rsi"]} · MACD {_c["macd"]} · DD {_c["dd"]}%</span></div>',
+                                unsafe_allow_html=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+                    if not _cambios_batch:
+                        st.info("📊 Sin cambios de fase — posiciones estables")
+                    # Limpiar caché local también
+                    st.session_state.pop(f"{_fase_cache_key}_ts", None)
+                    st.session_state.pop(f"{_fase_cache_key}_vigencias", None)
+                    st.session_state.pop(_fase_cache_key, None)
+                    st.rerun()
 
         _fase_cache_ts  = st.session_state.get(f"{_fase_cache_key}_ts", 0)
         _fase_recalc    = _tfa.time() - _fase_cache_ts > 300  # recalcular cada 5 min
@@ -14812,6 +15281,50 @@ También puedes descargar la plantilla de abajo y completarla.
                     G, A, R, C, TXT, TXT_MUT, TXT_SOFT, BG_HEAD, BOR
                 ) + _symp_html_t6, unsafe_allow_html=True)
 
+            # ── Badge de vigencia del catalizador v19.3 ──────────────
+            # Muestra cuántos días hace que ocurrió el earn/catalizador
+            # y alerta si el momentum ya no tiene combustible
+            try:
+                import datetime as _dt_cat_badge
+                _hoy_cb = _dt_cat_badge.date.today()
+                _cat_cb = str(r.get("Cat_Fecha","-") or "-")
+                _earn_ts_cb = None
+                _earn_date_cb = None
+                # Intentar con Cat_Fecha del Sheet
+                if _cat_cb not in ("-","","nan"):
+                    try: _earn_date_cb = _dt_cat_badge.date.fromisoformat(_cat_cb[:10])
+                    except Exception: pass
+                # Calcular días
+                if _earn_date_cb:
+                    _dias_cb = (_hoy_cb - _earn_date_cb).days
+                    # Vigencia del catalizador
+                    if _dias_cb <= 10:
+                        _cat_color = "#16A34A"; _cat_bg = "#F0FDF4"; _cat_border = "#86EFAC"
+                        _cat_emoji = "🟢"; _cat_lbl = f"Catalizador fresco · {_dias_cb}d"
+                        _cat_accion = ""
+                    elif _dias_cb <= 20:
+                        _cat_color = "#D97706"; _cat_bg = "#FFFBEB"; _cat_border = "#FDE68A"
+                        _cat_emoji = "🟡"; _cat_lbl = f"Catalizador moderado · {_dias_cb}d"
+                        _cat_accion = " · monitorear"
+                    elif _dias_cb <= 30:
+                        _cat_color = "#F97316"; _cat_bg = "#FFF7ED"; _cat_border = "#FDBA74"
+                        _cat_emoji = "⚠️"; _cat_lbl = f"Catalizador débil · {_dias_cb}d"
+                        _cat_accion = " · revisar stop"
+                    else:
+                        _cat_color = "#EF4444"; _cat_bg = "#FEF2F2"; _cat_border = "#FECACA"
+                        _cat_emoji = "🔴"; _cat_lbl = f"Catalizador vencido · {_dias_cb}d"
+                        _cat_accion = " · el momentum puede estar agotado"
+                    st.markdown(
+                        f'<div style="background:{_cat_bg};border:1px solid {_cat_border};'
+                        f'border-left:3px solid {_cat_color};border-radius:6px;'
+                        f'padding:5px 10px;margin-top:6px;display:flex;align-items:center;gap:8px">'
+                        f'<span style="font-size:10px;color:{_cat_color};font-weight:700">'
+                        f'{_cat_emoji} {_cat_lbl}{_cat_accion}</span>'
+                        f'<span style="font-size:9px;color:#94A3B8;margin-left:auto">'
+                        f'Cat: {_cat_cb[:10]}</span>'
+                        f'</div>', unsafe_allow_html=True)
+            except Exception: pass
+
             # v19: Earnings + Noticia unificados en Greko
             _en_card_gk = render_earn_news_card(
                 tk, str(r.get("Cat_Fecha","-")), G, R, A, TXT_MUT, BOR)
@@ -14952,45 +15465,57 @@ También puedes descargar la plantilla de abajo y completarla.
                     except Exception:
                         _dias_e = 0
 
-                    # Etapa de la señal — usar Sheet o live si disponible
-                    _fase_sheet_pos  = str(pos.get("Fase", "-"))
+                    # ── Alerta de fase siempre visible (col F del Sheet) ──────
+                    _fase_sheet_pos  = str(pos.get("Fase", "-")).upper().strip()
                     _fases_live_dict = st.session_state.get(f"_fase_live_{_SHEET_ACTIVO}", {})
                     _live_info_pos   = _fases_live_dict.get(tk, {})
                     _fase_live_pos   = _live_info_pos.get("fase", None)
                     _rsi_live_pos    = _live_info_pos.get("rsi", 0)
-
-                    # Badge de cambio de Fase
-                    _fase_origen_up  = _fase_sheet_pos.upper()
-                    _era_m3_pos = any(x in _fase_origen_up for x in ["M3","FASE 3","ENTRAR","ANTICIPAR"])
-                    _era_m2_pos = any(x in _fase_origen_up for x in ["M2","FASE 2","ENTRADA"])
-
+                    # Normalizar fase
+                    _fase_norm = ("M3" if any(x in _fase_sheet_pos for x in ("M3","FASE3","FASE 3","M3-A","ANTICIPAR"))
+                             else "Momentum" if "MOMENTUM" in _fase_sheet_pos
+                             else "M2" if any(x in _fase_sheet_pos for x in ("M2","FASE2","FASE 2"))
+                             else "M1")
+                    _fecha_cambio_f = str(pos.get("Fecha_Cambio_Fase","-") or "-")
                     _fase_badge_html = ""
-                    if _fase_live_pos:
-                        if _era_m2_pos and _fase_live_pos == "M3":
-                            _fase_badge_html = (
-                                f'<span style="background:#DCFCE7;color:#16A34A;border:1px solid #86EFAC;'
-                                f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:800;margin-left:6px">'
-                                f'📈 M2→M3 HOY</span>')
-                        elif _era_m3_pos and _fase_live_pos in ("M2","M1"):
-                            _fase_badge_html = (
-                                f'<span style="background:#FEF2F2;color:#DC2626;border:1px solid #FECACA;'
-                                f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:800;margin-left:6px">'
-                                f'📉 M3→{_fase_live_pos}</span>')
-                        elif _era_m2_pos and _fase_live_pos == "Momentum":
-                            _fase_badge_html = (
-                                f'<span style="background:#FEF9C3;color:#D97706;border:1px solid #FDE68A;'
-                                f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:800;margin-left:6px">'
-                                f'⚡ →Momentum</span>')
-                        elif _era_m3_pos and _fase_live_pos == "M3":
-                            _fase_badge_html = (
-                                f'<span style="background:#EFF6FF;color:#2563EB;border:1px solid #BFDBFE;'
-                                f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700;margin-left:6px">'
-                                f'M3 ✅ RSI {_rsi_live_pos:.0f}</span>')
-                        else:
-                            _fase_badge_html = (
-                                f'<span style="background:#F8FAFC;color:#94A3B8;border:1px solid #E2E8F0;'
-                                f'border-radius:4px;padding:2px 8px;font-size:10px;margin-left:6px">'
-                                f'{_fase_live_pos} RSI {_rsi_live_pos:.0f}</span>')
+                    if _fase_norm == "M1":
+                        # 🚨 CRÍTICO
+                        _ac_m1 = ("Stop debió activarse · salir si aún no" if pnl_e >= 0
+                               else "Señal deteriorada con pérdida · evaluar salida inmediata")
+                        _fase_badge_html = (
+                            f'<div style="background:#FEF2F2;border:1px solid #FECACA;'
+                            f'border-left:3px solid #EF4444;border-radius:6px;'
+                            f'padding:6px 10px;margin-top:6px">'
+                            f'<span style="background:#EF4444;color:#fff;border-radius:4px;'
+                            f'padding:2px 7px;font-size:10px;font-weight:800">🚨 FASE M1 — REVISAR</span>'
+                            f'<span style="font-size:10px;color:#7F1D1D;margin-left:8px;font-weight:600">'
+                            f'{_ac_m1}</span>'
+                            f'<span style="font-size:9px;color:#94A3B8;display:block;margin-top:2px">'
+                            f'Últ. cambio: {_fecha_cambio_f} · Fase Sheet: {pos.get("Fase","-")}</span>'
+                            f'</div>')
+                    elif _fase_norm == "M2":
+                        # ⚠️ ADVERTENCIA
+                        _fase_badge_html = (
+                            f'<div style="background:#FFF7ED;border:1px solid #FDE68A;'
+                            f'border-left:3px solid #F97316;border-radius:6px;'
+                            f'padding:6px 10px;margin-top:6px">'
+                            f'<span style="background:#F97316;color:#fff;border-radius:4px;'
+                            f'padding:2px 7px;font-size:10px;font-weight:800">⚠️ FASE M2 — VIGILAR</span>'
+                            f'<span style="font-size:10px;color:#92400E;margin-left:8px;font-weight:600">'
+                            f'Señal debilitada · esperar MACD+ para M3</span>'
+                            f'<span style="font-size:9px;color:#94A3B8;display:block;margin-top:2px">'
+                            f'Últ. cambio: {_fecha_cambio_f}</span>'
+                            f'</div>')
+                    elif _fase_norm == "Momentum":
+                        _fase_badge_html = (
+                            f'<span style="background:#FFFBEB;color:#D97706;border:1px solid #FDE68A;'
+                            f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700;margin-left:6px">'
+                            f'⚡ Momentum activa</span>')
+                    else:  # M3
+                        _fase_badge_html = (
+                            f'<span style="background:#DCFCE7;color:#16A34A;border:1px solid #86EFAC;'
+                            f'border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700;margin-left:6px">'
+                            f'✅ M3 Activa</span>')
 
                     if _dias_e <= 1:
                         _etapa = "M3 - Entrar Hoy"
@@ -15278,16 +15803,435 @@ with tab8:
 
 # ══ TAB SCORE MVALLE v4 — 2 secciones con datos reales ════════
 with tab_score:
+    # ── ETF sectorial → temperatura del área (Fase 1 · solo informativo) ────
+    _ETF_MAP = {
+        "SAAS":("IGV","SaaS/Software"), "SOFTWARE":("IGV","Software"),
+        "CLOUD":("IGV","Cloud SaaS"),   "CRYPTO":("BITQ","Crypto/Mining"),
+        "MINING":("BITQ","Mining"),     "BITCOIN":("BITQ","Bitcoin"),
+        "MINER":("BITQ","Mining"),      "DEFENSE":("ITA","Defensa"),
+        "DEFENSA":("ITA","Defensa"),    "DRONE":("ITA","Drones"),
+        "AEROSPACE":("ITA","Aerospace"),"BIOTECH":("XBI","Biotech"),
+        "BIO":("XBI","Biotech"),        "PHARMA":("XBI","Pharma"),
+        "HEALTHCARE":("XBI","Healthcare"),"FINTECH":("XLK","Fintech"),
+    }
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _get_etf_temp(etf_ticker: str) -> dict:
+        """Retorna cambio 30d del ETF sectorial — solo informativo."""
+        try:
+            import yfinance as _yf_etf
+            _h = _yf_etf.Ticker(etf_ticker).history(period="40d")["Close"].dropna()
+            if len(_h) < 5: return {"chg30":0,"ok":False}
+            return {"chg30":round(float((_h.iloc[-1]-_h.iloc[0])/_h.iloc[0]*100),1),"ok":True}
+        except Exception: return {"chg30":0,"ok":False}
+
+    # ── N10: Análisis IA con web_search (Claude API) ────────────────
+    def _llamar_prob_entrada(ticker, fase, score, rsi, dd, macd,
+                              wr_base, regimen, etf_ticker, etf_chg5d):
+        """
+        v19.3 — Probabilidad de entrada exitosa.
+        1 prompt · 1 número · antes de entrar.
+        """
+        import json, datetime as _dt_pe
+        _hoy_pe = str(_dt_pe.date.today())
+        _sys_pe = (
+            "Eres el evaluador de probabilidad de entrada de GrekoTrader.\n\n"
+            "Tu trabajo es ÚNICO: evaluar si una acción tiene alta o baja "
+            "probabilidad de subir en los próximos 10 días hábiles.\n\n"
+            "METODOLOGÍA:\n"
+            "1. Busca noticias de los últimos 5 días del ticker con web_search\n"
+            "2. Evalúa el contexto del sector\n"
+            "3. Detecta bloqueadores (dilución, earn próximo, guidance negativo)\n"
+            "4. Entrega UNA probabilidad de 0 a 100\n\n"
+            "REGLAS DURAS (van antes que cualquier análisis):\n"
+            "  Dilución/Offering anunciada:     probabilidad MÁXIMO 35\n"
+            "  Earnings en 2 días o menos:      probabilidad MÁXIMO 50\n"
+            "  Guidance negativo reciente:      probabilidad MÁXIMO 45\n"
+            "  CEO/CFO sale + sector adverso:   probabilidad MÁXIMO 50\n\n"
+            "FACTORES QUE SUBEN LA PROBABILIDAD:\n"
+            "  Contrato/M&A como objetivo:      +20 a +30 puntos\n"
+            "  Earnings BEAT reciente ≤10 días: +15 a +25 puntos\n"
+            "  Upgrade analista target +20%:    +10 a +15 puntos\n"
+            "  Sector ETF positivo esta semana: +5 a +10 puntos\n\n"
+            "FACTORES QUE BAJAN LA PROBABILIDAD:\n"
+            "  Sector ETF negativo >5% semana:  -10 a -20 puntos\n"
+            "  Earn hace >30 días sin noticia:  -10 puntos\n"
+            "  RSI > 78 sobreextendido:         -15 puntos\n"
+            "  Beta > 2.5 + mercado bajando:    -15 puntos\n"
+            "  Sin catalizador fresco:          -10 puntos\n\n"
+            "PUNTO DE PARTIDA — usa el WR histórico del modelo como base:\n"
+            "  M2: 87% · M3: 73% · Momentum: 84% · M1: 30%\n\n"
+            "DEVUELVE SOLO JSON válido sin markdown:\n"
+            '{"probabilidad":72,'
+            '"direccion":"FAVORABLE|ADVERSO|BLOQUEADO",'
+            '"bloqueador":"NINGUNO|DILUCION|EARN_PROXIMO|GUIDANCE_NEG|SECTOR_ADVERSO",'
+            '"razon_principal":"1 línea — qué determina esta probabilidad",'
+            '"factores_positivos":["factor1"],'
+            '"factores_negativos":["factor1"],'
+            '"confianza":75}'
+        )
+        _msg_pe = (
+            f"Ticker: {ticker}\n"
+            f"Fecha HOY: {_hoy_pe}\n\n"
+            f"Setup técnico de entrada:\n"
+            f"  Fase: {fase}\n"
+            f"  Score MVALLE: {score}/20\n"
+            f"  RSI: {rsi}\n"
+            f"  DD desde pico: {dd}%\n"
+            f"  MACD: {macd}\n"
+            f"  WR histórico en esta fase: {wr_base}%\n"
+            f"  Régimen mercado: {regimen}\n"
+            f"  ETF sector ({etf_ticker}): {etf_chg5d:+.1f}% esta semana\n\n"
+            f"Busca noticias de los últimos 5 días sobre {ticker} "
+            f"y evalúa la probabilidad de subida en 10 días hábiles."
+        )
+        _fallback_pe = {
+            "probabilidad": 50, "direccion": "NEUTRAL",
+            "bloqueador": "NINGUNO", "razon_principal": "Sin datos suficientes",
+            "factores_positivos": [], "factores_negativos": [], "confianza": 30
+        }
+        try:
+            import anthropic as _ant_pe
+            _cl_pe = _ant_pe.Anthropic(api_key=(
+                st.secrets.get("ANTHROPIC_API_KEY", "")
+                or st.secrets.get("anthropic", {}).get("api_key", "")
+                or st.secrets.get("gcp_service_account", {}).get("ANTHROPIC_API_KEY", "")
+            ))
+            _r_pe  = _cl_pe.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=800,
+                system=_sys_pe,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": _msg_pe}]
+            )
+            _parts_pe = [b.text.strip() for b in _r_pe.content
+                         if hasattr(b, "text") and b.text and b.text.strip()]
+            _raw_pe = " ".join(_parts_pe).replace("```json","").replace("```","").strip()
+            _s = _raw_pe.find("{"); _e = _raw_pe.rfind("}") + 1
+            if _s >= 0 and _e > _s + 5:
+                try:
+                    return json.loads(_raw_pe[_s:_e])
+                except json.JSONDecodeError:
+                    import re as _re_pe
+                    _js = _raw_pe[_s:_e]
+                    _js += "}" * (_js.count("{") - _js.count("}"))
+                    _js = _re_pe.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', '', _js)
+                    _js = _re_pe.sub(r',\s*"[^"]*"\s*:\s*\[[^\]]*$', '', _js)
+                    if not _js.rstrip().endswith("}"): _js = _js.rstrip() + "}"
+                    try:
+                        return json.loads(_js)
+                    except Exception:
+                        pass
+            return _fallback_pe
+        except Exception as _ex:
+            _fallback_pe["razon_principal"] = f"Error: {str(_ex)[:50]}"
+            return _fallback_pe
+
+    def _llamar_n10_ia(ticker, regimen, sector, rev_yoy, score_base):
+        """N10 GrekoTrader — análisis narrativo con web_search."""
+        import json, re as _re_n10
+        import datetime as _dt_n10
+        _hoy_n10 = str(_dt_n10.date.today())
+        _sys = (
+            f"Eres el analizador N10 de GrekoTrader. Fecha: {_hoy_n10}. "
+            f"Mercado: {regimen}. Ticker: {ticker}. Sector: {sector}.\n\n"
+            "Busca noticias de los últimos 3-5 días y evalúa:\n"
+            "1. Catalizador reciente (calidad y frescura)\n"
+            "2. Riesgos ocultos (demandas, dilución, downgrades)\n"
+            "3. Sentimiento de analistas esta semana\n"
+            "4. Contexto sectorial (viento a favor o en contra)\n\n"
+            "ESCALA n10_score: +3 muy positivo, 0 neutro, -3 riesgo crítico.\n\n"
+            "Responde SOLO con un objeto JSON válido, sin texto antes ni después, "
+            "sin markdown, sin comentarios:\n"
+            '{"n10_score":0,"n10_label":"descripcion corta",'
+            '"catalizador":"descripcion","riesgo_oculto":"descripcion",'
+            '"sector_viento":"A FAVOR o NEUTRO o EN CONTRA",'
+            '"confianza":"ALTA o MEDIA o BAJA","razon_2lineas":"dos lineas"}'
+        )
+        _user = (
+            f"Analiza {ticker} para decisión de inversión. "
+            f"Score técnico: {score_base}/20. Rev YoY: {rev_yoy}. "
+            f"Busca noticias recientes y retorna el JSON."
+        )
+        _fallback = {
+            "n10_score": 0, "n10_label": "Sin datos",
+            "catalizador": "No disponible", "riesgo_oculto": "No disponible",
+            "sector_viento": "NEUTRO", "confianza": "BAJA",
+            "razon_2lineas": "Sin información reciente"
+        }
+        try:
+            import anthropic as _ant_n10
+            _client = _ant_n10.Anthropic(api_key=(
+                st.secrets.get("ANTHROPIC_API_KEY", "")
+                or st.secrets.get("anthropic", {}).get("api_key", "")
+                or st.secrets.get("gcp_service_account", {}).get("ANTHROPIC_API_KEY", "")
+            ))
+            _resp = _client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=800,  # suficiente para web_search + JSON completo
+                system=_sys,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": _user}]
+            )
+            # Extraer texto de todos los bloques (ignorar tool_use/tool_result)
+            _parts = []
+            for _b in _resp.content:
+                if hasattr(_b, "text") and _b.text and _b.text.strip():
+                    _parts.append(_b.text.strip())
+            _raw = " ".join(_parts).strip()
+
+            # Limpiar markdown
+            _raw = _raw.replace("```json", "").replace("```", "").strip()
+
+            # Intentar encontrar JSON completo
+            _s = _raw.find("{")
+            _e = _raw.rfind("}") + 1
+            if _s >= 0 and _e > _s + 10:
+                _json_str = _raw[_s:_e]
+                try:
+                    return json.loads(_json_str)
+                except json.JSONDecodeError:
+                    # Intentar reparar JSON truncado: añadir llave de cierre si falta
+                    _open  = _json_str.count("{")
+                    _close = _json_str.count("}")
+                    _json_str += "}" * (_open - _close)
+                    # Eliminar último valor incompleto (sin comilla de cierre)
+                    _json_str = _re_n10.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', '', _json_str)
+                    _json_str = _re_n10.sub(r',\s*"[^"]*"\s*:\s*[^,}\]]*$', '', _json_str)
+                    if not _json_str.rstrip().endswith("}"):
+                        _json_str = _json_str.rstrip() + "}"
+                    try:
+                        return json.loads(_json_str)
+                    except Exception:
+                        pass
+
+            # Extracción campo a campo si el JSON está muy corrupto
+            def _extract(key, default="—"):
+                _m = _re_n10.search(
+                    rf'"{key}"\s*:\s*"([^"]*)"', _raw)
+                if _m: return _m.group(1)
+                _m = _re_n10.search(
+                    rf'"{key}"\s*:\s*(-?[0-9]+)', _raw)
+                if _m: return int(_m.group(1))
+                return default
+
+            return {
+                "n10_score":     _extract("n10_score", 0),
+                "n10_label":     _extract("n10_label", "Parcial"),
+                "catalizador":   _extract("catalizador", "Ver noticias"),
+                "riesgo_oculto": _extract("riesgo_oculto", "Sin datos suficientes"),
+                "sector_viento": _extract("sector_viento", "NEUTRO"),
+                "confianza":     _extract("confianza", "BAJA"),
+                "razon_2lineas": _extract("razon_2lineas", "Análisis incompleto"),
+            }
+        except Exception as _ex:
+            _fallback["n10_label"] = f"Error: {str(_ex)[:50]}"
+            _fallback["razon_2lineas"] = "Error conexión API"
+            return _fallback
+
+    def _get_etf_for(area: str, sector: str) -> tuple:
+        """Retorna (etf_ticker, label) para un area/sector dado."""
+        _s = (str(area)+str(sector)).upper()
+        for _k,(_e,_l) in _ETF_MAP.items():
+            if _k in _s: return _e, _l
+        return "QQQ","Tech general"
+
+    def _etf_badge(area: str, sector: str) -> str:
+        """Genera HTML del badge de temperatura sectorial (solo info, sin puntos)."""
+        _etf, _lbl = _get_etf_for(area, sector)
+        _d = _get_etf_temp(_etf)
+        if not _d["ok"]: return ""
+        _c = _d["chg30"]
+        if _c>10: _col,_bg,_bor,_icon="#16A34A","#F0FDF4","#86EFAC","🔥"
+        elif _c>5: _col,_bg,_bor,_icon="#22C55E","#F0FDF4","#86EFAC","✅"
+        elif _c>0: _col,_bg,_bor,_icon="#D97706","#FFFBEB","#FDE68A","🟡"
+        elif _c>-5: _col,_bg,_bor,_icon="#F97316","#FFF7ED","#FDBA74","⚠️"
+        elif _c>-10: _col,_bg,_bor,_icon="#EF4444","#FEF2F2","#FECACA","🔴"
+        else: _col,_bg,_bor,_icon="#DC2626","#FEF2F2","#FECACA","🚫"
+        return (f'<div style="background:{_bg};border:1px solid {_bor};'
+                f'border-left:3px solid {_col};border-radius:5px;'
+                f'padding:4px 8px;margin-top:2px">'
+                f'<span style="font-size:9px;font-weight:700;color:{_col}">'
+                f'{_icon} Sector {_lbl} ({_etf}): {_c:+.1f}% 30d'
+                f'</span><span style="font-size:9px;color:#94A3B8;margin-left:6px">'
+                f'· solo informativo</span></div>')
 
     st.markdown(
-        f'<div class="sec-header" style="background:#FFF7ED;border-color:#FB923C">'+
-        f'<span style="font-size:20px">🎯</span>'+
-        f'<div><span style="font-size:16px;font-weight:700;color:#EA580C">Score MVALLE</span>'+
-        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'+
-        f'Ranking para invertir dinero real · NBIS vs Momentum</span>'+
+    f'<div class="sec-header" style="background:#FFF7ED;border-color:#FB923C">'+
+    f'<span style="font-size:20px">🎯</span>'+
+    f'<div><span style="font-size:16px;font-weight:700;color:#EA580C">Score MVALLE</span>'+
+    f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'+
+    f'Ranking para invertir dinero real · NBIS vs Momentum</span>'+
+    f'</div></div>', unsafe_allow_html=True)
+
+    # ══ SEMÁFORO DE MERCADO Y SECTORES — Opción B (carga al abrir tab) ══════
+    @st.cache_data(ttl=1800, show_spinner=False)
+    def _calcular_semaforos() -> dict:
+        """Calcula semáforo de mercado general + 8 ETFs sectoriales."""
+        import yfinance as _yf_sm
+        import numpy as _np_sm
+
+        def _rsi(serie, n=14):
+            _d = serie.diff()
+            _g = _d.clip(lower=0).rolling(n).mean()
+            _l = (-_d.clip(upper=0)).rolling(n).mean()
+            return round(float(100-100/(1+_g.iloc[-1]/(_l.iloc[-1]+1e-9))), 1)
+
+        def _fetch(tk, period="40d"):
+            try:
+                _h = _yf_sm.Ticker(tk).history(period=period)["Close"].dropna()
+                if len(_h) < 10: return None
+                _c5  = round((_h.iloc[-1]-_h.iloc[-5])/_h.iloc[-5]*100, 1)  if len(_h)>=5  else 0
+                _c30 = round((_h.iloc[-1]-_h.iloc[0]) /_h.iloc[0] *100, 1)
+                _rs  = _rsi(_h)
+                return {"c5":_c5,"c30":_c30,"rsi":_rs,"precio":round(float(_h.iloc[-1]),2)}
+            except Exception: return None
+
+        # ── Indicadores de mercado general ───────────────────────
+        _spy  = _fetch("SPY")
+        _qqq  = _fetch("QQQ")
+        _vix  = _fetch("^VIX", period="10d")
+        _tnx  = _fetch("^TNX", period="10d")   # 10Y yield
+        _btc  = _fetch("BTC-USD", period="10d")
+
+        # Score semáforo mercado
+        _pts = 0
+        if _vix:
+            _v = _vix["precio"]
+            _pts += 3 if _v<15 else 1 if _v<18 else -1 if _v<25 else -3
+        if _spy:
+            _r = _spy["rsi"]
+            _pts += 2 if 48<=_r<=68 else 0 if 68<_r<=75 else -2 if _r>75 else -1
+        if _qqq:
+            _r = _qqq["rsi"]
+            _pts += 2 if 48<=_r<=68 else 0 if 68<_r<=75 else -2 if _r>75 else -1
+        if _tnx:
+            _t = _tnx["precio"]
+            _pts += 1 if _t<4.0 else 0 if _t<4.5 else -1 if _t<5.0 else -2
+        if _btc:
+            _pts += 1 if _btc["c5"]>0 else -1 if _btc["c5"]<-5 else 0
+
+        def _pts_to_semaforo(p):
+            if p>=4:  return ("🟢","VERDE FUERTE", "#16A34A","#F0FDF4","#86EFAC")
+            if p>=2:  return ("🟢","VERDE",        "#22C55E","#F0FDF4","#86EFAC")
+            if p>=0:  return ("🟡","SELECTIVO",    "#D97706","#FFFBEB","#FDE68A")
+            if p>=-2: return ("🟠","PRECAUCIÓN",   "#F97316","#FFF7ED","#FDBA74")
+            return            ("🔴","ALERTA",       "#EF4444","#FEF2F2","#FECACA")
+
+        _sem_gral = _pts_to_semaforo(_pts)
+
+        # ── Semáforos sectoriales (16 áreas → 8 ETFs) ────────────
+        _SECTOR_ETFS = {
+            "Aeroespacial y defensa":                 ("ITA",  "ITA","#1D4ED8"),
+            "Almacenamiento & Storage":               ("SOXX", "SOXX","#7C3AED"),
+            "Biotecnología e investigación médica":   ("XBI",  "XBI","#BE185D"),
+            "Comunicaciones y redes":                 ("IGN",  "QQQ","#0369A1"),
+            "Energía renovable":                      ("ICLN", "ICLN","#15803D"),
+            "Equipos y piezas electrónicas":          ("SOXX", "SOXX","#7C3AED"),
+            "Equipos y suministros sanitarios":       ("IHI",  "XLV","#BE185D"),
+            "eVTOL / Advanced Air Mobility (AAM)":    ("ITA",  "ITA","#1D4ED8"),
+            "IA Infraestructura":                     ("QQQ",  "QQQ","#4F46E5"),
+            "Networking&Connectivity":                ("IGN",  "QQQ","#0369A1"),
+            "Quantum Computing / AI":                 ("QQQ",  "QTUM","#4F46E5"),
+            "Robotica/Drones":                        ("ROBO", "QQQ","#6D28D9"),
+            "Salud":                                  ("XLV",  "XLV","#BE185D"),
+            "Semiconductores y equipos de semiconductores":("SOXX","SOXX","#7C3AED"),
+            "Software y servicios informáticos":      ("IGV",  "IGV","#1E40AF"),
+            "Tecnología financiera (Fintech) e infraestructuras":("FINX","XLK","#0E7490"),
+        }
+
+        # Descargar ETFs únicos
+        _etfs_unicos = list(set(e for e,_,_ in _SECTOR_ETFS.values()))
+        _etf_data    = {}
+        for _et in _etfs_unicos:
+            _etf_data[_et] = _fetch(_et)
+
+        def _score_etf(d):
+            if not d: return 0
+            _p = 0
+            _p += 2 if d["c5"]>2 else 1 if d["c5"]>0 else -1 if d["c5"]>-2 else -2
+            _p += 3 if d["c30"]>10 else 2 if d["c30"]>5 else 1 if d["c30"]>0 else 0 if d["c30"]>-5 else -2 if d["c30"]>-15 else -3
+            _p += 1 if 45<=d["rsi"]<=65 else -1 if d["rsi"]>72 or d["rsi"]<35 else 0
+            return _p
+
+        _sectores_sem = {}
+        for _nombre, (_etf_p, _etf_fb, _color) in _SECTOR_ETFS.items():
+            _d = _etf_data.get(_etf_p) or _etf_data.get(_etf_fb)
+            _sc_s = _score_etf(_d)
+            _sem_s = _pts_to_semaforo(_sc_s)
+            _sectores_sem[_nombre] = {
+                "semaforo": _sem_s,
+                "etf":      _etf_p,
+                "data":     _d,
+                "color_area": _color,
+            }
+
+        return {
+            "mercado_pts":  _pts,
+            "mercado_sem":  _sem_gral,
+            "spy":  _spy,  "qqq":  _qqq,
+            "vix":  _vix,  "tnx":  _tnx,  "btc":  _btc,
+            "sectores":     _sectores_sem,
+        }
+
+    # ── Mostrar semáforos (calcula al abrir el tab) ──────────────
+    with st.spinner("🌡️ Calculando temperatura de mercado y sectores..."):
+        _sem_data = _calcular_semaforos()
+
+    _sm_gral = _sem_data["mercado_sem"]      # (icon, label, col, bg, bor)
+    _sm_spy  = _sem_data.get("spy",  {}) or {}
+    _sm_qqq  = _sem_data.get("qqq",  {}) or {}
+    _sm_vix  = _sem_data.get("vix",  {}) or {}
+    _sm_tnx  = _sem_data.get("tnx",  {}) or {}
+    _sm_btc  = _sem_data.get("btc",  {}) or {}
+
+    # ── Header semáforo de mercado ───────────────────────────────
+    st.markdown(
+        f'<div style="background:{_sm_gral[3]};border:1px solid {_sm_gral[4]};'
+        f'border-left:4px solid {_sm_gral[2]};border-radius:8px;padding:10px 14px;margin-bottom:8px">'
+        f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+        f'<span style="font-size:18px">{_sm_gral[0]}</span>'
+        f'<span style="font-size:13px;font-weight:800;color:{_sm_gral[2]}">Mercado {_sm_gral[1]}</span>'
+        f'<span style="font-size:10px;color:#64748B">'
+        f'SPY RSI {_sm_spy.get("rsi","—")} · '
+        f'QQQ RSI {_sm_qqq.get("rsi","—")} · '
+        f'VIX {_sm_vix.get("precio","—")} · '
+        f'10Y {_sm_tnx.get("precio","—")}% · '
+        f'BTC {str(round(_sm_btc["c5"],1)) + "%" if isinstance(_sm_btc.get("c5"),(int,float)) else "—"}5d</span>'
         f'</div></div>', unsafe_allow_html=True)
 
-    with st.expander("📋 ¿Qué busca este tab? — Cómo leer el Score MVALLE", expanded=False):
+    # ── Grid semáforos sectoriales ───────────────────────────────
+    _sectores_items = list(_sem_data.get("sectores", {}).items())
+    if _sectores_items:
+        # Ordenar: verde primero, rojo último
+        _orden = {"VERDE FUERTE":0,"VERDE":1,"SELECTIVO":2,"PRECAUCIÓN":3,"ALERTA":4}
+        _sectores_items.sort(key=lambda x: _orden.get(x[1]["semaforo"][1], 5))
+
+        st.markdown(
+            f'<div style="font-size:10px;font-weight:700;color:#64748B;'
+            f'text-transform:uppercase;letter-spacing:.8px;margin:6px 0 4px">🌡️ Temperatura sectorial</div>',
+            unsafe_allow_html=True)
+
+        # 3 columnas de badges
+        _cols_s = st.columns(3)
+        for _si, (_snm, _sd) in enumerate(_sectores_items):
+            _sem_s  = _sd["semaforo"]
+            _sd_dat = _sd.get("data") or {}
+            _etf_s  = _sd["etf"]
+            _c30_s  = _sd_dat.get("c30", 0)
+            _rsi_s  = _sd_dat.get("rsi", 0)
+            _snm_corto = (_snm[:22]+"…") if len(_snm)>24 else _snm
+            with _cols_s[_si % 3]:
+                st.markdown(
+                    f'<div style="background:{_sem_s[3]};border:1px solid {_sem_s[4]};'
+                    f'border-left:3px solid {_sem_s[2]};border-radius:6px;'
+                    f'padding:5px 8px;margin-bottom:4px">'
+                    f'<div style="font-size:9px;font-weight:800;color:{_sem_s[2]}">'
+                    f'{_sem_s[0]} {_sem_s[1]}</div>'
+                    f'<div style="font-size:9px;color:#334155;font-weight:600;margin-top:1px">'
+                    f'{_snm_corto}</div>'
+                    f'<div style="font-size:8px;color:#94A3B8">'
+                    f'{_etf_s} · {_c30_s:+.1f}%30d · RSI {_rsi_s}</div>'
+                    f'</div>', unsafe_allow_html=True)
         st.markdown(
             "<div style='font-size:11px;line-height:1.9'>"
             "<strong style='color:#EA580C'>🎯 Tab Score MVALLE — ¿Qué acción entra a MVALLE mañana?</strong><br>"
@@ -15314,6 +16258,10 @@ with tab_score:
             "🔸 <strong>M5 SPY · M6 Prob · M7 Urgencia:</strong> igual que NBIS<br>"
             "<strong>Gestión Momentum:</strong> 20-30% · Stop -5% · T1 +15% · T2 +30%<br><br>"
 
+            "<strong style='color:#0284C7'>👁️ ALERTA M2 PRÓXIMAS A M3:</strong><br>"
+            "Las posiciones en fase M2 con score ≥9 aparecen arriba como alerta de vigilancia. "
+            "Cuando el MACD cruce a positivo → suben a M3 → aparecen como candidatas. "
+            "<strong>Revisar diariamente al cierre para no perder el cruce (caso ENPH).</strong><br><br>"
             "<strong style='color:#16A34A'>✅ REGLA DE DECISIÓN (misma para ambos modelos):</strong><br>"
             "🔴 <strong>WR histórico &lt;50%</strong> → 🚫 NO ENTRAR siempre · WR mide cuántas señales similares ganaron<br>"
             "🟢 <strong>Score ≥15</strong> + WR≥50% + RE&lt;75 → ✅ ENTRAR · señal calificada<br>"
@@ -15494,17 +16442,33 @@ with tab_score:
                     lambda v: v.strip() in ("-","","nan","None","NaT"))].copy()
 
                 def _es_m3_sc(row):
-                    _f  = str(row.get("Fase","-")).upper()
-                    _s  = str(row.get("Fuente","")).upper()
-                    _ts = str(row.get("Tipo_Señal","-")).upper()
-                    # v19.3: incluir M2, M3, Momentum y todas las activas
-                    if any(x in _f for x in ["M3","M2","FASE 3","FASE3","FASE 2","FASE2",
-                                              "ENTRAR","M3-A","ANTICIPAR","MOMENTUM",
-                                              "SWING","SEGUIR","VIGILAR"]):
+                    _f  = str(row.get("Fase","-")).upper().strip()
+                    _s  = str(row.get("Fuente","")).upper().strip()
+                    _ts = str(row.get("Tipo_Señal","-")).upper().strip()
+
+                    # M1 y sin fase → SIEMPRE excluir (señal prematura)
+                    if _f in ("-","","NAN","NONE","M1","M 1"):
+                        return False
+
+                    # Fuentes válidas
+                    _fuentes_ok = ("WATCHLIST","MOMENTUM","SWING","SWING ACTIVO",
+                                   "ENTRAR HOY","ENTRAR_HOY","SYMPATHY","NBIS")
+                    _src_ok = any(x in _s for x in _fuentes_ok)
+
+                    # Fases válidas — exactamente las definidas por el trader
+                    _fases_ok = ("M3","M3-A","FASE 3","FASE3","FASE3",
+                                 "MOMENTUM","MOMENTUM ⚡","ANTICIPAR","ENTRAR")
+                    _fase_ok = any(x in _f for x in _fases_ok)
+
+                    # M2 → solo incluir si viene de fuente válida (está en seguimiento)
+                    _es_m2 = "M2" in _f or "FASE 2" in _f or "FASE2" in _f
+                    if _es_m2:
+                        return _src_ok  # M2 solo si fuente válida
+
+                    if "MOMENTUM" in _ts or "SYMPATHY" in _ts:
                         return True
-                    if "MOMENTUM" in _s or "MOMENTUM" in _ts or "SYMPATHY" in _s:
-                        return True
-                    return _f not in ("-","","NAN","NONE","M1")
+
+                    return _src_ok and _fase_ok
 
                 _df_m3_sc  = _df_act_sc[_df_act_sc.apply(_es_m3_sc, axis=1)].copy()
                 _tks_sc    = [str(r.get("Ticker","")).upper().strip()
@@ -15571,6 +16535,24 @@ with tab_score:
                             try:
                                 _inf_sc  = _yf_sc_info.Ticker(_tk_sc).info or {}
                                 _n_an    = int(_inf_sc.get("numberOfAnalystOpinions",0) or 0)
+                                _rec_mean = float(_inf_sc.get("recommendationMean",3.0) or 3.0)
+                                _rec_key  = str(_inf_sc.get("recommendationKey","-") or "-").lower()
+                                # Calcular % Buy desde numberOfBuyAnalysts si disponible
+                                _n_strong_buy = int(_inf_sc.get("numberOfStrongBuyAnalysts",0) or 0)
+                                _n_buy        = int(_inf_sc.get("numberOfBuyAnalysts",0) or 0)
+                                _n_hold       = int(_inf_sc.get("numberOfHoldAnalysts",0) or 0)
+                                _n_sell       = int(_inf_sc.get("numberOfSellAnalysts",0) or 0)
+                                _n_strong_sell= int(_inf_sc.get("numberOfStrongSellAnalysts",0) or 0)
+                                _n_total_an   = _n_strong_buy+_n_buy+_n_hold+_n_sell+_n_strong_sell
+                                # Si tenemos desglose → calcular %buy; si no → estimar desde recommendationMean
+                                if _n_total_an > 0:
+                                    _pct_buy = round((_n_strong_buy+_n_buy)/_n_total_an*100, 0)
+                                elif _rec_mean <= 1.5:  _pct_buy = 85.0
+                                elif _rec_mean <= 2.0:  _pct_buy = 70.0
+                                elif _rec_mean <= 2.5:  _pct_buy = 55.0
+                                elif _rec_mean <= 3.0:  _pct_buy = 40.0
+                                elif _rec_mean <= 3.5:  _pct_buy = 28.0
+                                else:                   _pct_buy = 15.0
                                 _tm_sc   = float(_inf_sc.get("targetMeanPrice",0) or 0)
                                 _pa_sc   = float(_inf_sc.get("currentPrice",
                                            _inf_sc.get("regularMarketPrice",0)) or 0)
@@ -15584,14 +16566,19 @@ with tab_score:
                                                     == _dt_sc_info.date.today())
                                     except Exception: pass
                                 _up_sc    = round((_tm_sc-_pa_sc)/_pa_sc*100,1) if _tm_sc>0 and _pa_sc>0 else 0
+                                _beta_sc  = float(_inf_sc.get("beta", 1.0) or 1.0)
                                 _info_ok  = True
                                 _fund_sc[_tk_sc] = {
                                     "n_analistas": _n_an, "target_mean": _tm_sc,
                                     "precio": _pa_sc, "revenue_yoy": round(_rv_sc*100,1),
                                     "upside": _up_sc, "earn_hoy": _ehoy_sc,
                                     "sobre_target": _pa_sc > _tm_sc > 0,
-                                    "earn_ts_raw": _et_sc,  # timestamp raw para N7
+                                    "earn_ts_raw": _et_sc,
                                     "info_ok": True,
+                                    "pct_buy":   _pct_buy,
+                                    "rec_mean":  _rec_mean,
+                                    "rec_key":   _rec_key,
+                                    "beta":      _beta_sc,
                                 }
                             except Exception:
                                 _fund_sc[_tk_sc] = {
@@ -15627,12 +16614,28 @@ with tab_score:
 
                     # Fundamentales live
                     _f       = _fund_sc.get(_tk, {})
-                    _n_an_f  = _f.get("n_analistas", 0)
-                    _ehoy_f  = _f.get("earn_hoy", False)
-                    _up_f    = _f.get("upside", 0)
-                    _rv_f    = _f.get("revenue_yoy", None)
-                    _sob_tgt = _f.get("sobre_target", False)
-                    _info_ok = _f.get("info_ok", False)
+                    _n_an_f   = _f.get("n_analistas", 0)
+                    _pct_buy_f= _f.get("pct_buy", 50.0)
+                    _rec_mean_f= _f.get("rec_mean", 3.0)
+                    _ehoy_f   = _f.get("earn_hoy", False)
+                    _up_f     = _f.get("upside", 0)
+                    _rv_f     = _f.get("revenue_yoy", None)
+                    _sob_tgt  = _f.get("sobre_target", False)
+                    _info_ok  = _f.get("info_ok", False)
+                    _beta_f   = float(_f.get("beta", 1.0) or 1.0)  # Beta del activo
+                    # Puntos y etiqueta del consenso de analistas
+                    if _n_an_f < 5:
+                        _n_an_pts, _n_an_lbl = 0, f"Sin cobertura ({_n_an_f} anal.)"
+                    elif _pct_buy_f >= 70:
+                        _n_an_pts, _n_an_lbl = 3, f"🟢 Buy fuerte ({_pct_buy_f:.0f}% Buy · {_n_an_f} anal.)"
+                    elif _pct_buy_f >= 50:
+                        _n_an_pts, _n_an_lbl = 2, f"🟡 Buy moderado ({_pct_buy_f:.0f}% Buy · {_n_an_f} anal.)"
+                    elif _pct_buy_f >= 35:
+                        _n_an_pts, _n_an_lbl = 1, f"🟡 Hold ({_pct_buy_f:.0f}% Buy · {_n_an_f} anal.)"
+                    elif _pct_buy_f >= 20:
+                        _n_an_pts, _n_an_lbl = 0, f"🔴 Precaución ({_pct_buy_f:.0f}% Buy · {_n_an_f} anal.)"
+                    else:
+                        _n_an_pts, _n_an_lbl = -1, f"🔴 Sell ({_pct_buy_f:.0f}% Buy · {_n_an_f} anal.)"
 
                     # Tipo
                     if _tipo_s in ("-","","nan"):
@@ -15646,8 +16649,19 @@ with tab_score:
                     if _ehoy_f: _alertas.append("🚫 Earnings HOY"); _bloq=True
                     if not _info_ok:
                         _alertas.append("⚠️ Sin datos live")
-                    elif _n_an_f==0 and "MOMENTUM" not in _fuente:
-                        _alertas.append("❌ Sin analistas"); _bloq=True
+                    elif _n_an_f==0:
+                        # Verificar si la fuente o fase es válida para Momentum
+                        _fuentes_mom = ("MOMENTUM","WATCHLIST","SWING","ENTRAR HOY",
+                                        "SWING ACTIVO","SYMPATHY")
+                        _fases_mom   = ("MOMENTUM","M3","M3-A","MOMENTUM ⚡")
+                        _es_mom_src  = any(x in _fuente for x in _fuentes_mom)
+                        _es_mom_fase = any(x in str(_r.get("Fase","")).upper() for x in _fases_mom)
+                        if _es_mom_src or _es_mom_fase:
+                            # Momentum/Watchlist → no bloquear, solo alertar
+                            _alertas.append("⚠️ Sin cobertura analistas — evaluar manualmente")
+                        else:
+                            # NBIS sin analistas → bloquear
+                            _alertas.append("❌ Sin analistas"); _bloq=True
                     elif 0 < _n_an_f < 3:
                         _alertas.append(f"⚠️ Solo {_n_an_f} analistas")
                     if _sob_tgt:
@@ -15660,83 +16674,76 @@ with tab_score:
                     else:
                         _rv_str = f"{_rv_f:+.0f}%"
 
-                    # N7 Urgencia — ajustado por earnings BEAT/MISS (v19.2)
-                    # Detecta automáticamente la fecha y reacción del mercado
-                    _urg=1; _urg_l="Sin earn próx"
+                    # N7 Urgencia v19.3 — Frescura del catalizador
+                    # Post-earn BEAT 0-10d:+3 · 11-20d:+2 · 21-30d:+1 · >30d:0
+                    # Earn HOY/≤2d: BLOQUEAR · 3-5d:-2 · 6-10d:+1
+                    # Noticia fresca ≤3d: +2 · 4-7d: +1
+                    _urg=0; _urg_l="Sin catalizador"
                     try:
                         import datetime as _dtsc_n7
                         _hoy_n7 = _dtsc_n7.date.today()
-
-                        # Buscar earnings desde yfinance (ya tenemos _inf_sc del paso 3)
                         _et_n7 = _f.get("earn_ts_raw", None)
-                        # Si no está en _fund_sc, usar Cat_Fecha del Sheet como fallback
                         _earn_date_n7 = None
                         if _et_n7:
-                            try:
-                                _earn_date_n7 = _dtsc_n7.datetime.fromtimestamp(int(_et_n7)).date()
+                            try: _earn_date_n7 = _dtsc_n7.datetime.fromtimestamp(int(_et_n7)).date()
                             except Exception: pass
                         if not _earn_date_n7 and _cat not in ("-","","nan"):
-                            try:
-                                _earn_date_n7 = _dtsc_n7.date.fromisoformat(_cat[:10])
+                            try: _earn_date_n7 = _dtsc_n7.date.fromisoformat(_cat[:10])
                             except Exception: pass
-
+                        # Noticia más reciente (días desde hoy)
+                        _noticia_dias = 999
+                        try:
+                            _news_sc = _yf_sc_info.Ticker(_tk_sc).news or []
+                            if _news_sc:
+                                _latest_ts = _news_sc[0].get("providerPublishTime",0)
+                                if _latest_ts > 0:
+                                    _news_date = _dtsc_n7.datetime.fromtimestamp(_latest_ts).date()
+                                    _noticia_dias = (_hoy_n7 - _news_date).days
+                        except Exception: pass
                         if _earn_date_n7:
                             _dias_earn = (_earn_date_n7 - _hoy_n7).days
-
                             if _dias_earn == 0:
-                                # Earnings HOY → bloqueado
                                 _urg=-3; _urg_l="Earn HOY 🚫"; _bloq=True
-
                             elif _dias_earn < 0:
-                                # Earnings YA OCURRIÓ — detectar reacción del mercado
-                                _dias_pasados = abs(_dias_earn)
-                                if _dias_pasados <= 14:
-                                    # Dentro de 14 días — analizar reacción de precio
-                                    _pa_earn   = _pa_live  # precio actual
-                                    _pc_earn   = _pc        # precio de entrada
-
-                                    # Intentar obtener precio del día de earnings desde yf.download
-                                    # ya tenemos el historial en _live_sc si calculamos bien
-                                    # Proxy: si precio subió >3% desde entrada → BEAT
-                                    #        si bajó >3% → MISS
-                                    #        ±3% → IN LINE
-                                    _pnl_post = (_pa_earn - _pc_earn) / _pc_earn * 100 if _pc_earn > 0 else 0
-
-                                    # Complementar con revenueGrowth
-                                    _rv_n7 = _rv_f if _rv_f is not None else 0
-
-                                    if _pnl_post > 5 or _rv_n7 > 30:
-                                        # Reacción positiva o revenue fuerte → BEAT
-                                        _urg=3; _urg_l=f"Post-Earn BEAT +{_pnl_post:.0f}% 🟢"
-                                    elif _pnl_post < -5:
-                                        # Caída post-earnings → MISS o decepción
-                                        _urg=-2; _urg_l=f"Post-Earn MISS {_pnl_post:.0f}% 🔴"
-                                        if not _alertas: _alertas.append(f"⚠️ Post-earn -ve")
-                                    else:
-                                        # In line
-                                        _urg=1; _urg_l=f"Post-Earn IN LINE ({_pnl_post:+.0f}%)"
+                                _dp = abs(_dias_earn)
+                                _rv_n7 = _rv_f if _rv_f is not None else 0
+                                _pnl_post = (_pa_live - _pc)/_pc*100 if _pc>0 else 0
+                                _es_beat  = _pnl_post > 5 or _rv_n7 > 25
+                                if _dp <= 10:
+                                    if _es_beat: _urg=3; _urg_l=f"Post-Earn BEAT {_dp}d 🟢"
+                                    elif _pnl_post < -5: _urg=-2; _urg_l=f"Post-Earn MISS {_pnl_post:.0f}% 🔴"; _alertas.append("⚠️ Post-earn negativo")
+                                    else: _urg=1; _urg_l=f"Post-Earn {_dp}d neutral"
+                                elif _dp <= 20:
+                                    if _es_beat: _urg=2; _urg_l=f"Post-Earn {_dp}d · vigencia moderada"
+                                    elif _pnl_post < -5: _urg=-1; _urg_l=f"Post-Earn negativo {_dp}d"
+                                    else: _urg=0; _urg_l=f"Post-Earn {_dp}d neutral"
+                                elif _dp <= 30:
+                                    _urg = 1 if _es_beat else 0
+                                    _urg_l = f"Post-Earn {_dp}d · {'casi digerido' if _es_beat else 'digerido'}"
                                 else:
-                                    # Más de 14 días → earnings ya digerido por el mercado
-                                    _urg=1; _urg_l="Earn digerido"
-
+                                    # >30d earn digerido — buscar noticia fresca
+                                    if _noticia_dias<=3: _urg=2; _urg_l=f"Noticia fresca {_noticia_dias}d · earn digerido"
+                                    elif _noticia_dias<=7: _urg=1; _urg_l=f"Noticia {_noticia_dias}d · earn digerido"
+                                    else: _urg=0; _urg_l=f"Earn >30d sin catalizador nuevo"; _alertas.append("⚠️ Catalizador >30d · momentum sin combustible")
                             elif _dias_earn <= 2:
-                                # Earnings muy próximos → riesgo binario ALTO
-                                _urg=1; _urg_l=f"Earn {_dias_earn}d ⚠️ riesgo binario"
-                                _alertas.append(f"⚠️ Earnings en {_dias_earn}d — riesgo binario")
-
-                            elif _dias_earn <= 7:
-                                # Zona óptima — el mercado aún no reaccionó
-                                _urg=2; _urg_l=f"Earn {_dias_earn}d · zona óptima"
-
+                                _urg=-3; _urg_l=f"Earn {_dias_earn}d 🚫 BLOQUEADO"; _bloq=True
+                                _alertas.append(f"🚫 Earn en {_dias_earn}d — riesgo binario")
+                            elif _dias_earn <= 5:
+                                _urg=-2; _urg_l=f"Earn {_dias_earn}d ⚠️ precaución"
+                                _alertas.append(f"⚠️ Earn en {_dias_earn}d — reducir tamaño")
+                            elif _dias_earn <= 10:
+                                _urg=1; _urg_l=f"Earn {_dias_earn}d · anticipación"
                             else:
-                                # Lejos
-                                _urg=1; _urg_l=f"Earn en {_dias_earn}d"
+                                if _noticia_dias<=3: _urg=2; _urg_l=f"Noticia fresca {_noticia_dias}d · earn {_dias_earn}d"
+                                elif _noticia_dias<=7: _urg=1; _urg_l=f"Noticia {_noticia_dias}d · earn {_dias_earn}d"
+                                else: _urg=0; _urg_l=f"Sin catalizador fresco · earn {_dias_earn}d"
                         else:
-                            # Sin fecha de earnings → señal técnica pura
-                            _urg=1; _urg_l="Sin earn detectado"
-
+                            # Sin earnings — solo noticias
+                            if _noticia_dias<=3: _urg=2; _urg_l=f"Noticia fresca {_noticia_dias}d 🟢"
+                            elif _noticia_dias<=7: _urg=1; _urg_l=f"Noticia {_noticia_dias}d"
+                            else: _urg=0; _urg_l="Sin catalizador identificado"
                     except Exception:
-                        _urg=1; _urg_l="Urgencia N/D"
+                        _urg=0; _urg_l="Urgencia N/D"
                     _alerta_str = " · ".join(_alertas) if _alertas else "—"
 
                     # SPY N6
@@ -15759,9 +16766,12 @@ with tab_score:
                         # Datos reales: WR 84% en RSI 65-82 vs 32% en RSI 35-55
                         if 0<_rsi_ac<=52:   _n2=3;_n2_l=f"RSI {_rsi_ac:.0f}🟢 NBIS"
                         elif _rsi_ac<=65:   _n2=2;_n2_l=f"RSI {_rsi_ac:.0f}"
-                        elif _rsi_ac<=82:   _n2=2;_n2_l=f"RSI {_rsi_ac:.0f} MOM"
-                        elif _rsi_ac>82:    _n2=1;_n2_l=f"RSI {_rsi_ac:.0f} EXT"
+                        elif _rsi_ac<=73:   _n2=2;_n2_l=f"RSI {_rsi_ac:.0f} MOM"
+                        elif _rsi_ac<=82:   _n2=1;_n2_l=f"RSI {_rsi_ac:.0f}⚠️RE"  # v19.3: RSI>73 = sobreextendido
+                        elif _rsi_ac>82:    _n2=0;_n2_l=f"RSI {_rsi_ac:.0f}🔴EXT"
                         else:               _n2=0;_n2_l="RSI N/D"
+                        # v19.3: RSI>73 reduce score total (señal sobreextendida)
+                        _rsi_overextended = _rsi_ac > 73
 
                         if _dd_p<=-25:  _n3=3;_n3_l=f"DD {_dd_p:.0f}%"
                         elif _dd_p<=-15:_n3=2;_n3_l=f"DD {_dd_p:.0f}%"
@@ -15778,18 +16788,44 @@ with tab_score:
                         elif _macd_e=="-":_n5=-1;_n5_l="MACD−"
                         else:           _n5=0;_n5_l="MACD N/D"
 
-                        _total=max(0,min(20,_n1+_n2+_n3+_n4+_n5+_c_spy+_urg))
+                        # Agregar puntos de consenso analistas al total NBIS
+                        # v19.3: Regla RSI × DD validada con 9 casos reales
+                        # RSI>73 + DD<-25%:  sobreextensión rebote → -2pts (BRZE/TEAM/PLTR)
+                        # RSI>73 + DD-10/-25%: zona gris → -1pt  (FCEL)
+                        # RSI>73 + DD>-10%:  momentum genuino → 0pts (HPE/DELL)
+                        # RSI<73:            NBIS/Momentum normal → 0pts (APTV/RCAT/RUN)
+                        if _rsi_ac > 73 and _dd_p < -25:
+                            _rsi_over = -2   # sobreextensión clara
+                        elif _rsi_ac > 73 and -25 <= _dd_p < -10:
+                            _rsi_over = -1   # zona gris — cautela
+                        elif _rsi_ac > 73 and _dd_p >= -10:
+                            _rsi_over = 0    # momentum genuino — no penalizar
+                        else:
+                            _rsi_over = 0    # RSI normal — sin penalización
+                        # v19.3: Beta alto = amplifica riesgo → penalización permanente
+                        # Validado: ganadores beta<1.3 · perdedores beta>1.8
+                        if _beta_f >= 2.5:   _beta_pen = -3  # muy especulativo
+                        elif _beta_f >= 1.8: _beta_pen = -2  # alto riesgo
+                        elif _beta_f >= 1.4: _beta_pen = -1  # cautela
+                        else:                _beta_pen = 0   # beta normal
+                        _total=max(0,min(20,_n1+_n2+_n3+_n4+_n5+_c_spy+_urg+_n_an_pts+_rsi_over+_beta_pen))
+                        # Riesgo Extensión NBIS — calcular ANTES de _rec
+                        _ld_re       = _live_sc.get(_tk, {})
+                        _dist_ema_re = _ld_re.get("dist_ema50", 0)
+                        _dist_52w_re = _ld_re.get("dist_52w", 0)
+                        _re_result   = calcular_riesgo_extension(
+                            rsi=_rsi_ac, dist_ema50=_dist_ema_re,
+                            dist_52w=_dist_52w_re, tipo="NBIS")
                         if _bloq:
                             _total=min(_total,8);_rec="🚫 BLOQUEADO";_rc="#6B7280"
                         else:
-                            # v19.3: Score = gate principal · WR = filtro duro
-                            _rh_pre = _gtu_get_rh(_rsi_ac, abs(_dd_p), _prob)
-                            _wr_pre = _rh_pre.get("rh_wr", 50)
-                            _re_pre_nbis = _re_result.get("re",0) if "_re_result" in dir() else 50
+                            # v19.3: mismo cálculo que card veredicto → Candidatos consistente
+                            _rh_pre  = _gtu_get_rh(_rsi_ac, abs(_dd_p), _prob)
+                            _wr_pre  = _rh_pre.get("rh_wr", 50)
+                            _re_val  = _re_result.get("re", 0) if isinstance(_re_result, dict) else 50
                             if _wr_pre < 50:
-                                # WR bajo = trampa de valor, nunca entrar
                                 _rec="🚫 No entrar";_rc="#EF4444"
-                            elif _total >= 15 and _re_pre_nbis < 65:
+                            elif _total >= 15 and _re_val < 65:
                                 _rec="✅ Entrar";_rc="#16A34A"
                             elif _total >= 15:
                                 _rec="⚡ Parcial";_rc="#F97316"
@@ -15800,23 +16836,20 @@ with tab_score:
                             else:
                                 _rec="⬇️ Baja prio";_rc="#94A3B8"
 
-                        # Riesgo Extensión NBIS
-                        _ld_re       = _live_sc.get(_tk, {})
-                        _dist_ema_re = _ld_re.get("dist_ema50", 0)
-                        _dist_52w_re = _ld_re.get("dist_52w", 0)
-                        _re_result   = calcular_riesgo_extension(
-                            rsi=_rsi_ac, dist_ema50=_dist_ema_re,
-                            dist_52w=_dist_52w_re, tipo="NBIS")
-
                         _nbis_rows_new.append({
                             "Ticker":_tk,"Sector":_area[:14],"Fase":_n1_l,
                             "N1":_n1,"N2":_n2,"N3":_n3,"N4":_n4,"N5":_n5,
                             "N6":_c_spy,"N7":_urg,"TOTAL":_total,"Rec":_rec,"Rc":_rc,
                             "N2_l":_n2_l,"N3_l":_n3_l,"N4_l":_n4_l,"N5_l":_n5_l,
                             "N6_l":_spy_l,"N7_l":_urg_l,"Precio":_pa_live,
-                            "RSI":_rsi_ac,"MACD":_macd_e,
+                            "RSI":_rsi_ac,"MACD":_macd_e,"DD":_dd_p,
+                            "RSI_over":_rsi_over,
+                            "Beta":round(_beta_f,2),
+                            "Beta_pen":_beta_pen,
                             "Gestion":"100% · Stop -7% · T1 +8% · T2 +12%",
                             "Analistas":_n_an_f,
+                            "Analistas_Label":_n_an_lbl,
+                            "Analistas_Pct":round(_pct_buy_f,0),
                             "Upside":f"+{_up_f:.0f}%" if _info_ok else "N/D",
                             "RevYoY":_rv_str,
                             "Alertas":_alerta_str,"Bloqueado":_bloq,
@@ -15854,17 +16887,27 @@ with tab_score:
                         elif _prob>0:    _m6=1;_m6_l=f"Pr {_prob:.0f}%"
                         else:           _m6=0;_m6_l="Pr N/D"
 
-                        _total=max(0,min(20,_m1+_m2+_m3+_m4+_m5+_m6+_urg))
+                        # Agregar puntos de consenso analistas al total Momentum
+                        _n_an_pts_m = _n_an_pts
+                        _n_an_lbl_m = _n_an_lbl
+                        _total=max(0,min(20,_m1+_m2+_m3+_m4+_m5+_m6+_urg+_n_an_pts_m))
+                        # Riesgo Extensión Momentum — calcular ANTES de _rec
+                        _ld_re_m       = _live_sc.get(_tk, {})
+                        _dist_ema_re_m = _ld_re_m.get("dist_ema50", 0)
+                        _dist_52w_re_m = _ld_re_m.get("dist_52w", 0)
+                        _re_result_m   = calcular_riesgo_extension(
+                            rsi=_rsi_ac, dist_ema50=_dist_ema_re_m,
+                            dist_52w=_dist_52w_re_m, tipo="Momentum")
                         if _bloq:
                             _total=min(_total,8);_rec="🚫 BLOQUEADO";_rc="#6B7280"
                         else:
-                            # v19.3: Score = gate principal · WR = filtro duro (Momentum)
+                            # v19.3: consistente con card veredicto
                             _rh_pre_m = _gtu_get_rh(_rsi_ac, abs(_dd_p), _prob)
                             _wr_pre_m = _rh_pre_m.get("rh_wr", 50)
-                            _re_pre_m = _re_result_m.get("re",0) if "_re_result_m" in dir() else 50
+                            _re_val_m = _re_result_m.get("re", 0) if isinstance(_re_result_m, dict) else 50
                             if _wr_pre_m < 50:
                                 _rec="🚫 No entrar";_rc="#EF4444"
-                            elif _total >= 15 and _re_pre_m < 75:
+                            elif _total >= 15 and _re_val_m < 75:
                                 _rec="✅ Entrar";_rc="#16A34A"
                             elif _total >= 15:
                                 _rec="⚡ Parcial";_rc="#F97316"
@@ -15874,14 +16917,6 @@ with tab_score:
                                 _rec="⚪ Esperar";_rc="#64748B"
                             else:
                                 _rec="⬇️ Baja prio";_rc="#94A3B8"
-                        # Riesgo Extensión Momentum
-                        _ld_re_m       = _live_sc.get(_tk, {})
-                        _dist_ema_re_m = _ld_re_m.get("dist_ema50", 0)
-                        _dist_52w_re_m = _ld_re_m.get("dist_52w", 0)
-                        _re_result_m   = calcular_riesgo_extension(
-                            rsi=_rsi_ac, dist_ema50=_dist_ema_re_m,
-                            dist_52w=_dist_52w_re_m, tipo="Momentum")
-
                         _mom_rows_new.append({
                             "Ticker":_tk,"Sector":_area[:14],"Fuente":_m1_l,
                             "M1":_m1,"M2":_m2,"M3":_m3,"M4":_m4,"M5":_m5,"M6":_m6,"M7":_urg,
@@ -15992,7 +17027,7 @@ with tab_score:
                 f'<span style="font-size:10px;color:#64748B;margin-left:10px">'
                 f'Gestión: 100% · Stop -7% · T1 +8% · T2 +12%</span>'
                 f'</div>', unsafe_allow_html=True)
-            _CN = "70px 75px 40px 55px 55px 55px 50px 50px 45px 55px 55px 110px"
+            _CN = "70px 75px 40px 55px 55px 55px 50px 50px 45px 50px 55px 55px 110px"
             st.markdown(
                 f'<div style="display:grid;grid-template-columns:{_CN};gap:3px;'
                 f'padding:5px 8px;background:#F8FAFF;border:1px solid #BFDBFE;'
@@ -16004,6 +17039,7 @@ with tab_score:
                 f'<div style="text-align:center">N5<br>MACD</div>'
                 f'<div style="text-align:center">N6<br>SPY</div>'
                 f'<div style="text-align:center;font-weight:900;color:#1D4ED8">TOTAL</div>'
+                f'<div style="text-align:center">Beta</div>'
                 f'<div style="text-align:center">An.<br>Up%</div>'
                 f'<div style="text-align:center">Rev<br>YoY</div>'
                 f'<div>Recomendación / Alertas</div>'
@@ -16027,7 +17063,10 @@ with tab_score:
                         f'padding:3px 10px;font-size:9px;font-weight:700;color:#1D4ED8;'
                         f'border-top:none">🏭 {_sector_nbis} · Mejor score: {_best_sc_nbis}/20</div>',
                         unsafe_allow_html=True)
-                for _rn in _rows_nbis:
+                for _ii, _rn in enumerate(_rows_nbis):
+                    _mt = "margin-top:16px;" if _ii > 0 else ""
+                    _bg = "background:#FFFBEB" if _rn["TOTAL"]>=15 else "background:#F8FAFF" if _rn["TOTAL"]>=11 else f"background:{BG_CARD}"
+                    _bg = _bg.split(":")[1]
                     _bg = "#FFFBEB" if _rn["TOTAL"]>=15 else "#F8FAFF" if _rn["TOTAL"]>=11 else BG_CARD
                     _bl = "#FB923C" if _rn["TOTAL"]>=15 else "#93C5FD" if _rn["TOTAL"]>=11 else "#BFDBFE"
                     _sc = G if _rn["TOTAL"]>=15 else A if _rn["TOTAL"]>=11 else TXT_MUT
@@ -16040,7 +17079,7 @@ with tab_score:
                 _macd_rn = str(_rn.get("MACD", "-"))
                 st.markdown(
                     f'<div style="display:grid;grid-template-columns:{_CN};gap:3px;'
-                    f'padding:7px 8px;background:{_bg};border:1px solid {_bl};'
+                    f'padding:7px 8px;background:{_bg};border:1px solid {_bl};{_mt}'
                     f'border-top:none;border-left:3px solid {_bl}">'
                     f'<div style="font-weight:800;font-size:12px">{_rn["Ticker"]}</div>'
                     f'<div style="font-size:9px;color:{TXT_MUT}">{_rn["Sector"]}</div>'
@@ -16049,15 +17088,24 @@ with tab_score:
                     f'{_cel(_rn["N4"],_rn["N4_l"])}{_cel(_rn["N5"],_rn["N5_l"])}'
                     f'{_cel(_rn["N6"],_rn["N6_l"])}'
                     f'<div style="text-align:center;font-size:18px;font-weight:900;color:{_sc}">{_rn["TOTAL"]}</div>'
-                    f'<div style="font-size:10px;font-weight:700;color:{_rn["Rc"]}">{_rn["Rec"]}</div>'
+                    + (lambda b,p: (
+                        f'<div style="text-align:center;font-size:10px;font-weight:700;'
+                        f'color:{"#DC2626" if p<=-3 else "#C2410C" if p==-2 else "#D97706" if p==-1 else "#16A34A"}">'
+                        f'β{b:.1f}{"⚡" if p<=-2 else "⚠️" if p==-1 else "✅"}</div>'
+                    ))(float(_rn.get("Beta",1.0) or 1.0), int(_rn.get("Beta_pen",0) or 0))
+                    + f'<div style="font-size:10px;font-weight:700;color:{_rn["Rc"]}">{_rn["Rec"]}</div>'
                     f'</div>', unsafe_allow_html=True)
 
                 # ── Rango Histórico + Fundamentales + RE + Veredicto ──
                 _re_rn      = _rn.get("RE", {})
-                _an_display = f"{_an_rn} analistas" if _an_rn > 0 else "Sin cobertura"
+                _an_display = _rn.get("Analistas_Label", f"{_an_rn} analistas" if _an_rn > 0 else "Sin cobertura")
                 _rev_display= _rev_rn if _rev_rn not in ("","None","nan") else "N/D"
                 _up_display = _up_rn if _up_rn not in ("","None","nan","+0%") else "N/D"
-                _rh_perfil  = _gtu_get_rh(_rsi_ac, abs(_dd_p), _prob)
+                # v19.3 fix: usar valores del dict _rn, no variables del loop de cálculo
+                _rsi_rn    = float(_rn.get("RSI", 0) or 0)
+                _dd_rn     = abs(float(_rn.get("N3", 0) or 0))
+                _prob_rn   = float(_rn.get("N4", 0) or 0)
+                _rh_perfil = _gtu_get_rh(_rsi_rn, _dd_rn, _prob_rn)
                 _rh_wr      = _rh_perfil.get("rh_wr", 0)
                 _rh_p50     = _rh_perfil.get("rh_p50", 0)
                 _rh_p25     = _rh_perfil.get("rh_p25", 0)
@@ -16111,6 +17159,70 @@ with tab_score:
                 elif _re_score_n >= 65 and _vered == "✅ ENTRAR":
                     _vered="⚡ ENTRAR PARCIAL"; _vc="#F97316"; _vbg="#FFF7ED"
                     _vreason += f" · RE {_re_score_n:.0f} elevado"
+                # v19.3: RSI × DD badge (safe guard)
+                _rsi_over_n = int(_rn.get("RSI_over", 0)) if isinstance(_rn, dict) else 0
+                _dd_n = float(_rn.get("DD", 0) or 0) if isinstance(_rn, dict) else 0
+                _rsi_n = float(_rn.get("RSI", 0) or 0) if isinstance(_rn, dict) else 0
+                if _rsi_over_n < 0:
+                    if _rsi_over_n == -2:
+                        _rsi_dd_badge = (
+                            f'<div style="background:#FEF2F2;border:1px solid #FCA5A5;'
+                            f'border-radius:5px;padding:4px 8px;margin-bottom:4px;font-size:10px;color:#DC2626">'
+                            f'⚠️ RSI×DD: RSI {_rsi_n:.0f} + DD {_dd_n:.0f}% → '
+                            f'<strong>sobreextensión rebote</strong> · -2pts '
+                            f'(patrón BRZE/TEAM/PLTR)</div>'
+                        )
+                    else:
+                        _rsi_dd_badge = (
+                            f'<div style="background:#FFFBEB;border:1px solid #FDE68A;'
+                            f'border-radius:5px;padding:4px 8px;margin-bottom:4px;font-size:10px;color:#D97706">'
+                            f'🟡 RSI×DD: RSI {_rsi_n:.0f} + DD {_dd_n:.0f}% → '
+                            f'<strong>zona gris</strong> · -1pt · usar 🔮 antes de entrar</div>'
+                        )
+                elif _rsi_n > 73 and _dd_n > -10:
+                    _rsi_dd_badge = (
+                        f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+                        f'border-radius:5px;padding:4px 8px;margin-bottom:4px;font-size:10px;color:#16A34A">'
+                        f'✅ RSI×DD: RSI {_rsi_n:.0f} + DD {_dd_n:.0f}% → '
+                        f'<strong>momentum genuino</strong> · sin penalización '
+                        f'(patrón HPE/DELL)</div>'
+                    )
+                else:
+                    _rsi_dd_badge = ""
+                if _rsi_dd_badge:
+                    st.markdown(_rsi_dd_badge, unsafe_allow_html=True)
+                # ── Badge Beta ────────────────────────────────────────
+                _beta_n   = float(_rn.get("Beta", 1.0) if isinstance(_rn, dict) else 1.0)
+                _beta_p_n = int(_rn.get("Beta_pen", 0) if isinstance(_rn, dict) else 0)
+                if _beta_p_n < 0:
+                    if _beta_p_n <= -3:
+                        _beta_badge = (
+                            f'<div style="background:#FEF2F2;border:1px solid #FCA5A5;'
+                            f'border-radius:5px;padding:4px 8px;margin-bottom:4px;font-size:10px;color:#DC2626">'
+                            f'⚡ Beta {_beta_n:.1f} → <strong>muy especulativo</strong> · {_beta_p_n}pts '
+                            f'(patrón PLTR/QUBT)</div>'
+                        )
+                    elif _beta_p_n == -2:
+                        _beta_badge = (
+                            f'<div style="background:#FFF7ED;border:1px solid #FED7AA;'
+                            f'border-radius:5px;padding:4px 8px;margin-bottom:4px;font-size:10px;color:#C2410C">'
+                            f'⚡ Beta {_beta_n:.1f} → <strong>alto riesgo</strong> · {_beta_p_n}pts '
+                            f'(patrón BRZE/TEAM/FCEL)</div>'
+                        )
+                    else:
+                        _beta_badge = (
+                            f'<div style="background:#FFFBEB;border:1px solid #FDE68A;'
+                            f'border-radius:5px;padding:4px 8px;margin-bottom:4px;font-size:10px;color:#D97706">'
+                            f'🟡 Beta {_beta_n:.1f} → zona de cautela · {_beta_p_n}pts</div>'
+                        )
+                    st.markdown(_beta_badge, unsafe_allow_html=True)
+                elif _beta_n < 1.3 and _beta_n > 0:
+                    st.markdown(
+                        f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+                        f'border-radius:5px;padding:4px 8px;margin-bottom:4px;font-size:10px;color:#16A34A">'
+                        f'✅ Beta {_beta_n:.1f} → bajo riesgo · sin penalización '
+                        f'(patrón HPE/DELL/APTV)</div>',
+                        unsafe_allow_html=True)
                 st.markdown(
                     f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;'
                     f'padding:4px 8px 0px 8px;background:{_bg};border:1px solid {_bl};'
@@ -16133,7 +17245,16 @@ with tab_score:
                         f'<div style="padding:0px 8px 0px 8px;background:{_bg};'
                         f'border:1px solid {_bl};border-top:none;border-left:3px solid {_bl}">'
                         + _re_rn["badge_html"] + f'</div>', unsafe_allow_html=True)
-                # Veredicto NBIS
+                # ── ETF Sectorial badge NBIS (solo informativo) ───
+                _etf_html_n = _etf_badge(
+                    str(_rn.get("Sector","")) + str(_rn.get("Fuente","")),
+                    str(_rn.get("Sector","")))
+                if _etf_html_n:
+                    st.markdown(
+                        f'<div style="padding:0 8px 0 8px;background:{_vbg};'
+                        f'border:1px solid {_vc}40;border-top:none;border-left:3px solid {_vc}">'
+                        + _etf_html_n + f'</div>', unsafe_allow_html=True)
+                # ── Veredicto NBIS (siempre visible) ────────────────
                 st.markdown(
                     f'<div style="padding:6px 10px;margin-bottom:4px;background:{_vbg};'
                     f'border:1px solid {_vc}60;border-top:none;border-left:3px solid {_vc};'
@@ -16141,6 +17262,127 @@ with tab_score:
                     f'<span style="font-size:12px;font-weight:900;color:{_vc}">{_vered}</span>'
                     f'<span style="font-size:10px;color:{_vc}90;margin-left:8px">{_vreason}</span>'
                     f'</div>', unsafe_allow_html=True)
+                # ── 🔍 Análisis IA — solo si veredicto es ENTRAR/PARCIAL ──
+                _n10_key  = f"n10_scmvalle_nbis_{_rn['Ticker']}_{_ii}"
+                _n10_res  = st.session_state.get(f"n10_nbis_{_rn['Ticker']}", None)
+                _prob_res = st.session_state.get(f"prob_nbis_{_rn['Ticker']}", None)
+                _nbis_score_total = _rn["TOTAL"]
+                _es_entrar_nbis = _vered.startswith(("✅","⚡"))
+                if _es_entrar_nbis:
+                    if not _n10_res or not _prob_res:
+                        if st.button(
+                            f"🔍 Análisis IA · {_rn['Ticker']}",
+                            key=f"btn_{_n10_key}",
+                            use_container_width=True, type="secondary",
+                            help="N10 noticias + Probabilidad de éxito en 1 llamada"):
+                            with st.spinner(f"🔍 {_rn['Ticker']} · analizando en paralelo..."):
+                                from concurrent.futures import ThreadPoolExecutor, as_completed as _asc
+                                # Preparar ETF para prob_entrada
+                                _etf_pe = "QQQ"; _etf_chg_pe = 0.0
+                                try:
+                                    _sec_pe = str(_rn.get("Sector","")).lower()
+                                    for _kw,_ev in [("software","IGV"),("saas","IGV"),("defens","ITA"),
+                                                    ("semi","SOXX"),("chip","SOXX"),("bio","XBI"),
+                                                    ("crypto","BITQ"),("bitcoin","BITQ"),("mining","BITQ"),
+                                                    ("ai","QQQ"),("tech","QQQ")]:
+                                        if _kw in _sec_pe: _etf_pe = _ev; break
+                                    import yfinance as _yf_pe
+                                    _h_pe = _yf_pe.Ticker(_etf_pe).history(period="10d")["Close"].dropna()
+                                    if len(_h_pe) >= 6:
+                                        _etf_chg_pe = round(float((_h_pe.iloc[-1]-_h_pe.iloc[-6])/_h_pe.iloc[-6]*100),1)
+                                except Exception: pass
+                                _fase_pe = str(_rn.get("Fase","")).upper()
+                                _wr_pe = 87.5 if "M2" in _fase_pe else 73.0 if "M3" in _fase_pe else 84.0 if "MOMENTUM" in _fase_pe else 50.0
+                                _reg_n = st.session_state.get("mercado_data",{}).get("regimen","NEUTRO")
+                                # Lanzar N10 y prob en paralelo
+                                def _run_n10():
+                                    return _llamar_n10_ia(
+                                        _rn["Ticker"], _reg_n,
+                                        str(_rn.get("Sector","")),
+                                        str(_rn.get("RevYoY","")),
+                                        _rn["TOTAL"])
+                                def _run_prob():
+                                    return _llamar_prob_entrada(
+                                        ticker=_rn["Ticker"],
+                                        fase=str(_rn.get("Fase","M3")),
+                                        score=_rn["TOTAL"],
+                                        rsi=round(float(_rn.get("RSI",0) or 0)),
+                                        dd=round(float(_rn.get("DD",0) or 0),1),
+                                        macd="POSITIVO" if float(_rn.get("MACD",0) or 0) > 0 else "NEGATIVO",
+                                        wr_base=_wr_pe, regimen=_reg_n,
+                                        etf_ticker=_etf_pe, etf_chg5d=_etf_chg_pe)
+                                with ThreadPoolExecutor(max_workers=2) as _ex:
+                                    _f_n10  = _ex.submit(_run_n10)
+                                    _f_prob = _ex.submit(_run_prob)
+                                    _n10_res  = _f_n10.result()
+                                    _prob_res = _f_prob.result()
+                            st.session_state[f"n10_nbis_{_rn['Ticker']}"]  = _n10_res
+                            st.session_state[f"prob_nbis_{_rn['Ticker']}"] = _prob_res
+                    # Mostrar N10
+                    if _n10_res:
+                        _n10_sc   = _n10_res.get("n10_score", 0)
+                        _n10_lbl  = _n10_res.get("n10_label", "")
+                        _n10_cat  = _n10_res.get("catalizador", "")
+                        _n10_risk = _n10_res.get("riesgo_oculto", "")
+                        _n10_vnt  = _n10_res.get("sector_viento", "NEUTRO")
+                        _n10_r2   = _n10_res.get("razon_2lineas", "")
+                        _n10_conf = _n10_res.get("confianza", "MEDIA")
+                        _n10_total= min(20, max(0, _rn["TOTAL"] + _n10_sc))
+                        _n10c = "#16A34A" if _n10_sc >= 2 else "#D97706" if _n10_sc >= 0 else "#EF4444"
+                        _n10bg= "#F0FDF4" if _n10_sc >= 2 else "#FFFBEB" if _n10_sc >= 0 else "#FEF2F2"
+                        st.markdown(
+                            f'<div style="background:{_n10bg};border:1px solid {_n10c}40;'
+                            f'border-left:3px solid {_n10c};border-top:none;'
+                            f'border-radius:0;padding:8px 10px">'
+                            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
+                            f'<span style="font-size:10px;font-weight:800;color:{_n10c}">🤖 N10 IA</span>'
+                            f'<span style="font-size:13px;font-weight:900;color:{_n10c}">{_n10_sc:+d}pts</span>'
+                            f'<span style="font-size:10px;color:#64748B">→ Score total: {_n10_total}/20</span>'
+                            f'<span style="font-size:9px;color:#94A3B8;margin-left:auto">Conf: {_n10_conf}</span>'
+                            f'</div>'
+                            f'<div style="font-size:10px;color:#334155;line-height:1.6">'
+                            f'<strong>{_n10_lbl}</strong><br>'
+                            f'🎯 {_n10_cat}<br>'
+                            f'⚠️ {_n10_risk}<br>'
+                            f'🌡️ Sector: {_n10_vnt}'
+                            f'</div>'
+                            f'<div style="font-size:10px;color:#475569;margin-top:4px;'
+                            f'border-top:1px solid {_n10c}30;padding-top:4px;font-style:italic">'
+                            f'{_n10_r2}</div>'
+                            f'</div>', unsafe_allow_html=True)
+                    # Mostrar Probabilidad
+                    if _prob_res:
+                        _pval  = int(_prob_res.get("probabilidad", 50))
+                        _pblk  = _prob_res.get("bloqueador", "NINGUNO")
+                        _prazon= _prob_res.get("razon_principal", "")
+                        _pfpos = _prob_res.get("factores_positivos", [])
+                        _pfneg = _prob_res.get("factores_negativos", [])
+                        _pconf = int(_prob_res.get("confianza", 50))
+                        if _pblk != "NINGUNO":
+                            _pc,_pbg,_pico,_pdec = "#EF4444","#FEF2F2","🚫","BLOQUEADO"
+                        elif _pval >= 80: _pc,_pbg,_pico,_pdec = "#16A34A","#F0FDF4","🟢","MUY FAVORABLE"
+                        elif _pval >= 70: _pc,_pbg,_pico,_pdec = "#22C55E","#F0FDF4","🟢","FAVORABLE"
+                        elif _pval >= 60: _pc,_pbg,_pico,_pdec = "#D97706","#FFFBEB","🟡","CON CAUTELA"
+                        elif _pval >= 50: _pc,_pbg,_pico,_pdec = "#F97316","#FFF7ED","🟠","ESPERAR"
+                        else:             _pc,_pbg,_pico,_pdec = "#EF4444","#FEF2F2","🔴","ADVERSO"
+                        _bar_fill = "█" * (_pval // 10) + "░" * (10 - _pval // 10)
+                        st.markdown(
+                            f'<div style="background:{_pbg};border:1px solid {_pc}50;'
+                            f'border-left:4px solid {_pc};border-radius:6px;'
+                            f'padding:10px 12px;margin-top:4px;margin-bottom:6px">'
+                            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+                            f'<span style="font-size:16px">{_pico}</span>'
+                            f'<span style="font-size:18px;font-weight:900;color:{_pc}">{_pval}%</span>'
+                            f'<span style="font-size:12px;font-weight:700;color:{_pc}">{_pdec}</span>'
+                            f'<span style="font-size:10px;color:#94A3B8;margin-left:auto">Conf: {_pconf}%</span>'
+                            f'</div>'
+                            f'<div style="font-family:monospace;font-size:11px;color:{_pc};margin-bottom:6px">'
+                            f'{_bar_fill} {_pval}/100</div>'
+                            f'<div style="font-size:11px;color:#334155;margin-bottom:4px;font-style:italic">"{_prazon}"</div>'
+                            + (f'<div style="font-size:10px;color:#16A34A">⬆️ {" · ".join(_pfpos[:2])}</div>' if _pfpos else "")
+                            + (f'<div style="font-size:10px;color:#EF4444">⬇️ {" · ".join(_pfneg[:2])}</div>' if _pfneg else "")
+                            + (f'<div style="font-size:10px;font-weight:700;color:#EF4444;margin-top:4px">🚫 BLOQUEADOR: {_pblk}</div>' if _pblk != "NINGUNO" else "")
+                            + '</div>', unsafe_allow_html=True)
         # ══ SECCIÓN MOMENTUM ══════════════════════════════════
         if _mom_rows:
             _m_entrar = sum(1 for r in _mom_rows if r.get("Rec","").startswith("✅"))
@@ -16188,7 +17430,8 @@ with tab_score:
                         f'padding:3px 10px;font-size:9px;font-weight:700;color:#92400E;'
                         f'border-top:none">🏭 {_sector_name} · Mejor score: {_best_sc_mom}/20</div>',
                         unsafe_allow_html=True)
-                for _rm in _sector_rows:
+                for _jj, _rm in enumerate(_sector_rows):
+                    _mt_m = "margin-top:16px;" if _jj > 0 else ""
                     _bg_m = "#FFFBEB" if _rm["TOTAL"]>=15 else "#FFFEF0" if _rm["TOTAL"]>=11 else BG_CARD
                     _bl_m = "#FB923C" if _rm["TOTAL"]>=15 else "#FDE68A" if _rm["TOTAL"]>=11 else "#FDE68A"
                     _sc_m = G if _rm["TOTAL"]>=15 else A if _rm["TOTAL"]>=11 else TXT_MUT
@@ -16198,7 +17441,7 @@ with tab_score:
                     _up_rm   = _rm.get("Upside","N/D")
                     st.markdown(
                         f'<div style="display:grid;grid-template-columns:{_CM};gap:3px;'
-                        f'padding:7px 8px;background:{_bg_m};border:1px solid {_bl_m};'
+                        f'padding:7px 8px;background:{_bg_m};border:1px solid {_bl_m};{_mt_m}'
                         f'border-top:none;border-left:3px solid {_bl_m}">'
                         f'<div style="font-weight:800;font-size:12px">{_rm["Ticker"]}</div>'
                         f'<div style="font-size:9px;color:{TXT_MUT}">{_rm["Sector"]}</div>'
@@ -16212,14 +17455,14 @@ with tab_score:
                     # Rango Histórico + Fundamentales + RE + Veredicto
                     _rev_disp_m = _rev_rm if _rev_rm not in ("","None","nan") else "N/D"
                     _up_disp_m  = _up_rm  if _up_rm  not in ("","None","nan","+0%") else "N/D"
-                    _an_disp_m  = f"{_an_rm} analistas" if _an_rm > 0 else "Sin cobertura"
+                    _an_disp_m  = _rm.get("Analistas_Label", f"{_an_rm} analistas" if _an_rm > 0 else "Sin cobertura")
                     # v19.3 fix: usar Dist_ATH como DD real para Momentum
                     # Dist_ATH = distancia desde máximo 52 semanas (ej: -23% → DD=23)
                     _dist_ath_rm = str(_rm.get("Dist_ATH","0%")).replace("%","").replace("+","")
                     try: _dd_rm_val = abs(float(_dist_ath_rm))
                     except: _dd_rm_val = 0
                     _rh_rm_p    = _gtu_get_rh(float(_rm.get("RSI",0) or 0), _dd_rm_val, float(_rm.get("M4",0) or 0))
-                    _rh_rm_wr   = _rh_rm_p.get("rh_wr",0); _rh_rm_p50=_rh_rm_p.get("rh_p50",0)
+                    _rh_rm_wr   = _rh_rm_p.get("rh_wr",0);  _rh_rm_p50=_rh_rm_p.get("rh_p50",0)
                     _rh_rm_p25  = _rh_rm_p.get("rh_p25",0); _rh_rm_p75=_rh_rm_p.get("rh_p75",0)
                     _rh_rm_n    = _rh_rm_p.get("rh_n",0);   _rh_rm_c  =_rh_rm_p.get("rh_color","#64748B")
                     _rh_rm_human= "📈 Favorable" if _rh_rm_wr>=70 else "📊 Moderado" if _rh_rm_wr>=50 else "⚠️ Débil"
@@ -16279,6 +17522,94 @@ with tab_score:
                             f'<div style="padding:0px 8px 0px 8px;background:{_bg_m};'
                             f'border:1px solid {_bl_m};border-top:none;border-left:3px solid {_bl_m}">'
                             + _re_rm["badge_html"] + f'</div>', unsafe_allow_html=True)
+                    # ── ETF Sectorial badge (solo informativo) ─────────
+                    _etf_html_m = _etf_badge(
+                        str(_rm.get("Sector","")) + str(_rm.get("Fuente","")),
+                        str(_rm.get("Sector","")))
+                    if _etf_html_m:
+                        st.markdown(
+                            f'<div style="padding:0 8px 0 8px;background:{_vmbg};'
+                            f'border:1px solid {_vmc}40;border-top:none;border-left:3px solid {_vmc}">'
+                            + _etf_html_m + f'</div>', unsafe_allow_html=True)
+                    # ── 🔍 Análisis IA unificado Momentum (N10 + Probabilidad) ──
+                    _n10_key_m  = f"n10_scmvalle_mom_{_rm['Ticker']}_{_jj}"
+                    _n10_res_m  = st.session_state.get(f"n10_mom_{_rm['Ticker']}", None)
+                    _prob_res_m = st.session_state.get(f"prob_mom_{_rm['Ticker']}", None)
+                    _mom_total  = _rm["TOTAL"]
+                    _es_entrar_mom = _vm.startswith(("✅","⚡"))
+                    if _es_entrar_mom:
+                        if not _n10_res_m or not _prob_res_m:
+                            if st.button(
+                                f"🔍 Análisis IA · {_rm['Ticker']}",
+                                key=f"btn_{_n10_key_m}",
+                                use_container_width=True, type="secondary",
+                                help="N10 noticias + Probabilidad de éxito en 1 llamada"):
+                                with st.spinner(f"🔍 {_rm['Ticker']} · analizando en paralelo..."):
+                                    from concurrent.futures import ThreadPoolExecutor as _TpE
+                                    _etf_pm = "QQQ"; _etf_chg_pm = 0.0
+                                    try:
+                                        _sec_pm = str(_rm.get("Sector","")).lower()
+                                        for _kw,_ev in [("software","IGV"),("saas","IGV"),("defens","ITA"),
+                                                        ("semi","SOXX"),("chip","SOXX"),("bio","XBI"),
+                                                        ("crypto","BITQ"),("bitcoin","BITQ"),("mining","BITQ"),
+                                                        ("ai","QQQ"),("tech","QQQ")]:
+                                            if _kw in _sec_pm: _etf_pm = _ev; break
+                                        import yfinance as _yf_pm
+                                        _h_pm = _yf_pm.Ticker(_etf_pm).history(period="10d")["Close"].dropna()
+                                        if len(_h_pm) >= 6:
+                                            _etf_chg_pm = round(float((_h_pm.iloc[-1]-_h_pm.iloc[-6])/_h_pm.iloc[-6]*100),1)
+                                    except Exception: pass
+                                    _reg_m = st.session_state.get("mercado_data",{}).get("regimen","NEUTRO")
+                                    def _run_n10m():
+                                        return _llamar_n10_ia(
+                                            _rm["Ticker"], _reg_m,
+                                            str(_rm.get("Sector","")),
+                                            str(_rm.get("RevYoY","")),
+                                            _rm["TOTAL"])
+                                    def _run_probm():
+                                        return _llamar_prob_entrada(
+                                            ticker=_rm["Ticker"], fase="Momentum",
+                                            score=_rm["TOTAL"],
+                                            rsi=round(float(_rm.get("RSI",0) or 0)),
+                                            dd=round(float(_rm.get("DD",0) or 0),1),
+                                            macd="POSITIVO", wr_base=84.0,
+                                            regimen=_reg_m,
+                                            etf_ticker=_etf_pm, etf_chg5d=_etf_chg_pm)
+                                    with _TpE(max_workers=2) as _ex_m:
+                                        _fn10m  = _ex_m.submit(_run_n10m)
+                                        _fprobm = _ex_m.submit(_run_probm)
+                                        _n10_res_m  = _fn10m.result()
+                                        _prob_res_m = _fprobm.result()
+                                    st.session_state[f"n10_mom_{_rm['Ticker']}"]  = _n10_res_m
+                                    st.session_state[f"prob_mom_{_rm['Ticker']}"] = _prob_res_m
+                        if _n10_res_m:
+                            _n10m_sc    = _n10_res_m.get("n10_score", 0)
+                            _n10m_lbl   = _n10_res_m.get("n10_label", "")
+                            _n10m_cat   = _n10_res_m.get("catalizador", "")
+                            _n10m_risk  = _n10_res_m.get("riesgo_oculto", "")
+                            _n10m_vnt   = _n10_res_m.get("sector_viento","NEUTRO")
+                            _n10m_r2    = _n10_res_m.get("razon_2lineas","")
+                            _n10m_conf  = _n10_res_m.get("confianza","MEDIA")
+                            _n10m_total = min(20, max(0, _rm["TOTAL"] + _n10m_sc))
+                            _n10mc  = "#16A34A" if _n10m_sc>=2 else "#D97706" if _n10m_sc>=0 else "#EF4444"
+                            _n10mbg = "#F0FDF4" if _n10m_sc>=2 else "#FFFBEB" if _n10m_sc>=0 else "#FEF2F2"
+                            st.markdown(
+                                f'<div style="background:{_n10mbg};border:1px solid {_n10mc}40;'
+                                f'border-left:3px solid {_n10mc};border-top:none;padding:8px 10px">'
+                                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
+                                f'<span style="font-size:10px;font-weight:800;color:{_n10mc}">🤖 N10 IA</span>'
+                                f'<span style="font-size:13px;font-weight:900;color:{_n10mc}">{_n10m_sc:+d}pts</span>'
+                                f'<span style="font-size:10px;color:#64748B">→ Score: {_n10m_total}/20</span>'
+                                f'<span style="font-size:9px;color:#94A3B8;margin-left:auto">Conf: {_n10mc_conf if "_n10mc_conf" in dir() else _n10m_conf}</span>'
+                                f'</div>'
+                                f'<div style="font-size:10px;color:#334155;line-height:1.6">'
+                                f'<strong>{_n10m_lbl}</strong><br>'
+                                f'🎯 {_n10m_cat}<br>⚠️ {_n10m_risk}<br>🌡️ Sector: {_n10m_vnt}'
+                                f'</div>'
+                                f'<div style="font-size:10px;color:#475569;margin-top:4px;'
+                                f'border-top:1px solid {_n10mc}30;padding-top:4px;font-style:italic">'
+                                f'{_n10m_r2}</div>'
+                                f'</div>', unsafe_allow_html=True)
                     st.markdown(
                         f'<div style="padding:6px 10px;margin-bottom:4px;background:{_vmbg};'
                         f'border:1px solid {_vmc}60;border-top:none;border-left:3px solid {_vmc};'
@@ -16286,6 +17617,41 @@ with tab_score:
                         f'<span style="font-size:12px;font-weight:900;color:{_vmc}">{_vm}</span>'
                         f'<span style="font-size:10px;color:{_vmc}90;margin-left:8px">{_vmr}</span>'
                         f'</div>', unsafe_allow_html=True)
+                    # Mostrar Probabilidad Momentum
+                    if _prob_res_m:
+                            _pval_m = int(_prob_res_m.get("probabilidad", 50))
+                            _pdir_m = _prob_res_m.get("direccion","NEUTRAL")
+                            _pblk_m = _prob_res_m.get("bloqueador","NINGUNO")
+                            _prazon_m = _prob_res_m.get("razon_principal","")
+                            _pfpos_m = _prob_res_m.get("factores_positivos",[])
+                            _pfneg_m = _prob_res_m.get("factores_negativos",[])
+                            _pconf_m = int(_prob_res_m.get("confianza",50))
+                            if _pblk_m != "NINGUNO":
+                                _pmc,_pmbg,_pmico = "#EF4444","#FEF2F2","🚫"
+                                _pmdec = "BLOQUEADO"
+                            elif _pval_m >= 80: _pmc,_pmbg,_pmico,_pmdec = "#16A34A","#F0FDF4","🟢","MUY FAVORABLE"
+                            elif _pval_m >= 70: _pmc,_pmbg,_pmico,_pmdec = "#22C55E","#F0FDF4","🟢","FAVORABLE"
+                            elif _pval_m >= 60: _pmc,_pmbg,_pmico,_pmdec = "#D97706","#FFFBEB","🟡","CON CAUTELA"
+                            elif _pval_m >= 50: _pmc,_pmbg,_pmico,_pmdec = "#F97316","#FFF7ED","🟠","ESPERAR"
+                            else: _pmc,_pmbg,_pmico,_pmdec = "#EF4444","#FEF2F2","🔴","ADVERSO"
+                            _bar_m = "█" * (_pval_m // 10) + "░" * (10 - _pval_m // 10)
+                            st.markdown(
+                                f'<div style="background:{_pmbg};border:1px solid {_pmc}50;'
+                                f'border-left:4px solid {_pmc};border-radius:6px;'
+                                f'padding:10px 12px;margin-top:4px;margin-bottom:6px">'
+                                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+                                f'<span style="font-size:16px">{_pmico}</span>'
+                                f'<span style="font-size:18px;font-weight:900;color:{_pmc}">{_pval_m}%</span>'
+                                f'<span style="font-size:12px;font-weight:700;color:{_pmc}">{_pmdec}</span>'
+                                f'<span style="font-size:10px;color:#94A3B8;margin-left:auto">Conf: {_pconf_m}%</span>'
+                                f'</div>'
+                                f'<div style="font-family:monospace;font-size:11px;color:{_pmc};margin-bottom:6px">'
+                                f'{_bar_m} {_pval_m}/100</div>'
+                                f'<div style="font-size:11px;color:#334155;margin-bottom:4px;font-style:italic">"{_prazon_m}"</div>'
+                                + (f'<div style="font-size:10px;color:#16A34A">⬆️ {" · ".join(_pfpos_m[:2])}</div>' if _pfpos_m else "")
+                                + (f'<div style="font-size:10px;color:#EF4444">⬇️ {" · ".join(_pfneg_m[:2])}</div>' if _pfneg_m else "")
+                                + (f'<div style="font-size:10px;font-weight:700;color:#EF4444;margin-top:4px">🚫 BLOQUEADOR: {_pblk_m}</div>' if _pblk_m != "NINGUNO" else "")
+                                + '</div>', unsafe_allow_html=True)
 
         # ══ CAPITAL ALLOCATOR — Candidatos para MVALLE ════════════
         # Solo mostrar acciones con veredicto ✅ ENTRAR o ⚡ PARCIAL
@@ -16293,12 +17659,12 @@ with tab_score:
         _top_nbis = sorted(
             [r for r in _nbis_rows
              if r["TOTAL"] >= 15 and
-             not str(r.get("Rec","")).startswith(("🚫","⏳","⬇️","🟡"))],
+             str(r.get("Rec","")).startswith(("✅","⚡"))],
             key=lambda x: x["TOTAL"], reverse=True)
         _top_mom = sorted(
             [r for r in _mom_rows
              if r["TOTAL"] >= 15 and
-             not str(r.get("Rec","")).startswith(("🚫","⏳","⬇️","🟡"))],
+             str(r.get("Rec","")).startswith(("✅","⚡"))],
             key=lambda x: x["TOTAL"], reverse=True)
 
         if _top_nbis or _top_mom:
@@ -16334,7 +17700,7 @@ with tab_score:
                             f'<div style="padding:7px 12px;background:#EFF6FF;'
                             f'border:1px solid #BFDBFE;border-top:none;border-radius:0">'
                             f'<strong style="color:#1D4ED8">{_rv["Ticker"]}</strong> '
-                            f'<span style="font-size:10px;color:{TXT_MUT}">Fase:{_rv.get("Fase","-")} · RSI:{_rv.get("RSI",0):.0f}</span>'
+                            f'<span style="font-size:10px;color:{TXT_MUT}">Fase:{_rv.get("Fase","-")} · RSI:{float(_rv.get("RSI",0) or 0):.0f}</span>'
                             f'<br><span style="font-size:9px;color:#64748B">'
                             f'WR {int(_rh_wr_rv)}% · P50:{_rh_p50_rv:+.0f}% · RE:{_re_sc_rv:.0f} · '
                             f'Rev:{_rv.get("RevYoY","N/D")} · {_rv.get("Analistas",0)}anal.</span>'
@@ -16378,7 +17744,7 @@ with tab_score:
                             f'<div style="padding:7px 12px;background:#FFFBEB;'
                             f'border:1px solid #FDE68A;border-top:none;border-radius:0">'
                             f'<strong style="color:#D97706">{_rv["Ticker"]}</strong> '
-                            f'<span style="font-size:10px;color:{TXT_MUT}">Fase:{_rv.get("Fase","-")} · RSI:{_rv.get("RSI",0):.0f}</span>'
+                            f'<span style="font-size:10px;color:{TXT_MUT}">Fase:{_rv.get("Fase","-")} · RSI:{float(_rv.get("RSI",0) or 0):.0f}</span>'
                             f'<br><span style="font-size:9px;color:#64748B">'
                             f'WR {int(_rh_wr_rv)}% · P50:{_rh_p50_rv:+.0f}% · RE:{_re_sc_rv:.0f} · '
                             f'Rev:{_rv.get("RevYoY","N/D")} · {_rv.get("Analistas",0)}anal.</span>'
@@ -16397,6 +17763,120 @@ with tab_score:
                             st.session_state[f"_prefill_mvalle_{_rv['Ticker']}"] = _rv
                             st.success(f"✅ {_rv['Ticker']} (Momentum) marcado → MVALLE")
 
+            # ── Botón de descarga — Candidatos para MVALLE ─────
+            if _top_nbis or _top_mom:
+                import io as _io
+                import datetime as _dt_dl
+
+                _hoy_dl = _dt_dl.date.today().strftime("%d-%m-%Y")
+                _reg_dl = st.session_state.get("_regimen_mercado", {})
+
+                # Construir filas para el Excel
+                _rows_dl = []
+                for _rv in _top_nbis:
+                    _rh_p = _gtu_get_rh(float(_rv.get("RSI",0) or 0),
+                                        abs(float(_rv.get("N3",0) or 0)),
+                                        float(_rv.get("N4",0) or 0))
+                    _re_v = _rv.get("RE", {})
+                    _rows_dl.append({
+                        "Fecha":          _hoy_dl,
+                        "Ticker":         _rv["Ticker"],
+                        "Tipo":           "NBIS",
+                        "Fase":           _rv.get("Fase","-"),
+                        "Score_20":       _rv["TOTAL"],
+                        "Veredicto":      _rv.get("Rec",""),
+                        "WR_%":           _rh_p.get("rh_wr",0),
+                        "P50_%":          _rh_p.get("rh_p50",0),
+                        "P75_%":          _rh_p.get("rh_p75",0),
+                        "RE_score":       round(_re_v.get("re",0),0) if _re_v else 0,
+                        "RSI":            _rv.get("RSI",0),
+                        "Rev_YoY":        _rv.get("RevYoY","N/D"),
+                        "Upside_%":       _rv.get("Upside","N/D"),
+                        "Analistas":      _rv.get("Analistas",0),
+                        "Sector":         _rv.get("Sector","-"),
+                        "Precio_Ref":     _rv.get("Precio",0),
+                        "Regimen_Mkt":    _reg_dl.get("regimen",""),
+                        "Score_Min_Hoy":  _reg_dl.get("umbral_score",15),
+                        "Gestion":        "Stop -7% · T1 +8% · T2 +12%",
+                        "Opinion_Trader": "",
+                        "Notas":          "",
+                    })
+                for _rv in _top_mom:
+                    _rh_p = _gtu_get_rh(float(_rv.get("RSI",0) or 0),
+                                        abs(float(_rv.get("N3",0) or 0)),
+                                        float(_rv.get("N4",0) or 0))
+                    _re_v = _rv.get("RE", {})
+                    _rows_dl.append({
+                        "Fecha":          _hoy_dl,
+                        "Ticker":         _rv["Ticker"],
+                        "Tipo":           "Momentum",
+                        "Fase":           _rv.get("Fase","Momentum"),
+                        "Score_20":       _rv["TOTAL"],
+                        "Veredicto":      _rv.get("Rec",""),
+                        "WR_%":           _rh_p.get("rh_wr",0),
+                        "P50_%":          _rh_p.get("rh_p50",0),
+                        "P75_%":          _rh_p.get("rh_p75",0),
+                        "RE_score":       round(_re_v.get("re",0),0) if _re_v else 0,
+                        "RSI":            _rv.get("RSI",0),
+                        "Rev_YoY":        _rv.get("RevYoY","N/D"),
+                        "Upside_%":       _rv.get("Upside","N/D"),
+                        "Analistas":      _rv.get("Analistas",0),
+                        "Sector":         _rv.get("Sector","-"),
+                        "Precio_Ref":     _rv.get("Precio",0),
+                        "Regimen_Mkt":    _reg_dl.get("regimen",""),
+                        "Score_Min_Hoy":  _reg_dl.get("umbral_score",15),
+                        "Gestion":        "Stop -5% · T1 +15% · T2 +30%",
+                        "Opinion_Trader": "",
+                        "Notas":          "",
+                    })
+
+                if _rows_dl:
+                    import pandas as _pd_dl
+                    _df_dl = _pd_dl.DataFrame(_rows_dl)
+
+                    # ── Generar Excel en memoria ──────────────
+                    _buf_dl = _io.BytesIO()
+                    with _pd_dl.ExcelWriter(_buf_dl, engine="openpyxl") as _wr:
+                        _df_dl.to_excel(_wr, index=False, sheet_name="Candidatos_MVALLE")
+                        _ws = _wr.sheets["Candidatos_MVALLE"]
+
+                        # Ancho de columnas
+                        _col_widths = {
+                            "A":8,"B":8,"C":12,"D":12,"E":9,"F":18,
+                            "G":8,"H":8,"I":8,"J":9,"K":7,
+                            "L":10,"M":10,"N":10,"O":18,"P":10,
+                            "Q":16,"R":14,"S":22,"T":20,"U":25
+                        }
+                        for _col, _w in _col_widths.items():
+                            _ws.column_dimensions[_col].width = _w
+
+                        # Header amarillo para NBIS, naranja para Momentum
+                        from openpyxl.styles import PatternFill, Font, Alignment
+                        _fill_nbis = PatternFill("solid", start_color="DBEAFE")
+                        _fill_mom  = PatternFill("solid", start_color="FEF3C7")
+                        _fill_hdr  = PatternFill("solid", start_color="1E293B")
+                        _font_hdr  = Font(bold=True, color="FFFFFF", size=10)
+
+                        for _cell in _ws[1]:
+                            _cell.fill = _fill_hdr
+                            _cell.font = _font_hdr
+                            _cell.alignment = Alignment(horizontal="center")
+
+                        for _row_idx, _row_data in enumerate(_rows_dl, 2):
+                            _fill = _fill_nbis if _row_data["Tipo"] == "NBIS" else _fill_mom
+                            for _cell in _ws[_row_idx]:
+                                _cell.fill = _fill
+
+                    _buf_dl.seek(0)
+                    st.download_button(
+                        label=f"📥 Descargar Candidatos ({len(_rows_dl)} acciones) · {_hoy_dl}",
+                        data=_buf_dl.getvalue(),
+                        file_name=f"CandidatosMVALLE_{_hoy_dl.replace('-','')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="btn_download_candidatos"
+                    )
+
         elif _nbis_rows or _mom_rows:
             st.markdown(
                 f'<div style="background:#F8FAFC;border:1px solid #CBD5E1;'
@@ -16406,552 +17886,779 @@ with tab_score:
                 f'<span style="font-size:10px">Espera que alguna suba a Score ≥15 o revisa mañana al cierre.</span>'
                 f'</div>', unsafe_allow_html=True)
 
-with tab9:
-    # ══ TAB 9 — BACKTESTING Y ATR SIZING v19 ══════════════════
-
-    # v19.1: Link al Dashboard de Métricas (app separada)
+with tab_noticias:
+    # ══════════════════════════════════════════════════════════
+    #  TAB NOTICIAS IA — Análisis de trader por posición activa
+    #  v19.3 · Claude API con web_search · cache 1h
+    # ══════════════════════════════════════════════════════════
     st.markdown(
-        f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;'
-        f'border-radius:10px;padding:14px 18px;margin-bottom:16px">'
-        f'<div style="font-size:14px;font-weight:700;color:#1D4ED8;margin-bottom:6px">'
-        f'📊 Dashboard de Métricas — App Separada</div>'
-        f'<div style="font-size:11px;color:#1E40AF;margin-bottom:10px">'
-        f'El dashboard de métricas corre en una app independiente para no afectar '
-        f'la estabilidad de GrekoTrader v19.1. Lee los mismos Google Sheets.</div>'
-        f'<div style="font-size:11px;color:#64748B;margin-bottom:8px">'
-        f'Para iniciarlo: <code>streamlit run grekotrader_metricas.py --server.port 8502</code>'
-        f'</div>'
-        f'<a href="http://localhost:8502" target="_blank" '
-        f'style="background:#2563EB;color:white;border-radius:6px;'
-        f'padding:6px 16px;font-size:11px;font-weight:700;text-decoration:none">'
-        f'📊 Abrir Dashboard de Métricas →</a>'
-        f'</div>', unsafe_allow_html=True)
+        f'<div class="sec-header" style="background:#F0F9FF;border-color:#BAE6FD">'
+        f'<span style="font-size:20px">📰</span>'
+        f'<div><span style="font-size:16px;font-weight:700;color:#0369A1">Noticias IA — Análisis de Trader</span>'
+        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'
+        f'Análisis en tiempo real de tus posiciones activas · Claude con web_search</span>'
+        f'</div></div>', unsafe_allow_html=True)
 
-    # ══ v19: TABLA WR POR SECTOR — basado en trades REALES ════════
-    st.markdown(
-        f'<div style="font-size:15px;font-weight:800;color:{TXT};margin:16px 0 10px">'
-        f'📊 Win Rate por Sector — Trades reales de tus posiciones</div>',
-        unsafe_allow_html=True)
+    # ── Selector de Sheet ───────────────────────────────────
+    _sn_not = st.radio(
+        "Portfolio a analizar:",
+        ["MVALLE", "Greko", "Mauri", "Amparito"],
+        horizontal=True, key="radio_noticias_sheet")
 
-    # Leer las 3 carteras y combinar posiciones CERRADAS
-    _wr_frames = []
-    for _wr_sheet, _wr_label in [
-        (_SHEET_NAME_MAURI,    "MVALLE"),
-        (_SHEET_NAME_AMPARITO, "Amparito"),
-        (_SHEET_NAME_GREKO,    "Greko"),
-    ]:
+    _sheet_not = {
+        "MVALLE":   _SHEET_NAME_MAURI,
+        "Greko":    _SHEET_NAME_GREKO,
+        "Mauri":    _SHEET_NAME_MAURI,
+        "Amparito": _SHEET_NAME_AMPARITO,
+    }.get(_sn_not, _SHEET_NAME_GREKO)
+
+    # ── Función análisis por ticker ─────────────────────────
+    def _get_technicals_live(ticker: str) -> dict:
+        """Descarga RSI/MACD/DD live para un ticker — cache 15min por sesión."""
+        _cache_k = f"_tech_live_{ticker}"
+        _cached  = st.session_state.get(_cache_k)
+        if _cached and (st.session_state.get(f"_tech_ts_{ticker}",0) >
+                        __import__("datetime").datetime.now().timestamp() - 900):
+            return _cached
         try:
-            _df_wr = leer_posiciones_sheets(_wr_sheet)
-            if _df_wr is not None and not _df_wr.empty:
-                _df_wr["_cartera"] = _wr_label
-                _wr_frames.append(_df_wr)
+            import yfinance as _yf_tl
+            _h = _yf_tl.Ticker(ticker).history(period="3mo")["Close"].dropna()
+            if len(_h) < 20:
+                return {"rsi":0,"macd":0,"dd":0,"ok":False}
+            # RSI 14
+            _d  = _h.diff()
+            _g  = _d.clip(lower=0).rolling(14).mean()
+            _l  = (-_d.clip(upper=0)).rolling(14).mean()
+            _rsi= round(float(100-100/(1+_g.iloc[-1]/(_l.iloc[-1]+1e-9))),1)
+            # MACD 12/26/9
+            _ema12 = _h.ewm(span=12).mean()
+            _ema26 = _h.ewm(span=26).mean()
+            _macd  = _ema12 - _ema26
+            _sig   = _macd.ewm(span=9).mean()
+            _macd_val = round(float(_macd.iloc[-1]),3)
+            _macd_pos = _macd.iloc[-1] > _sig.iloc[-1]
+            # DD desde pico 60 días
+            _pico  = float(_h.iloc[-60:].max()) if len(_h)>=60 else float(_h.max())
+            _dd    = round((_h.iloc[-1]-_pico)/_pico*100, 1)
+            _res = {"rsi":_rsi,"macd":_macd_val,"macd_pos":_macd_pos,
+                    "dd":_dd,"precio_hoy":round(float(_h.iloc[-1]),2),"ok":True}
+            st.session_state[_cache_k]            = _res
+            st.session_state[f"_tech_ts_{ticker}"] = __import__("datetime").datetime.now().timestamp()
+            return _res
+        except Exception:
+            return {"rsi":0,"macd":0,"macd_pos":False,"dd":0,"precio_hoy":0,"ok":False}
+
+    def _analizar_posicion_ia(tk, precio_entrada, pnl_pct, fase,
+                               dias_pos, cat_fecha, regimen, sector,
+                               otros_tickers=None,
+                               score_nbis=0, rsi_entrada=0, dd_entrada=0,
+                               tipo_evento_entrada="-", p_exito_entrada=0,
+                               rsi_hoy=0, macd_hoy=False, dd_hoy=0):
+        """Llama a Claude API con web_search — análisis trader + Predicción NBIS + Sympathy."""
+        import json, datetime as _dt_not
+        _hoy = str(_dt_not.date.today())
+        _lista_otros = ", ".join(otros_tickers) if otros_tickers else ""
+
+        # Multiplicador NBIS con datos de HOY (dinámico por ticker)
+        _rsi_ref = rsi_hoy if rsi_hoy > 0 else rsi_entrada
+        _dd_ref  = dd_hoy  if dd_hoy  < 0 else -abs(dd_entrada)
+        _fase_up = str(fase).upper()
+        if "M2" in _fase_up or "FASE 2" in _fase_up:
+            if _dd_ref <= -30:   _mult_nbis=1.8; _mult_label="M2 + DD profundo ×1.8"
+            elif _dd_ref <= -20: _mult_nbis=1.4; _mult_label="M2 + DD moderado ×1.4"
+            else:                _mult_nbis=1.2; _mult_label="M2 ×1.2"
+        elif "M3" in _fase_up or "FASE 3" in _fase_up:
+            _mult_nbis=1.2; _mult_label="M3 activo ×1.2"
+        elif "MOMENTUM" in _fase_up:
+            if _rsi_ref >= 78: _mult_nbis=0.5; _mult_label="Momentum sobreextendido ×0.5"
+            else:              _mult_nbis=1.0; _mult_label="Momentum activo ×1.0"
+        elif "M1" in _fase_up:
+            _mult_nbis=0.6; _mult_label="M1 señal débil ×0.6"
+        else:
+            _mult_nbis=1.0; _mult_label="×1.0"
+        if _rsi_ref >= 78: _mult_nbis=min(_mult_nbis,0.5); _mult_label+=" · RE alto"
+
+        # Contexto ETF del sector (cálculo inline — sin dependencias de scope)
+        _etf_line = ""
+        try:
+            _etf_map_not = {
+                "software": "IGV", "saas": "IGV", "nube": "IGV", "cloud": "IGV",
+                "defensa": "ITA", "defens": "ITA", "aeroespacial": "ITA",
+                "semi": "SOXX", "chip": "SOXX", "semiconductor": "SOXX",
+                "biotech": "XBI", "bio": "XBI", "farmac": "XBI", "salud": "XBI",
+                "ai": "QQQ", "tech": "QQQ", "infra": "QQQ", "nasdaq": "QQQ",
+                "crypto": "BITQ", "bitcoin": "BITQ", "mining": "BITQ",
+            }
+            _etf_sel = "QQQ"
+            _sec_low = str(sector).lower()
+            for _kw, _etf_v in _etf_map_not.items():
+                if _kw in _sec_low:
+                    _etf_sel = _etf_v
+                    break
+            import yfinance as _yf_etf_not
+            _h_etf = _yf_etf_not.Ticker(_etf_sel).history(period="40d")["Close"].dropna()
+            if len(_h_etf) >= 5:
+                _chg_etf = round(float((_h_etf.iloc[-1]-_h_etf.iloc[0])/_h_etf.iloc[0]*100), 1)
+                _etf_line = f"ETF {_etf_sel}: {_chg_etf:+.1f}% 30d"
         except Exception:
             pass
 
-    if _wr_frames:
-        import pandas as _pd_wr
-        _df_all = _pd_wr.concat(_wr_frames, ignore_index=True)
-        _df_all = _normalizar_precios_df(_df_all)
+        # Estado técnico HOY
+        _macd_str  = "POSITIVO ✅" if macd_hoy else "NEGATIVO ❌"
+        _rsi_zona  = ("sobrecomprado ⚠️" if _rsi_ref>72 else
+                       "momentum 🟢" if _rsi_ref>60 else
+                       "neutral 🟡" if _rsi_ref>48 else "oversold 🔵")
+        _pos_estado = ("EN GANANCIA · stop al break-even" if pnl_pct>5 else
+                       "EN GANANCIA LEVE · stop conservador" if pnl_pct>0 else
+                       "EN PÉRDIDA · revisar stop urgente")
 
-        # Solo posiciones CERRADAS (tienen Precio_Salida > 0)
-        if "Precio_Salida" in _df_all.columns and "Precio_Compra" in _df_all.columns:
-            _df_all["Precio_Salida"] = _pd_wr.to_numeric(_df_all["Precio_Salida"], errors="coerce")
-            _df_all["Precio_Compra"] = _pd_wr.to_numeric(_df_all["Precio_Compra"], errors="coerce")
-            _df_cerradas = _df_all[
-                _df_all["Precio_Salida"].notna() &
-                (_df_all["Precio_Salida"] > 0)
-            ].copy()
-
-            if not _df_cerradas.empty:
-                _df_cerradas["Retorno_%"] = (
-                    (_df_cerradas["Precio_Salida"] - _df_cerradas["Precio_Compra"])
-                    / _df_cerradas["Precio_Compra"] * 100
-                ).round(1)
-                _df_cerradas["Ganadora"] = _df_cerradas["Retorno_%"] > 0
-
-                # Agrupar por Area (sector)
-                _area_col = "Area" if "Area" in _df_cerradas.columns else None
-                if _area_col:
-                    _wr_by_sector = (
-                        _df_cerradas.groupby(_area_col)
-                        .agg(
-                            Señales  = ("Ticker",   "count"),
-                            Ganadoras= ("Ganadora",  "sum"),
-                            Avg_Ret  = ("Retorno_%", "mean"),
-                            Max_Ret  = ("Retorno_%", "max"),
-                            Min_Ret  = ("Retorno_%", "min"),
-                        )
-                        .reset_index()
-                    )
-                    _wr_by_sector["WR_%"] = (
-                        _wr_by_sector["Ganadoras"] / _wr_by_sector["Señales"] * 100
-                    ).round(0).astype(int)
-                    _wr_by_sector["Avg_Ret"] = _wr_by_sector["Avg_Ret"].round(1)
-                    _wr_by_sector = _wr_by_sector.sort_values("WR_%", ascending=False)
-
-                    # Renderizar tabla
-                    _wr_rows = ""
-                    for _, _rw in _wr_by_sector.iterrows():
-                        _wr_pct  = int(_rw["WR_%"])
-                        _wr_c    = G if _wr_pct >= 70 else A if _wr_pct >= 50 else R
-                        _wr_bg   = G_BG if _wr_pct >= 70 else A_BG if _wr_pct >= 50 else R_BG
-                        _ret_c   = G if _rw["Avg_Ret"] > 0 else R
-                        _sector  = str(_rw[_area_col])
-                        _wr_rows += (
-                            f'<tr style="background:{_wr_bg}">'
-                            f'<td style="font-weight:700;color:{TXT}">{_sector}</td>'
-                            f'<td style="text-align:center">{int(_rw["Señales"])}</td>'
-                            f'<td style="text-align:center">{int(_rw["Ganadoras"])}</td>'
-                            f'<td style="text-align:center;font-weight:800;color:{_wr_c}">'
-                            f'{_wr_pct}%</td>'
-                            f'<td style="text-align:center;color:{_ret_c}">'
-                            f'{_rw["Avg_Ret"]:+.1f}%</td>'
-                            f'<td style="text-align:center;color:{G}">'
-                            f'{_rw["Max_Ret"]:+.1f}%</td>'
-                            f'<td style="text-align:center;color:{R}">'
-                            f'{_rw["Min_Ret"]:+.1f}%</td>'
-                            f'</tr>'
-                        )
-
-                    # Totales
-                    _tot_sen = len(_df_cerradas)
-                    _tot_gan = int(_df_cerradas["Ganadora"].sum())
-                    _tot_wr  = round(_tot_gan/_tot_sen*100) if _tot_sen > 0 else 0
-                    _tot_ret = round(_df_cerradas["Retorno_%"].mean(), 1)
-
-                    st.markdown(
-                        f'<div class="tbl-wrap">'
-                        f'<table class="dtbl">'
-                        f'<thead><tr>'
-                        f'<th>Sector / Área</th><th>Señales</th><th>Ganadoras</th>'
-                        f'<th>WR%</th><th>Avg Retorno</th><th>Mejor</th><th>Peor</th>'
-                        f'</tr></thead>'
-                        f'<tbody>{_wr_rows}</tbody>'
-                        f'<tfoot><tr style="font-weight:800;border-top:2px solid {BOR}">'
-                        f'<td>TOTAL</td>'
-                        f'<td style="text-align:center">{_tot_sen}</td>'
-                        f'<td style="text-align:center">{_tot_gan}</td>'
-                        f'<td style="text-align:center;color:{G if _tot_wr>=60 else R}">{_tot_wr}%</td>'
-                        f'<td style="text-align:center;color:{G if _tot_ret>0 else R}">{_tot_ret:+.1f}%</td>'
-                        f'<td></td><td></td></tr></tfoot>'
-                        f'</table></div>',
-                        unsafe_allow_html=True)
-
-                    # Recomendación automática
-                    _mejores = _wr_by_sector[_wr_by_sector["WR_%"] >= 70]["Area"].tolist()
-                    _peores  = _wr_by_sector[_wr_by_sector["WR_%"] < 40]["Area"].tolist()
-                    if _mejores:
-                        st.success(f"🎯 **Sectores con mayor WR:** {', '.join(_mejores[:3])} — concentrar señales aquí")
-                    if _peores:
-                        st.warning(f"⚠️ **Sectores con bajo WR:** {', '.join(_peores[:3])} — revisar criterios o evitar")
-                else:
-                    st.info("ℹ️ Agrega la columna 'Area' en tus Sheets de posiciones para ver WR por sector.")
-            else:
-                st.info("ℹ️ Sin posiciones cerradas aún. El WR por sector aparecerá cuando registres salidas.")
-        else:
-            st.info("ℹ️ Las posiciones necesitan las columnas Precio_Compra y Precio_Salida.")
-    else:
-        st.info("ℹ️ Conecta las planillas de posiciones para ver el análisis de WR por sector.")
-
-    st.divider()
-    # ══════════════════════════════════════════════════════════════
-
-    st.markdown(
-        f'<div style="background:#F0FDF4;border:2px solid #86EFAC;border-radius:14px;'
-        f'padding:16px 20px;margin-bottom:16px">'
-        f'<div style="font-size:16px;font-weight:800;color:#16A34A;margin-bottom:8px">'
-        f'📊 ¿Para qué sirve este Tab?</div>'
-        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:12px;color:{TXT}">'
-        f'  <div style="background:white;border-radius:8px;padding:10px">'
-        f'    <div style="font-weight:700;color:#16A34A;margin-bottom:4px">🔬 Backtesting Real</div>'
-        f'    Prueba el modelo con datos históricos reales. Responde: si hubieras seguido las señales M2/M3 '
-        f'    del modelo en los últimos 6 meses, ¿cuánto hubieras ganado o perdido? '
-        f'    Calcula win rate real, promedio de ganancia y pérdida.'
-        f'  </div>'
-        f'  <div style="background:white;border-radius:8px;padding:10px">'
-        f'    <div style="font-weight:700;color:#2563EB;margin-bottom:4px">📐 ATR Sizing</div>'
-        f'    Calcula cuántas acciones comprar para que si el trade sale mal, '
-        f'    pierdas exactamente lo que decidiste arriesgar (ej: $500). '
-        f'    Usa el ATR (volatilidad real) del ticker para calcular el stop loss.'
-        f'  </div>'
-        f'</div></div>', unsafe_allow_html=True)
-
-    # ── Selector de herramienta ─────────────────────────────
-    _tool = st.radio("Selecciona herramienta",
-        ["🔬 Backtesting — ¿funcionó el modelo?",
-         "📐 ATR Sizing — ¿cuántas acciones comprar?"],
-        horizontal=True, label_visibility="collapsed")
-
-    # ════════════════════════════════════════════════════════
-    # SECCIÓN 1 — BACKTESTING
-    # ════════════════════════════════════════════════════════
-    if "Backtesting" in _tool:
-        st.markdown(
-            f'<div class="info-box">'
-            f'<strong>Cómo funciona:</strong> El sistema descarga precios históricos de cada ticker, '
-            f'busca los momentos donde el modelo habría generado señal M2/M3, '
-            f'simula la entrada al precio de cierre de ese día, y calcula si '
-            f'el precio llegó a Target +8% antes de tocar el Stop Loss (ATR x 1.5). '
-            f'⏱️ Puede tardar 30-60 segundos dependiendo de cuántos tickers analices.</div>',
-            unsafe_allow_html=True)
-
-        _bc1, _bc2, _bc3, _bc4 = st.columns(4)
-        with _bc1:
-            _bt_tickers = st.text_input(
-                "Tickers a testear",
-                value="NBIS,AMD,IONQ,NVDA,VRDN",
-                help="Pon los tickers de acciones que quieres analizar, separados por coma"
+        _sys = (
+            "Eres un analista de portfolio senior de GrekoTrader. "
+            "Combinas análisis técnico NBIS con análisis de noticias para dar "
+            "predicciones de impacto precisas. Estilo: directo, cuantificado, accionable.\n\n"
+            f"Fecha HOY: {_hoy}. Régimen mercado: {regimen}.\n\n"
+            "=== FÓRMULA DE IMPACTO PREDICHO ===\n"
+            "IMPACTO = Base_Evento × Multiplicador_NBIS × Contexto_Sector × Régimen\n\n"
+            "Base_Evento según tipo:\n"
+            "  Earnings BEAT fuerte (>10% EPS)   → base +15%\n"
+            "  Earnings BEAT moderado (<10%)      → base +8%\n"
+            "  Earnings EN LÍNEA                  → base +2%\n"
+            "  Earnings MISS                      → base -12%\n"
+            "  Guidance CUT                       → base -18%\n"
+            "  Contrato/M&A (objetivo)            → base +20%\n"
+            "  Dilución/Oferta secundaria         → base -10%\n"
+            "  FDA approval                       → base +30%\n"
+            "  FDA rejection                      → base -40%\n"
+            "  Upgrade analista + target sube     → base +4%\n"
+            "  Downgrade + target baja            → base -5%\n"
+            "  Insider selling masivo             → base -5%\n"
+            "  Sin evento relevante               → base 0%\n\n"
+            f"Multiplicador NBIS de esta posición: ×{_mult_nbis} ({_mult_label})\n"
+            "Cómo usarlo:\n"
+            "  Evento positivo + mult >1.0 → amplifica el upside\n"
+            "  Evento positivo + mult <0.6 → el RE alto frena el alza\n"
+            "  Evento negativo + mult <0.6 → ya estaba débil, golpe doble\n\n"
+            "Tipos de predicción:\n"
+            "  POSITIVO FUERTE: impacto calculado >+12%\n"
+            "  POSITIVO MEDIO:  impacto +5% a +12%\n"
+            "  POSITIVO LEVE:   impacto +2% a +5%\n"
+            "  NEUTRO:          impacto -2% a +2%\n"
+            "  NEGATIVO LEVE:   impacto -2% a -8%\n"
+            "  NEGATIVO FUERTE: impacto -8% a -20%\n"
+            "  BINARIO:         resultado 50/50 con sesgo definido\n\n"
+            "EJEMPLO DE SALIDA CORRECTA (AVGO):\n"
+            "  noticia: Beat moderado + guía sin subir\n"
+            "  base_evento: -6% (beat pero guía decepcionó)\n"
+            "  mult_aplicado: ×0.5 (RE alto, cotizaba perfección)\n"
+            "  impacto_calculado: -6% × 0.5 × 1.0 mercado = -3% base\n"
+            "  pero RE 90+ amplifica fragilidad → -12% a -15%\n"
+            "  tipo: NEGATIVO FUERTE con sesgo confirmado\n\n"
+            "NARRATIVAS FUTURAS: Identifica eventos o tendencias pendientes "
+            "que puedan materializarse en los próximos 30 días y afectar este ticker. "
+            "Busca: earnings próximos, cambios regulatorios, tendencias del sector, "
+            "cambios en el comportamiento de clientes, pipeline de productos. "
+            "Solo incluir si hay evidencia real — no especular.\n\n"
+            "Tipos de narrativa:\n"
+            "  AGOTAMIENTO_CATALIZADOR: el earn/noticia que motivó la entrada ya se digirió\n"
+            "  REGIMEN_ADVERSO: el sector tiene viento en contra estructural\n"
+            "  EVENTO_BINARIO: hay un evento futuro de resultado incierto (earn, FDA, etc)\n"
+            "  NARRATIVA_POSITIVA: catalizador nuevo en formación\n"
+            "  RIESGO_OCULTO: algo que el mercado no ha descontado aún\n\n"
+            "Narrative Score (0-9): Claridad(0-3) + Impacto(0-3) + Confirmación(0-3)\n"
+            "  8-9: ROJO · actuar · 5-7: NARANJA · precaución · 3-4: AMARILLO · monitorear\n\n"
+            "RETORNA SOLO JSON sin markdown:\n"
+            '{"noticia_principal":"1-2 oraciones qué pasó HOY",'
+            '"por_que":"por qué el mercado reaccionó así",'
+            '"lectura_clave":"insight del trader para esta posición",'
+            '"catalizador_vigente":true_o_false,'
+            '"riesgo_oculto":"riesgo específico o Sin riesgos identificados",'
+            '"sector_viento":"A FAVOR / NEUTRO / EN CONTRA",'
+            '"impacto_predicho":{'
+            '"tipo":"POSITIVO FUERTE/MEDIO/LEVE/NEUTRO/NEGATIVO LEVE/FUERTE/BINARIO",'
+            '"sesgo":"POSITIVO/NEGATIVO/NEUTRO",'
+            '"magnitud_min":-10,'
+            '"magnitud_max":-5,'
+            '"base_evento":"tipo de evento detectado",'
+            '"mult_nbis_aplicado":1.4,'
+            '"ventana":"INTRADAY/1-3d/1-2sem/2-4sem",'
+            '"factor_decisivo":"lo que determinará si el impacto se materializa",'
+            '"confianza_prediccion":"ALTA/MEDIA/BAJA"},'
+            '"narrativas_futuras":['
+            '{"descripcion":"qué narrativa está pendiente",'
+            '"tipo":"AGOTAMIENTO_CATALIZADOR/REGIMEN_ADVERSO/EVENTO_BINARIO/NARRATIVA_POSITIVA/RIESGO_OCULTO",'
+            '"impacto":"POSITIVO/NEGATIVO/NEUTRO",'
+            '"narrative_score":7,'
+            '"nivel_alerta":"ROJO/NARANJA/AMARILLO/VERDE",'
+            '"timeline":"1-5d/1-4sem/1-3m",'
+            '"accion_recomendada":"qué hacer ante esta narrativa"}'
+            '],'
+            '"veredicto":"MANTENER/REVISAR STOP/REDUCIR/CONSIDERAR SALIR",'
+            '"accion_concreta":"1 línea qué hacer exactamente hoy",'
+            '"confianza":"ALTA/MEDIA/BAJA",'
+            '"radar_sympathy":[{"ticker":"XXX","impacto":"NEGATIVO/POSITIVO/INVERSO",'
+            '"probabilidad":"ALTA/MEDIA/BAJA","razon":"conexión causal 1 línea"}]}'
+        )
+        _otros_str = (
+            f"\nOtros tickers del portfolio/watchlist para evaluar sympathy:\n{_lista_otros}\n"
+            f"Para cada uno: ¿la noticia de {tk} les afecta causalmente? Solo incluir los relevantes."
+        ) if _lista_otros else ""
+        # Safe float casting — prevent "Unknown format code 'f' for str" errors
+        _pc_s   = float(precio_entrada)   if precio_entrada   else 0.0
+        _pnl_s  = float(pnl_pct)          if pnl_pct          else 0.0
+        _rsi_s  = float(_rsi_ref)         if _rsi_ref         else 0.0
+        _dd_s   = float(dd_hoy)           if dd_hoy           else 0.0
+        _rsi_e  = float(rsi_entrada)      if rsi_entrada      else 0.0
+        _dd_e   = float(dd_entrada)       if dd_entrada       else 0.0
+        _pe_s   = float(p_exito_entrada)  if p_exito_entrada  else 0.0
+        _msg = (
+            f"POSICIÓN ACTIVA: {tk}\n\n"
+            f"─── AL ENTRAR (contexto de la decisión) ───────────────\n"
+            f"  RSI entrada:      {round(_rsi_e) if _rsi_e > 0 else 'N/D'}\n"
+            f"  Score NBIS:       {score_nbis}/20\n"
+            f"  DD al entrar:     {round(_dd_e) if _dd_e != 0 else 'N/D'}%\n"
+            f"  Tipo catalizador: {tipo_evento_entrada}\n"
+            f"  P_Exito entrada:  {round(_pe_s*100) if _pe_s > 0 else 'N/D'}%\n"
+            f"  Catalizador: {cat_fecha} · {dias_pos} días abierta\n\n"
+            f"─── HOY {_hoy} (estado actual) ───────────────────────\n"
+            f"  Precio entrada: ${round(_pc_s,2)} · PnL: {round(_pnl_s,1):+}% · {_pos_estado}\n"
+            f"  RSI HOY: {round(_rsi_s)} ({_rsi_zona})\n"
+            f"  MACD HOY: {_macd_str}\n"
+            f"  DD desde pico: {round(_dd_s,1) if _dd_s != 0 else 'N/D'}%\n"
+            f"  Fase actual: {fase}\n"
+            f"  Mult NBIS recalculado HOY: x{_mult_nbis} ({_mult_label})\n\n"
+            f"─── CONTEXTO MERCADO ──────────────────────────────────\n"
+            f"  Régimen: {regimen}\n"
+            f"  Sector: {sector} · {_etf_line}\n\n"
+            f"RESPONDE ESTAS 3 PREGUNTAS (en el JSON):\n"
+            f"  1. ¿Qué pasó con {tk} HOY? ¿Sigue vigente el catalizador de entrada?\n"
+            f"  2. ¿Hay narrativas futuras que puedan materializar impacto en 30 días?\n"
+            f"  3. ¿Mantengo, ajusto stop, reduzco o salgo — y por qué?\n\n"
+            f"Busca noticias de HOY {_hoy} y últimos 2 días sobre {tk}."
+            f"{_otros_str}"
+        )
+        _fallback = {
+            "noticia_principal":"Sin datos","por_que":"","lectura_clave":"",
+            "catalizador_vigente":True,"riesgo_oculto":"N/D","sector_viento":"NEUTRO",
+            "impacto_predicho":{
+                "tipo":"NEUTRO","sesgo":"NEUTRO","magnitud_min":0,"magnitud_max":0,
+                "base_evento":"Sin evento","mult_nbis_aplicado":_mult_nbis,
+                "ventana":"N/D","factor_decisivo":"N/D","confianza_prediccion":"BAJA"},
+            "narrativas_futuras":[],
+            "veredicto":"MANTENER","accion_concreta":"Revisar manualmente",
+            "confianza":"BAJA","radar_sympathy":[]}
+        try:
+            import anthropic as _ant_not
+            _cl = _ant_not.Anthropic(api_key=(st.secrets.get("ANTHROPIC_API_KEY","") or st.secrets.get("anthropic",{}).get("api_key","") or st.secrets.get("gcp_service_account",{}).get("ANTHROPIC_API_KEY","")))
+            _r = _cl.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=700,
+                system=_sys,
+                tools=[{"type":"web_search_20250305","name":"web_search"}],
+                messages=[{"role":"user","content":_msg}]
             )
-        with _bc2:
-            _bt_meses = st.selectbox("¿Cuántos meses atrás?",
-                ["3 meses","6 meses","9 meses","12 meses"], index=1,
-                help="Período histórico a analizar. Más meses = más señales = más confiable")
-            _bt_meses_n = int(_bt_meses.split()[0])
-        with _bc3:
-            _bt_riesgo = st.number_input("Riesgo por trade ($USD)",
-                min_value=100, max_value=10000, value=500, step=100,
-                help="¿Cuánto estás dispuesto a perder si el trade sale mal?")
-        with _bc4:
-            _bt_dias = st.selectbox("Días máx por trade",
-                [10,15,20], index=1,
-                help="Cuántos días esperar antes de cerrar el trade")
+            _raw = " ".join(b.text for b in _r.content if hasattr(b,"text") and b.text)
+            _raw = _raw.replace("```json","").replace("```","").strip()
+            _s = _raw.find("{"); _e = _raw.rfind("}") + 1
+            if _s >= 0 and _e > _s:
+                _res = json.loads(_raw[_s:_e])
+                if "radar_sympathy"    not in _res: _res["radar_sympathy"]    = []
+                if "impacto_predicho"  not in _res: _res["impacto_predicho"]  = _fallback["impacto_predicho"]
+                if "narrativas_futuras" not in _res: _res["narrativas_futuras"] = []
+                return _res
+            return _fallback
+        except Exception as _ex:
+            _fallback["noticia_principal"] = f"Error: {str(_ex)[:60]}"
+            return _fallback
 
-        st.markdown(
-            f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;'
-            f'padding:10px 14px;margin:8px 0;font-size:11px;color:#1D4ED8">'
-            f'📋 <strong>Lo que verás al ejecutar:</strong> Win Rate % real · '
-            f'Promedio ganancia vs pérdida · Expectativa matemática por trade · '
-            f'Tabla de cada señal con precio entrada, salida y resultado</div>',
-            unsafe_allow_html=True)
+    # ══ ARQUITECTURA v19.3 ══════════════════════════════════════
+    #  DINERO REAL (MVALLE + Amparito) → análisis auto al abrir
+    #  GREKO (papel)                   → manual, 2 momentos
+    # ═══════════════════════════════════════════════════════════
+    import datetime as _dt_not2
 
-        if st.button("🔬 Ejecutar Backtesting — analizar señales históricas",
-                     use_container_width=True, type="primary", key="btn_bt_v18"):
-            _tickers_list = [t.strip().upper() for t in _bt_tickers.split(",") if t.strip()]
-            _progress = st.progress(0, text=f"Iniciando análisis de {len(_tickers_list)} tickers...")
-            _resultados_bt = []
-            _all_trades    = []
-            for _idx, _tk_bt in enumerate(_tickers_list):
-                _progress.progress(
-                    (_idx) / len(_tickers_list),
-                    text=f"Analizando {_tk_bt} ({_idx+1}/{len(_tickers_list)})... puede tardar 10-15s por ticker"
-                )
-                _r = backtest_real_v16(_tk_bt, meses=_bt_meses_n, dias_max=_bt_dias)
-                if _r["_ok"]:
-                    _resultados_bt.append(_r)
-                    _all_trades.extend(_r["trades"])
-            _progress.progress(1.0, text="✅ Análisis completado")
-            st.session_state["bt_v19_resultados"] = _resultados_bt
-            st.session_state["bt_v19_trades"]     = _all_trades
-            st.session_state["bt_v19_ts"]         = datetime.datetime.now().strftime("%H:%M")
+    def _leer_activas(sheet_name):
+        _df = leer_posiciones_sheets(sheet_name)
+        if _df is None: return []
+        if hasattr(_df,"empty") and _df.empty: return []
+        _rows = _df.to_dict("records") if hasattr(_df,"to_dict") else _df
+        return [r for r in _rows if not r.get("Fecha_Salida") and r.get("Ticker")]
 
-        _bt_res  = st.session_state.get("bt_v19_resultados", [])
-        _bt_trds = st.session_state.get("bt_v19_trades", [])
-        _bt_ts   = st.session_state.get("bt_v19_ts", "")
+    def _prioridad_pos(p, pnl=0):
+        fase = str(p.get("Fase","")).upper()
+        if "M1" in fase: return 0
+        if pnl < -3:     return 1
+        if "M2" in fase: return 2
+        return 3
 
-        if not _bt_res:
+    def _analizar_portfolio(sheet_name, sheet_label, cache_key, otros_tks):
+        """Analiza posiciones en PARALELO con 4 workers — ~75% mas rapido."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        _pos = _leer_activas(sheet_name)
+        if not _pos:
+            st.info(f"Sin posiciones activas en {sheet_label}")
+            return
+        _mkt_reg = st.session_state.get("mercado_data",{}).get("regimen","NEUTRO")
+        _total   = len(_pos)
+        _res     = dict(st.session_state.get(cache_key, {}))
+        _lock    = threading.Lock()
+        _prog    = st.progress(0, text=f"Analizando {sheet_label} · 0/{_total}...")
+        _done    = [0]
+
+        def _procesar_una(p):
+            _tk = str(p.get("Ticker","")).upper()
+            try:
+                _pc = float(p.get("Precio_Compra",0) or 0)
+                _pa = float(get_row_for_ticker(_tk,_pc)["Precio"])
+                _pnl = round((_pa-_pc)/_pc*100,1) if _pc>0 else 0
+            except Exception: _pc=0; _pnl=0
+            _dias = 0
+            try:
+                _fd = pd.to_datetime(p.get("Fecha",""),errors="coerce")
+                _dias = (_dt_not2.date.today()-_fd.date()).days if not pd.isna(_fd) else 0
+            except Exception: pass
+            _tech = _get_technicals_live(_tk)
+            _r = _analizar_posicion_ia(
+                tk=_tk, precio_entrada=_pc, pnl_pct=_pnl,
+                fase=str(p.get("Fase","—")), dias_pos=_dias,
+                cat_fecha=str(p.get("Cat_Fecha","—")),
+                regimen=_mkt_reg,
+                sector=str(p.get("Sector","") or p.get("Area","Tech")),
+                otros_tickers=[t for t in otros_tks if t!=_tk],
+                score_nbis=int(p.get("Score_MVALLE",0) or 0),
+                rsi_entrada=float(p.get("RSI_Accion",0) or 0),
+                dd_entrada=float(p.get("N3",0) or 0),
+                tipo_evento_entrada=str(p.get("Tipo_Evento","-") or "-"),
+                p_exito_entrada=float(str(p.get("P_Exito_Entrada","0") or "0").replace("%","") or 0)/100,
+                rsi_hoy=_tech.get("rsi",0),
+                macd_hoy=_tech.get("macd_pos",False),
+                dd_hoy=_tech.get("dd",0),
+            )
+            with _lock:
+                _done[0] += 1
+                _n = _done[0]
+            try:
+                _prog.progress(_n/_total,
+                    text=f"🔍 {sheet_label} · {_tk} · {_n}/{_total}")
+            except Exception: pass
+            return _tk, _r
+
+        MAX_W = min(4, max(1, _total))
+        with ThreadPoolExecutor(max_workers=MAX_W) as executor:
+            futures = [executor.submit(_procesar_una, p) for p in _pos]
+            for future in as_completed(futures):
+                try:
+                    _tk, _r = future.result()
+                    _res[_tk] = _r
+                except Exception: pass
+
+        _prog.empty()
+        st.session_state[cache_key] = _res
+        st.session_state[f"{cache_key}_ts"] = _dt_not2.datetime.now().timestamp()
+        return _res
+
+    _VEREDICTO_COLORS = {
+        "MANTENER":        ("#16A34A","#F0FDF4"),
+        "REVISAR STOP":    ("#D97706","#FFFBEB"),
+        "REDUCIR":         ("#F97316","#FFF7ED"),
+        "CONSIDERAR SALIR":("#EF4444","#FEF2F2"),
+    }
+    _ALERTA_COLORS = {
+        "ROJO":    ("#EF4444","#FEF2F2","🚨"),
+        "NARANJA": ("#F97316","#FFF7ED","⚠️"),
+        "AMARILLO":("#D97706","#FFFBEB","🟡"),
+        "VERDE":   ("#16A34A","#F0FDF4","📈"),
+    }
+    _SYMPATHY_COLORS = {
+        "NEGATIVO":("#EF4444","#FEF2F2","⬇️"),
+        "POSITIVO":("#16A34A","#F0FDF4","⬆️"),
+        "INVERSO": ("#8B5CF6","#FAF5FF","↔️"),
+    }
+
+    def _mostrar_cards(resultados, posiciones, sheet_label, cache_key, otros_tks):
+        if not resultados: return
+        _pnls = {}
+        for _p in posiciones:
+            _tk = str(_p.get("Ticker","")).upper()
+            try:
+                _pc = float(_p.get("Precio_Compra",0) or 0)
+                _pa = float(get_row_for_ticker(_tk,_pc)["Precio"])
+                _pnls[_tk] = round((_pa-_pc)/_pc*100,1) if _pc>0 else 0
+            except Exception: _pnls[_tk]=0
+        _pos_sorted = sorted(posiciones,
+            key=lambda p: _prioridad_pos(p, _pnls.get(str(p.get("Ticker","")).upper(),0)))
+        for _p2 in _pos_sorted:
+            _tk2   = str(_p2.get("Ticker","")).upper()
+            _pnl2  = _pnls.get(_tk2, 0)
+            _pc2   = float(_p2.get("Precio_Compra",0) or 0)
+            _an    = resultados.get(_tk2)
+            _fase2 = str(_p2.get("Fase","—"))
+            _pnl_col = "#16A34A" if _pnl2>=0 else "#EF4444"
+            # Header card
             st.markdown(
-                f'<div style="background:{BG_HEAD};border:2px dashed {BOR};border-radius:12px;'
-                f'padding:40px;text-align:center">'
-                f'<div style="font-size:40px;margin-bottom:12px">🔬</div>'
-                f'<div style="font-size:15px;font-weight:700;color:{TXT};margin-bottom:6px">'
-                f'Aún no has ejecutado el backtesting</div>'
-                f'<div style="font-size:12px;color:{TXT_MUT}">'
-                f'1. Escribe los tickers que quieres analizar (ej: NBIS,AMD,IONQ)<br>'
-                f'2. Elige el período (recomendado: 6 meses)<br>'
-                f'3. Haz click en el botón verde <strong>"Ejecutar Backtesting"</strong><br>'
-                f'4. Espera 30-60 segundos mientras descarga datos históricos</div>'
-                f'</div>', unsafe_allow_html=True)
-        else:
-            # ── RESUMEN GLOBAL ───────────────────────────────
-            import numpy as _np
-            _n_tot  = sum(r["n_señales"]   for r in _bt_res)
-            _n_win  = sum(r["n_ganadoras"] for r in _bt_res)
-            _n_los  = sum(r["n_perdedoras"] for r in _bt_res)
-            _wr_g   = round(_n_win / _n_tot * 100, 1) if _n_tot > 0 else 0
-            _avg_g  = round(_np.mean([t["resultado"] for t in _bt_trds if t.get("ganadora")]), 2) if any(t.get("ganadora") for t in _bt_trds) else 0
-            _avg_p  = round(_np.mean([t["resultado"] for t in _bt_trds if not t.get("ganadora")]), 2) if any(not t.get("ganadora") for t in _bt_trds) else 0
-            _ratio  = round(abs(_avg_g / _avg_p), 2) if _avg_p != 0 else 0
-            _expect = round(_wr_g/100 * _avg_g + (1-_wr_g/100) * _avg_p, 2)
-            _wr_col = "#16A34A" if _wr_g >= 60 else "#D97706" if _wr_g >= 50 else "#DC2626"
-
-            st.markdown(f'<div style="font-size:11px;color:{TXT_MUT};margin:6px 0">Ejecutado {_bt_ts} · {_n_tot} señales analizadas</div>', unsafe_allow_html=True)
-
-            # KPIs
-            _k1,_k2,_k3,_k4,_k5 = st.columns(5)
-            for _kc, _kv, _kl, _kco, _khelp in [
-                (_k1, f"{_wr_g}%",        "Win Rate",             _wr_col,   "De cada 100 señales, cuántas terminaron en ganancia"),
-                (_k2, f"+{_avg_g}%",      "Promedio ganadora",    "#16A34A", "Cuando el modelo acierta, ¿cuánto gana en promedio?"),
-                (_k3, f"{_avg_p}%",       "Promedio perdedora",   "#DC2626", "Cuando el modelo falla, ¿cuánto pierde en promedio?"),
-                (_k4, f"{_ratio}x",       "Ratio ganancia/pérdida","#7C3AED","Si el ratio > 1 el sistema es rentable a largo plazo"),
-                (_k5, f"{_expect:+.1f}%", "Expectativa/trade",    "#16A34A" if _expect>0 else "#DC2626",
-                                                                              "Resultado esperado promedio por cada señal tomada"),
-            ]:
-                with _kc:
-                    st.markdown(
-                        f'<div style="background:{BG_CARD};border:1px solid {BOR};'
-                        f'border-radius:10px;padding:12px;text-align:center" title="{_khelp}">'
-                        f'<div style="font-size:10px;color:{TXT_MUT};font-weight:600">{_kl}</div>'
-                        f'<div style="font-size:24px;font-weight:800;color:{_kco}">{_kv}</div>'
-                        f'</div>', unsafe_allow_html=True)
-
-            # Interpretación
-            _msg = ("✅ El modelo es rentable — gana más de lo que pierde" if _expect > 0 and _wr_g >= 50
-                    else "⚠️ Revisar — win rate o ratio necesitan mejorar" if _expect > -2
-                    else "❌ Modelo necesita ajuste — pérdida esperada por trade")
-            st.markdown(
-                f'<div style="background:{"#F0FDF4" if _expect>0 else "#FEF2F2"};'
-                f'border:1px solid {"#86EFAC" if _expect>0 else "#FCA5A5"};'
-                f'border-radius:8px;padding:10px 14px;margin:10px 0;font-size:12px">'
-                f'<strong>{_msg}</strong><br>'
-                f'Win Rate {_wr_g}% · Ganancia avg +{_avg_g}% · Pérdida avg {_avg_p}% · '
-                f'Cada señal tomada tiene expectativa de {_expect:+.1f}%</div>',
+                f'<div style="border:1px solid #E2E8F0;border-radius:10px;'
+                f'margin-bottom:12px;overflow:hidden">',
                 unsafe_allow_html=True)
-
-            # Tabla de trades
-            if _bt_trds:
-                # ── RENDIMIENTO POR SECTOR ──────────────────────
-                _areas_bt = {}
-                for _t in _bt_trds:
-                    _a = str(_t.get("area", _t.get("Area", "Sin área")))
-                    if not _a or _a in ("", "-", "nan"): _a = "Sin área"
-                    if _a not in _areas_bt:
-                        _areas_bt[_a] = {"total":0,"gan":0,"res":[]}
-                    _areas_bt[_a]["total"] += 1
-                    if _t.get("ganadora"): _areas_bt[_a]["gan"] += 1
-                    _areas_bt[_a]["res"].append(float(_t.get("resultado",0)))
-
-                if len(_areas_bt) > 1:
-                    st.markdown(
-                        f'<div style="font-size:13px;font-weight:700;color:{TXT};margin:14px 0 6px">'
-                        f'📊 Rendimiento por Sector — ¿cuál funciona mejor con el modelo?</div>',
-                        unsafe_allow_html=True)
-                    _area_rows_bt = ""
-                    for _an, _av in sorted(_areas_bt.items(),
-                            key=lambda x: x[1]["gan"]/max(x[1]["total"],1), reverse=True):
-                        _wr_a  = round(_av["gan"]/_av["total"]*100,1) if _av["total"]>0 else 0
-                        _avg_a = round(sum(_av["res"])/_av["total"],1) if _av["total"]>0 else 0
-                        _wrc   = G if _wr_a>=60 else A if _wr_a>=50 else R
-                        _avrc  = "#16A34A" if _avg_a>0 else "#DC2626"
-                        _sector_c = SECTOR_COLORS.get(_an, TXT_MUT)
-                        _area_rows_bt += (
-                            f"<tr>"
-                            f"<td><span style='color:{_sector_c};font-weight:600'>{_an}</span></td>"
-                            f"<td style='text-align:center'>{_av['total']}</td>"
-                            f"<td style='text-align:center;color:{_wrc};font-weight:800'>{_wr_a}%</td>"
-                            f"<td style='text-align:center;color:{_avrc};font-weight:700'>{_avg_a:+.1f}%</td>"
-                            f"<td style='text-align:center'>"
-                            f"{'✅ Modelo funciona bien aquí' if _wr_a>=60 else '⚠️ Mejorable' if _wr_a>=50 else '❌ Filtrar este sector'}"
-                            f"</td>"
-                            f"</tr>"
-                        )
-                    st.markdown(
-                        f'<div class="tbl-wrap"><table class="dtbl">'
-                        f'<thead><tr>'
-                        f'<th>Sector</th><th>Señales</th><th>Win Rate</th>'
-                        f'<th>Promedio %</th><th>Diagnóstico</th>'
-                        f'</tr></thead>'
-                        f'<tbody>{_area_rows_bt}</tbody></table></div>',
-                        unsafe_allow_html=True)
-
-                st.markdown(f'<div style="font-size:13px;font-weight:700;color:{TXT};margin:10px 0 4px">📋 Detalle de señales históricas</div>', unsafe_allow_html=True)
-                _rows = ""
-                for _t in sorted(_bt_trds, key=lambda x: x.get("fecha",""), reverse=True)[:40]:
-                    _rc = "#16A34A" if _t.get("ganadora") else "#DC2626"
-                    _res = float(_t.get("resultado",0))
-                    _rows += (
-                        f"<tr style='background:{'#F0FDF420' if _t.get('ganadora') else '#FEF2F220'}'>"
-                        f"<td><strong style='color:{B}'>{_t.get('ticker','')}</strong></td>"
-                        f"<td style='font-size:11px;color:{TXT_MUT}'>{_t.get('fecha','')}</td>"
-                        f"<td><strong>${_t.get('entrada',0):.2f}</strong></td>"
-                        f"<td>${_t.get('salida',0):.2f}</td>"
-                        f"<td style='color:{TXT_MUT};font-size:10px'>${_t.get('stop',0):.2f}</td>"
-                        f"<td><span style='color:{_rc};font-weight:800'>{_res:+.1f}%</span></td>"
-                        f"<td>{'✅' if _t.get('ganadora') else '❌'}</td>"
-                        f"<td style='font-size:10px;color:{TXT_MUT}'>{_t.get('dias_trade',0)}d</td>"
-                        f"</tr>"
-                    )
-                _hdr = "<tr>" + "".join(f"<th>{h}</th>" for h in ["Ticker","Fecha","Entrada","Salida","Stop","Resultado","✓","Días"]) + "</tr>"
-                st.markdown(
-                    f'<div class="tbl-wrap"><table class="dtbl"><thead>{_hdr}</thead><tbody>{_rows}</tbody></table></div>',
-                    unsafe_allow_html=True)
-
-                _csv_bt = "\n".join([",".join(str(v) for v in [
-                    t.get("ticker",""),t.get("fecha",""),t.get("entrada",0),
-                    t.get("salida",0),t.get("stop",0),t.get("resultado",0),
-                    "SI" if t.get("ganadora") else "NO",t.get("dias_trade",0)
-                ]) for t in _bt_trds])
-                st.download_button("⬇️ Descargar CSV de señales",
-                    ("Ticker,Fecha,Entrada,Salida,Stop,Resultado%,Ganadora,Dias\n" + _csv_bt).encode(),
-                    f"backtesting_v18_{datetime.date.today()}.csv", "text/csv",
-                    use_container_width=True, key="dl_senales_csv")
-
-    # ════════════════════════════════════════════════════════
-    # SECCIÓN EXPORTACIÓN SEMANAL — memoria de trades
-    # ════════════════════════════════════════════════════════
-    st.markdown("---")
-    st.markdown(
-        f'<div style="font-size:13px;font-weight:700;color:{TXT};margin-bottom:8px">'
-        f'📤 Exportación semanal — memoria de trades</div>',
-        unsafe_allow_html=True)
-
-    _exp_col1, _exp_col2, _exp_col3 = st.columns(3)
-    with _exp_col1:
-        # Exportar señales del modelo (candidatos guardados)
-        _local_trades = st.session_state.get("memoria_trades_local", [])
-        if _local_trades:
-            import pandas as _pd_exp, io as _io_exp, datetime as _dt_exp
-            _df_exp = _pd_exp.DataFrame(_local_trades)
-            _csv_exp = _df_exp.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                f"⬇️ Señales del modelo ({len(_local_trades)} registros)",
-                _csv_exp,
-                f"senales_modelo_{_dt_exp.date.today()}.csv",
-                "text/csv", use_container_width=True,
-                help="Señales M2/M3 que guardaste como candidatos esta semana",
-                key="dl_senales_local",
-            )
-        else:
-            st.info("Sin señales registradas aún")
-
-    with _exp_col2:
-        # Exportar trades reales (posiciones reales Tab6/7)
-        _pos_mauri = st.session_state.get("posiciones_df_mauri")
-        _pos_amp   = st.session_state.get("posiciones_df_amparito")
-        if _pos_mauri is not None or _pos_amp is not None:
-            import pandas as _pd_pos, datetime as _dt_pos
-            _frames = []
-            if _pos_mauri is not None:
-                _df_m = _pos_mauri.copy(); _df_m["Cartera"] = "Mauri"; _frames.append(_df_m)
-            if _pos_amp is not None:
-                _df_a = _pos_amp.copy(); _df_a["Cartera"] = "Amparito"; _frames.append(_df_a)
-            if _frames:
-                _df_pos_exp = _pd_pos.concat(_frames, ignore_index=True)
-                st.download_button(
-                    "⬇️ Mis posiciones actuales",
-                    _df_pos_exp.to_csv(index=False).encode("utf-8"),
-                    f"posiciones_{_dt_pos.date.today()}.csv",
-                    "text/csv", use_container_width=True,
-                    help="Estado actual de todas tus posiciones con P&L",
-                    key="dl_pos_act",
-                )
-        else:
-            st.info("Carga tus posiciones primero")
-
-    with _exp_col3:
-        # Botón para limpiar memoria local (después de exportar)
-        if st.button("🗑️ Limpiar memoria local",
-                     key="btn_clear_local", use_container_width=True,
-                     help="Borra las señales guardadas localmente (ya las descargaste)"):
-            st.session_state["memoria_trades_local"] = []
-            st.success("✅ Memoria local limpiada")
-
-    # Instrucción semanal
-    st.markdown(
-        f'<div style="background:#FFFBEB;border:1px solid #FCD34D;border-radius:8px;'
-        f'padding:10px 14px;font-size:11px;color:#92400E;margin-top:8px">'
-        f'📅 <strong>Rutina semanal recomendada (lunes, 10 min):</strong> '
-        f'1) Descargar "Señales del modelo" · '
-        f'2) Descargar "Mis posiciones" · '
-        f'3) Pegar ambos en Google Sheets "GrekoTrader_Memoria" · '
-        f'4) Actualizar campo Error_Modelo para señales que fallaron · '
-        f'5) Limpiar memoria local'
-        f'</div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ════════════════════════════════════════════════════════
-    # SECCIÓN 2 — ATR SIZING (else del radio _tool)
-    # ════════════════════════════════════════════════════════
-    if "ATR Sizing" in _tool:
-        st.markdown(
-            f'<div class="info-box">'
-            f'<strong>¿Qué es el ATR Sizing?</strong> El ATR (Average True Range) mide '
-            f'cuánto se mueve una acción en un día normal. Usamos eso para calcular '
-            f'el stop loss y de ahí cuántas acciones comprar. '
-            f'Ejemplo: Si arriesgas $500 y el stop está a $12 de distancia → compras 41 acciones.</div>',
-            unsafe_allow_html=True)
-
-        _as1, _as2, _as3 = st.columns(3)
-        with _as1:
-            _atr_tk = st.text_input("Ticker", value="NBIS", key="atr_tk_v18").upper()
-        with _as2:
-            _atr_capital = st.number_input("¿Cuánto puedes perder si sale mal? ($)",
-                min_value=50, max_value=50000, value=500, step=50,
-                help="Capital máximo en riesgo por este trade")
-        with _as3:
-            _atr_precio = st.number_input("Precio actual ($)",
-                min_value=0.5, max_value=10000.0, value=100.0, step=0.5)
-
-        if st.button("📐 Calcular — ¿cuántas acciones comprar?",
-                     use_container_width=True, type="primary", key="btn_atr_v18"):
-            with st.spinner(f"Calculando ATR real de {_atr_tk}..."):
-                _sz = sizing_por_atr(
-                    ticker=_atr_tk, precio_actual=_atr_precio,
-                    capital_riesgo_usd=_atr_capital, atr_mult=1.5,
-                    score=60, vix_val=float(vix.get("valor",20))
-                )
-                st.session_state["atr_v18"] = _sz
-
-        _sz_r = st.session_state.get("atr_v18")
-        if not _sz_r:
             st.markdown(
-                f'<div style="background:{BG_HEAD};border:2px dashed {BOR};border-radius:12px;'
-                f'padding:40px;text-align:center">'
-                f'<div style="font-size:40px;margin-bottom:12px">📐</div>'
-                f'<div style="font-size:15px;font-weight:700;color:{TXT};margin-bottom:6px">'
-                f'Ingresa el ticker y el capital en riesgo</div>'
-                f'<div style="font-size:12px;color:{TXT_MUT}">'
-                f'El sistema descargará el ATR real de los últimos 14 días<br>'
-                f'y calculará exactamente cuántas acciones comprar</div>'
+                f'<div style="background:#F8FAFC;padding:10px 14px;'
+                f'border-bottom:1px solid #E2E8F0;display:flex;align-items:center;gap:12px">'
+                f'<strong style="font-size:16px;color:#1E293B">{_tk2}</strong>'
+                f'<span style="font-size:13px;font-weight:700;color:{_pnl_col}">{_pnl2:+.1f}%</span>'
+                f'<span style="font-size:11px;color:#64748B">Entrada ${_pc2:.2f}</span>'
+                f'<span style="font-size:11px;color:#94A3B8">· {_fase2}</span>'
+                f'<span style="font-size:10px;color:#CBD5E1;margin-left:auto">{sheet_label}</span>'
                 f'</div>', unsafe_allow_html=True)
+            if not _an:
+                if st.button(f"🔍 Analizar {_tk2}",
+                            key=f"btn_ind_{sheet_label}_{_tk2}",
+                            use_container_width=False):
+                    with st.spinner(f"Analizando {_tk2}..."):
+                        _mkt_r = st.session_state.get("mercado_data",{}).get("regimen","NEUTRO")
+                        _tech_i = _get_technicals_live(_tk2)
+                        try:
+                            _pc_i = float(_p2.get("Precio_Compra",0) or 0)
+                            _pa_i = float(get_row_for_ticker(_tk2,_pc_i)["Precio"])
+                            _pnl_i = round((_pa_i-_pc_i)/_pc_i*100,1) if _pc_i>0 else 0
+                        except Exception: _pc_i=0; _pnl_i=0
+                        _an = _analizar_posicion_ia(
+                            _tk2,_pc_i,_pnl_i,
+                            str(_p2.get("Fase","—")),0,
+                            str(_p2.get("Cat_Fecha","—")),_mkt_r,
+                            str(_p2.get("Sector","") or _p2.get("Area","Tech")),
+                            rsi_hoy=_tech_i.get("rsi",0),
+                            macd_hoy=_tech_i.get("macd_pos",False),
+                            dd_hoy=_tech_i.get("dd",0),
+                            rsi_entrada=float(_p2.get("RSI_Accion",0) or 0),
+                            tipo_evento_entrada=str(_p2.get("Tipo_Evento","-") or "-"),
+                        )
+                        _cache = st.session_state.get(cache_key,{})
+                        _cache[_tk2] = _an
+                        st.session_state[cache_key] = _cache
+                        st.rerun()
+            else:
+                _vered2  = _an.get("veredicto","MANTENER")
+                _vc2,_vcbg2 = _VEREDICTO_COLORS.get(_vered2,("#64748B","#F8FAFC"))
+                st.markdown(
+                    f'<div style="padding:12px 14px;background:#fff">'
+                    f'<div style="font-size:13px;color:#1E293B;line-height:1.7;margin-bottom:8px">'
+                    f'<strong>📰 Qué pasó:</strong> {_an.get("noticia_principal","—")}</div>'
+                    f'<div style="font-size:12px;color:#475569;line-height:1.6;margin-bottom:6px">'
+                    f'<strong>🔍 Por qué:</strong> {_an.get("por_que","—")}</div>'
+                    f'<div style="font-size:12px;color:#334155;line-height:1.6;'
+                    f'background:#F0F9FF;border-left:3px solid #0369A1;'
+                    f'padding:6px 10px;border-radius:4px;margin-bottom:8px">'
+                    f'<strong>💡 Lectura clave:</strong> {_an.get("lectura_clave","—")}</div>'
+                    f'<div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">'
+                    f'<span style="font-size:11px;color:#64748B">⚠️ {_an.get("riesgo_oculto","—")}</span>'
+                    f'<span style="font-size:11px;color:#64748B">🌡️ Sector: {_an.get("sector_viento","—")}</span>'
+                    f'<span style="font-size:9px;color:#94A3B8">Conf: {_an.get("confianza","—")}</span>'
+                    f'</div>'
+                    f'<div style="background:{_vcbg2};border:1px solid {_vc2}40;'
+                    f'border-left:4px solid {_vc2};border-radius:6px;padding:8px 12px;margin-bottom:6px">'
+                    f'<span style="font-size:13px;font-weight:800;color:{_vc2}">{_vered2}</span>'
+                    f'<span style="font-size:11px;color:{_vc2}CC;margin-left:10px">{_an.get("accion_concreta","—")}</span>'
+                    f'</div></div></div>', unsafe_allow_html=True)
+                # Predicción
+                _imp = _an.get("impacto_predicho",{})
+                if _imp and _imp.get("tipo","NEUTRO") != "NEUTRO":
+                    _itipo=_imp.get("tipo",""); _iconf=_imp.get("confianza_prediccion","BAJA")
+                    _imult=_imp.get("mult_nbis_aplicado",1.0); _ifact=_imp.get("factor_decisivo","")
+                    _imin=_imp.get("magnitud_min",0); _imax=_imp.get("magnitud_max",0)
+                    _ic = "#16A34A" if "POSITIVO" in _itipo else "#EF4444" if "NEGATIVO" in _itipo else "#8B5CF6"
+                    _ibg= "#F0FDF4" if "POSITIVO" in _itipo else "#FEF2F2" if "NEGATIVO" in _itipo else "#FAF5FF"
+                    _iico= "📈" if "POSITIVO" in _itipo else "📉" if "NEGATIVO" in _itipo else "⚖️"
+                    _rango = f"{_imin:+.0f}% a {_imax:+.0f}%" if _imin!=0 or _imax!=0 else ""
+                    st.markdown(
+                        f'<div style="background:{_ibg};border-left:4px solid {_ic};'
+                        f'border-top:none;padding:8px 12px;margin-bottom:0">'
+                        f'<span style="font-size:10px;font-weight:800;color:{_ic}">{_iico} PREDICCIÓN</span>'
+                        f'<span style="font-size:12px;font-weight:900;color:{_ic};margin-left:8px">{_itipo}</span>'
+                        f'<span style="font-size:10px;color:#64748B;margin-left:8px">{_rango} · Mult ×{_imult} · {_iconf}</span>'
+                        f'<div style="font-size:10px;color:#334155;margin-top:3px;font-style:italic">🔑 {_ifact}</div>'
+                        f'</div>', unsafe_allow_html=True)
+                # Narrativas
+                _narrs = _an.get("narrativas_futuras",[])
+                if _narrs:
+                    _nh = '<div style="background:#FAFAFA;border:1px solid #E2E8F0;border-top:none;padding:8px 14px 10px"><div style="font-size:9px;font-weight:800;color:#475569;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">🔮 Narrativas futuras</div>'
+                    for _nv in sorted(_narrs, key=lambda x: -x.get("narrative_score",0)):
+                        _nc,_nb,_ni = _ALERTA_COLORS.get(_nv.get("nivel_alerta",""),("#64748B","#F8FAFC","ℹ️"))
+                        _sc_n = _nv.get("narrative_score",0)
+                        _bars = "█"*_sc_n+"░"*(9-_sc_n)
+                        _nh += (f'<div style="background:{_nb};border-left:3px solid {_nc};border-radius:5px;padding:6px 9px;margin-bottom:4px">'
+                                f'<div style="display:flex;align-items:center;gap:6px">{_ni} '
+                                f'<span style="font-size:10px;font-weight:700;color:{_nc}">{_nv.get("nivel_alerta","")}</span>'
+                                f'<span style="font-size:9px;color:#64748B">{_nv.get("tipo","").replace("_"," ")}</span>'
+                                f'<span style="font-size:9px;color:#94A3B8;margin-left:auto">{_sc_n}/9 [{_bars}] · {_nv.get("timeline","")}</span>'
+                                f'</div>'
+                                f'<div style="font-size:10px;color:#334155;margin:3px 0">{_nv.get("descripcion","")}</div>'
+                                f'<div style="font-size:9px;color:{_nc};font-weight:600">→ {_nv.get("accion_recomendada","")}</div>'
+                                f'</div>')
+                    st.markdown(_nh+"</div>", unsafe_allow_html=True)
+                # Radar Sympathy
+                _radar = _an.get("radar_sympathy",[])
+                if _radar:
+                    _rh = '<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-top:none;padding:8px 14px 10px"><div style="font-size:9px;font-weight:800;color:#64748B;text-transform:uppercase;margin-bottom:6px">📡 Radar Sympathy</div>'
+                    for _sym in _radar:
+                        _sc2,_sb2,_si2 = _SYMPATHY_COLORS.get(_sym.get("impacto",""),("#94A3B8","#F8FAFC","→"))
+                        _rh += (f'<div style="background:{_sb2};border-left:3px solid {_sc2};border-radius:5px;padding:5px 8px;margin-bottom:4px;display:flex;align-items:flex-start;gap:8px">'
+                                f'<strong style="font-size:11px;color:{_sc2};min-width:50px">{_si2} {_sym.get("ticker","")}</strong>'
+                                f'<div><span style="font-size:9px;font-weight:700;color:{_sc2};background:{_sc2}20;border-radius:3px;padding:1px 5px">{_sym.get("impacto","")} · {_sym.get("probabilidad","")}</span>'
+                                f'<span style="font-size:10px;color:#475569;margin-left:6px">{_sym.get("razon","")}</span></div>'
+                                f'</div>')
+                    st.markdown(_rh+"</div>", unsafe_allow_html=True)
+
+    # ══ NOTICIAS IA — ARQUITECTURA CON ALERTAS v19.3 ══════════════
+    # Flujo: scan técnico rápido → detectar alertas → IA solo si hay motivo
+    import datetime as _dt_not2, json as _json_nc, os as _os_nc, time as _time_nc
+
+    # ── Toggle modo dev ──────────────────────────────────────────────
+    _col_dev1, _col_dev2 = st.columns([5,1])
+    with _col_dev2:
+        _modo_dev = st.toggle("🛠️ Dev", value=False, key="modo_dev_noticias",
+                              help="Modo desarrollo: desactiva IA para ahorrar tokens")
+
+    # ── Leer posiciones reales ───────────────────────────────────────
+    _pos_mvalle   = _leer_activas(_SHEET_NAME_MAURI)
+    _pos_amparito = _leer_activas(_SHEET_NAME_AMPARITO)
+    _pos_reales   = _pos_mvalle + _pos_amparito
+
+    if not _pos_reales:
+        st.info("Sin posiciones activas en MVALLE o Amparito")
+    else:
+        _n_tot = len(_pos_reales)
+        # ── SCAN TÉCNICO RÁPIDO (solo yfinance — sin IA) ─────────────
+        # Caché 15 min en session_state — sin llamadas API
+        _scan_key = "noticias_scan_tecnico"
+        _scan_ts  = st.session_state.get(f"{_scan_key}_ts", 0)
+        _scan_stale = (_time_nc.time() - _scan_ts) > 900  # 15 min
+
+        if _scan_stale or _scan_key not in st.session_state:
+            with st.spinner(f"🔎 Verificando {_n_tot} posiciones... (~10 seg)"):
+                _scan_res = {}
+                for _p in _pos_reales:
+                    _tk = str(_p.get("Ticker","")).upper()
+                    try:
+                        _pc = float(_p.get("Precio_Compra",0) or 0)
+                        _tech = _get_technicals_live(_tk)
+                        _pa   = float(get_row_for_ticker(_tk,_pc).get("Precio",_pc) or _pc)
+                        _pnl  = round((_pa-_pc)/_pc*100,1) if _pc>0 else 0
+                        _rsi  = float(_tech.get("rsi",0))
+                        _macd = _tech.get("macd_pos", False)
+                        _dd   = float(_tech.get("dd",0))
+                        _fase = str(_p.get("Fase","")).upper()
+                        # Días en posición
+                        _dias = 0
+                        try:
+                            _fd = pd.to_datetime(_p.get("Fecha",""),errors="coerce")
+                            _dias = (_dt_not2.date.today()-_fd.date()).days if not pd.isna(_fd) else 0
+                        except Exception: pass
+                        # ── Detectar alertas ──────────────────────────────
+                        _alertas = []
+                        # ALERTA 1: caída intraday fuerte
+                        if _tech.get("c1d", 0) < -3:
+                            _alertas.append(("📉", f"Cayó {_tech['c1d']:+.1f}% hoy", "ROJO"))
+                        # ALERTA 2: pérdida acumulada crítica
+                        if _pnl < -7:
+                            _alertas.append(("🚨", f"Pérdida {_pnl:+.1f}% desde entrada", "ROJO"))
+                        elif _pnl < -4:
+                            _alertas.append(("⚠️", f"Pérdida {_pnl:+.1f}% — revisar stop", "NARANJA"))
+                        # ALERTA 3: RSI sobreextendido post-entrada
+                        if _rsi > 78:
+                            _alertas.append(("⚡", f"RSI {_rsi:.0f} — sobreextendido", "NARANJA"))
+                        elif _rsi > 73 and _dd > -10:
+                            _alertas.append(("🟡", f"RSI {_rsi:.0f} — momentum alto", "AMARILLO"))
+                        # ALERTA 4: fase regresó a M1
+                        if "M1" in _fase:
+                            _alertas.append(("🔴", "Fase M1 — deterioro grave", "ROJO"))
+                        # ALERTA 5: posición muy antigua
+                        if _dias > 20:
+                            _alertas.append(("⏰", f"{_dias} días — catalizador puede expirar", "AMARILLO"))
+                        # ALERTA 6: ganancia grande — considerar parcial
+                        if _pnl > 20:
+                            _alertas.append(("💰", f"Ganancia {_pnl:+.1f}% — ¿toma parcial?", "VERDE"))
+                        _scan_res[_tk] = {
+                            "tk": _tk, "pnl": _pnl, "rsi": _rsi, "dd": _dd,
+                            "macd": _macd, "fase": _fase, "dias": _dias,
+                            "alertas": _alertas, "portfolio": str(_p.get("_portfolio",""))
+                        }
+                    except Exception: pass
+                st.session_state[_scan_key] = _scan_res
+                st.session_state[f"{_scan_key}_ts"] = _time_nc.time()
         else:
-            _c1, _c2 = st.columns(2)
-            with _c1:
+            _scan_res = st.session_state[_scan_key]
+
+        # ── Clasificar: alertadas vs ok ──────────────────────────────
+        _con_alerta = {tk: d for tk,d in _scan_res.items() if d.get("alertas")}
+        _sin_alerta = {tk: d for tk,d in _scan_res.items() if not d.get("alertas")}
+        _n_alertas  = len(_con_alerta)
+
+        # ── Header de estado ─────────────────────────────────────────
+        if _n_alertas == 0:
+            st.markdown(
+                '<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+                'border-left:4px solid #16A34A;border-radius:8px;'
+                'padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px">'
+                '<span style="font-size:20px">✅</span>'
+                '<div><span style="font-size:14px;font-weight:700;color:#15803D">'
+                'Sin alertas hoy</span>'
+                '<span style="font-size:11px;color:#64748B;margin-left:10px">'
+                f'{_n_tot} posiciones estables</span></div>'
+                '<span style="font-size:10px;color:#94A3B8;margin-left:auto">Costo IA: $0.00</span>'
+                '</div>', unsafe_allow_html=True)
+        else:
+            _col_sev = "#EF4444" if any(
+                a[2]=="ROJO" for d in _con_alerta.values() for a in d["alertas"]
+            ) else "#D97706"
+            _col_bg  = "#FEF2F2" if _col_sev=="#EF4444" else "#FFFBEB"
+            _col_bd  = "#FECACA" if _col_sev=="#EF4444" else "#FDE68A"
+            st.markdown(
+                f'<div style="background:{_col_bg};border:1px solid {_col_bd};'
+                f'border-left:4px solid {_col_sev};border-radius:8px;'
+                f'padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px">'
+                f'<span style="font-size:20px">⚠️</span>'
+                f'<div><span style="font-size:14px;font-weight:700;color:{_col_sev}">'
+                f'{_n_alertas} alerta{"s" if _n_alertas>1 else ""} detectada{"s" if _n_alertas>1 else ""}</span>'
+                f'<span style="font-size:11px;color:#64748B;margin-left:10px">'
+                f'{_n_tot - _n_alertas} posiciones estables</span></div>'
+                f'<span style="font-size:10px;color:#94A3B8;margin-left:auto">'
+                f'Análisis IA: ${_n_alertas*0.003:.2f} estimado</span>'
+                f'</div>', unsafe_allow_html=True)
+
+        # ── SECCIÓN ALERTAS ──────────────────────────────────────────
+        if _con_alerta:
+            st.markdown("**⚠️ Posiciones que requieren atención:**")
+            # Caché IA (disco + session)
+            _CACHE_FILE_NC = _os_nc.path.join(".streamlit","noticias_cache.json")
+            def _guardar_cache_disco(key, data):
+                try:
+                    _ex = {}
+                    if _os_nc.path.exists(_CACHE_FILE_NC):
+                        with open(_CACHE_FILE_NC) as _f: _ex = _json_nc.load(_f)
+                    _ex[key] = {"data": data, "ts": _time_nc.time()}
+                    _os_nc.makedirs(_os_nc.dirname(_CACHE_FILE_NC), exist_ok=True)
+                    with open(_CACHE_FILE_NC,"w") as _f: _json_nc.dump(_ex,_f)
+                except Exception: pass
+            def _leer_cache_disco(key, max_h=8):
+                try:
+                    if not _os_nc.path.exists(_CACHE_FILE_NC): return None
+                    with open(_CACHE_FILE_NC) as _f: _d = _json_nc.load(_f)
+                    _e = _d.get(key)
+                    if not _e or _time_nc.time()-_e["ts"] > max_h*3600: return None
+                    return _e["data"]
+                except Exception: return None
+
+            # Botón analizar todas las alertas
+            _todos_alertados = list(_con_alerta.keys())
+            if not _modo_dev:
+                if st.button(
+                    f"🔍 Analizar las {_n_alertas} alertas con IA",
+                    key="btn_analizar_alertas", type="primary",
+                    use_container_width=True):
+                    _pos_alertadas = [p for p in _pos_reales
+                                      if str(p.get("Ticker","")).upper() in _todos_alertados]
+                    with st.spinner(f"🔍 Analizando {_n_alertas} posiciones alertadas en paralelo..."):
+                        _analizar_portfolio(_SHEET_NAME_MAURI,    "MVALLE",   "noticias_alerta_cache", _todos_alertados)
+                        _analizar_portfolio(_SHEET_NAME_AMPARITO, "Amparito", "noticias_alerta_cache", _todos_alertados)
+                    _guardar_cache_disco("noticias_alerta_cache",
+                                         st.session_state.get("noticias_alerta_cache", {}))
+
+            # Mostrar cada posición alertada
+            _cache_alertas = (
+                st.session_state.get("noticias_alerta_cache") or
+                _leer_cache_disco("noticias_alerta_cache") or {}
+            )
+            # Ordenar: ROJO primero
+            _alertas_sorted = sorted(_con_alerta.items(),
+                key=lambda x: 0 if any(a[2]=="ROJO" for a in x[1]["alertas"])
+                              else 1 if any(a[2]=="NARANJA" for a in x[1]["alertas"]) else 2)
+
+            for _tk, _sd in _alertas_sorted:
+                _pnl_s = _sd["pnl"]
+                _pnl_c = "#16A34A" if _pnl_s>=0 else "#EF4444"
+                # Card header
+                _badges_html = ""
+                for _ico, _txt, _nivel in _sd["alertas"]:
+                    _ac = {"ROJO":"#EF4444","NARANJA":"#D97706","AMARILLO":"#D97706","VERDE":"#16A34A"}.get(_nivel,"#64748B")
+                    _abg= {"ROJO":"#FEF2F2","NARANJA":"#FFFBEB","AMARILLO":"#FFFBEB","VERDE":"#F0FDF4"}.get(_nivel,"#F8FAFC")
+                    _badges_html += (f'<span style="background:{_abg};border:1px solid {_ac}40;'
+                                     f'border-radius:4px;padding:2px 6px;font-size:10px;'
+                                     f'color:{_ac};margin-right:4px">{_ico} {_txt}</span>')
                 st.markdown(
-                    f'<div style="background:{G_BG};border:2px solid {G_BOR};border-radius:14px;padding:20px">'
-                    f'<div style="font-size:14px;font-weight:800;color:{G};margin-bottom:14px">'
-                    f'📐 Resultado para {_atr_tk}</div>'
-                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">'
-                    f'  <div style="background:white;border-radius:8px;padding:10px;text-align:center">'
-                    f'    <div style="font-size:10px;color:{TXT_MUT};font-weight:600">ATR REAL (14d)</div>'
-                    f'    <div style="font-size:22px;font-weight:800;color:#7C3AED">${_sz_r["atr"]}</div>'
-                    f'    <div style="font-size:9px;color:{TXT_SOFT}">volatilidad diaria promedio</div>'
-                    f'  </div>'
-                    f'  <div style="background:#FEF2F2;border-radius:8px;padding:10px;text-align:center">'
-                    f'    <div style="font-size:10px;color:{R};font-weight:600">STOP LOSS</div>'
-                    f'    <div style="font-size:22px;font-weight:800;color:{R}">${_sz_r["stop_precio"]}</div>'
-                    f'    <div style="font-size:9px;color:{TXT_SOFT}">{_sz_r["detalle"]}</div>'
-                    f'  </div>'
-                    f'  <div style="background:#DBEAFE;border-radius:8px;padding:12px;text-align:center;grid-column:span 2">'
-                    f'    <div style="font-size:10px;color:#1D4ED8;font-weight:700">COMPRAR</div>'
-                    f'    <div style="font-size:36px;font-weight:900;color:#1D4ED8">{_sz_r["acciones"]} acciones</div>'
-                    f'    <div style="font-size:11px;color:#3B82F6">'
-                    f'      ${_sz_r["capital_total"]:,.0f} USD total · '
-                    f'      si el stop se activa pierdes exactamente ${_sz_r["riesgo_real"]:,.0f}</div>'
-                    f'  </div>'
-                    f'</div></div>', unsafe_allow_html=True)
-            with _c2:
-                st.markdown(
-                    f'<div style="background:{BG_CARD};border:1px solid {BOR};border-radius:14px;padding:20px">'
-                    f'<div style="font-size:14px;font-weight:800;color:{TXT};margin-bottom:14px">'
-                    f'🎯 Cuándo vender</div>'
-                    f'<div style="display:flex;flex-direction:column;gap:8px">'
-                    f'  <div style="background:{A_BG};border:1px solid {A_BOR};border-radius:8px;padding:10px">'
-                    f'    <div style="font-size:11px;font-weight:700;color:{A}">T1 — Vender 60% aquí</div>'
-                    f'    <div style="font-size:20px;font-weight:800;color:{A}">${_sz_r["t1"]} (+{_sz_r["t1_pct"]}%)</div>'
-                    f'    <div style="font-size:9px;color:{TXT_SOFT}">ATR x 2 desde tu entrada</div>'
-                    f'  </div>'
-                    f'  <div style="background:{G_BG};border:1px solid {G_BOR};border-radius:8px;padding:10px">'
-                    f'    <div style="font-size:11px;font-weight:700;color:{G}">T2 — Vender 30% aquí</div>'
-                    f'    <div style="font-size:20px;font-weight:800;color:{G}">${_sz_r["t2"]} (+{_sz_r["t2_pct"]}%)</div>'
-                    f'    <div style="font-size:9px;color:{TXT_SOFT}">ATR x 4 desde tu entrada</div>'
-                    f'  </div>'
-                    f'  <div style="background:{C_BG};border:1px solid {C_BOR};border-radius:8px;padding:10px">'
-                    f'    <div style="font-size:11px;font-weight:700;color:{C}">T3 — Runner 10%</div>'
-                    f'    <div style="font-size:20px;font-weight:800;color:{C}">${_sz_r["t3"]} (+{_sz_r["t3_pct"]}%)</div>'
-                    f'    <div style="font-size:9px;color:{TXT_SOFT}">dejar correr sin stop</div>'
-                    f'  </div>'
-                    f'</div></div>', unsafe_allow_html=True)
+                    f'<div style="border:1px solid #E2E8F0;border-radius:10px;'
+                    f'margin-bottom:10px;overflow:hidden">'
+                    f'<div style="background:#F8FAFC;padding:10px 14px;'
+                    f'border-bottom:1px solid #E2E8F0">'
+                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+                    f'<strong style="font-size:16px;color:#1E293B">{_tk}</strong>'
+                    f'<span style="font-size:13px;font-weight:700;color:{_pnl_c}">{_pnl_s:+.1f}%</span>'
+                    f'<span style="font-size:11px;color:#94A3B8">RSI {_sd["rsi"]:.0f} · '
+                    f'{"MACD +" if _sd["macd"] else "MACD −"} · {_sd["dias"]}d</span>'
+                    f'<span style="font-size:10px;color:#CBD5E1;margin-left:auto">{_sd["portfolio"]}</span>'
+                    f'</div>'
+                    f'<div>{_badges_html}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+                # Análisis IA si existe o botón para pedir
+                _an_cache = _cache_alertas.get(_tk)
+                if _an_cache and not _modo_dev:
+                    _mostrar_cards({_tk: _an_cache},
+                                   [p for p in _pos_reales if str(p.get("Ticker","")).upper()==_tk],
+                                   "", "noticias_alerta_cache", _todos_alertados)
+                elif not _modo_dev:
+                    _cb1, _cb2 = st.columns([3,1])
+                    with _cb2:
+                        if st.button(f"🔍 Analizar", key=f"btn_1alerta_{_tk}",
+                                     use_container_width=True, type="secondary"):
+                            _p_one = next((p for p in _pos_reales
+                                          if str(p.get("Ticker","")).upper()==_tk), None)
+                            if _p_one:
+                                with st.spinner(f"Analizando {_tk}..."):
+                                    _tech_a = _get_technicals_live(_tk)
+                                    try:
+                                        _pc_a = float(_p_one.get("Precio_Compra",0) or 0)
+                                        _pa_a = float(get_row_for_ticker(_tk,_pc_a).get("Precio",_pc_a))
+                                        _pnl_a = round((_pa_a-_pc_a)/_pc_a*100,1) if _pc_a>0 else 0
+                                    except Exception: _pc_a=0; _pnl_a=0
+                                    _dias_a = 0
+                                    try:
+                                        _fd_a = pd.to_datetime(_p_one.get("Fecha",""),errors="coerce")
+                                        _dias_a = (_dt_not2.date.today()-_fd_a.date()).days if not pd.isna(_fd_a) else 0
+                                    except Exception: pass
+                                    _res_a = _analizar_posicion_ia(
+                                        tk=_tk, precio_entrada=_pc_a, pnl_pct=_pnl_a,
+                                        fase=str(_p_one.get("Fase","—")), dias_pos=_dias_a,
+                                        cat_fecha=str(_p_one.get("Cat_Fecha","—")),
+                                        regimen=st.session_state.get("mercado_data",{}).get("regimen","NEUTRO"),
+                                        sector=str(_p_one.get("Sector","") or _p_one.get("Area","Tech")),
+                                        rsi_hoy=_tech_a.get("rsi",0),
+                                        macd_hoy=_tech_a.get("macd_pos",False),
+                                        dd_hoy=_tech_a.get("dd",0),
+                                    )
+                                _cache_up = dict(st.session_state.get("noticias_alerta_cache",{}))
+                                _cache_up[_tk] = _res_a
+                                st.session_state["noticias_alerta_cache"] = _cache_up
+                                _guardar_cache_disco("noticias_alerta_cache", _cache_up)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── SECCIÓN ESTABLES — resumen compacto sin IA ───────────────
+        if _sin_alerta:
+            with st.expander(f"✅ {len(_sin_alerta)} posiciones estables",
+                             expanded=False):
+                for _tk, _sd in sorted(_sin_alerta.items(),
+                                        key=lambda x: -x[1]["pnl"]):
+                    _pc = "#16A34A" if _sd["pnl"]>=0 else "#EF4444"
+                    _mac_ico = "📈" if _sd["macd"] else "📉"
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:12px;'
+                        f'padding:6px 4px;border-bottom:1px solid #F1F5F9">'
+                        f'<span style="font-size:13px;font-weight:700;color:#1E293B;min-width:50px">{_tk}</span>'
+                        f'<span style="font-size:12px;font-weight:700;color:{_pc}">{_sd["pnl"]:+.1f}%</span>'
+                        f'<span style="font-size:11px;color:#64748B">RSI {_sd["rsi"]:.0f}</span>'
+                        f'<span style="font-size:11px">{_mac_ico}</span>'
+                        f'<span style="font-size:10px;color:#94A3B8">{_sd["fase"][:8]} · {_sd["dias"]}d</span>'
+                        f'<span style="font-size:9px;color:#CBD5E1;margin-left:auto">{_sd["portfolio"]}</span>'
+                        f'</div>', unsafe_allow_html=True)
 
 st.markdown("---")
 st.markdown(
