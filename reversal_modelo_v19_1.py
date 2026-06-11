@@ -998,20 +998,26 @@ def fetch_market_indicators() -> dict:
 
         # S&P 500
         try:
-            spx = yf.Ticker("^GSPC").history(period="2d")
+            spx = yf.Ticker("^GSPC").history(period="5d")
             if not spx.empty:
-                spx_now  = float(spx["Close"].iloc[-1])
-                spx_prev = float(spx["Close"].iloc[-2]) if len(spx)>=2 else spx_now
-                result["spx"] = {"val": spx_now, "chg": (spx_now-spx_prev)/spx_prev*100}
+                _spx_c = spx["Close"].dropna()
+                if len(_spx_c) >= 1:
+                    spx_now  = float(_spx_c.iloc[-1])
+                    spx_prev = float(_spx_c.iloc[-2]) if len(_spx_c) >= 2 else spx_now
+                    if spx_now == spx_now and spx_now > 0:  # NaN check
+                        result["spx"] = {"val": spx_now, "chg": (spx_now-spx_prev)/spx_prev*100}
         except Exception: pass
 
         # Nasdaq
         try:
-            ndx = yf.Ticker("^IXIC").history(period="2d")
+            ndx = yf.Ticker("^IXIC").history(period="5d")
             if not ndx.empty:
-                ndx_now  = float(ndx["Close"].iloc[-1])
-                ndx_prev = float(ndx["Close"].iloc[-2]) if len(ndx)>=2 else ndx_now
-                result["ndx"] = {"val": ndx_now, "chg": (ndx_now-ndx_prev)/ndx_prev*100}
+                _ndx_c = ndx["Close"].dropna()
+                if len(_ndx_c) >= 1:
+                    ndx_now  = float(_ndx_c.iloc[-1])
+                    ndx_prev = float(_ndx_c.iloc[-2]) if len(_ndx_c) >= 2 else ndx_now
+                    if ndx_now == ndx_now and ndx_now > 0:  # NaN check
+                        result["ndx"] = {"val": ndx_now, "chg": (ndx_now-ndx_prev)/ndx_prev*100}
         except Exception: pass
 
         # Fear & Greed aproximado via VIX (^PCALL no disponible en Yahoo)
@@ -1039,10 +1045,11 @@ def fetch_market_indicators() -> dict:
         try:
             spy = yf.Ticker("SPY").history(period="1y")
             if not spy.empty:
-                s = spy["Close"]
-                _pa_spy   = float(s.iloc[-1])
-                _p20_spy  = float(s.iloc[-20]) if len(s)>=20 else _pa_spy
-                _chg20    = round((_pa_spy-_p20_spy)/_p20_spy*100, 1)  # cambio 20 días
+                s = spy["Close"].dropna()  # eliminar NaN (pre/after-hours, días sin datos)
+                if len(s) >= 21:
+                    _pa_spy   = float(s.iloc[-1])
+                    _p20_spy  = float(s.iloc[-20]) if len(s)>=20 else _pa_spy
+                    _chg20    = round((_pa_spy-_p20_spy)/_p20_spy*100, 1)
                 # RSI
                 delta = s.diff()
                 gain  = delta.clip(lower=0).rolling(14).mean()
@@ -3508,16 +3515,16 @@ def render_resumen_sector(posiciones_lista: list, G: str, R: str, A: str,
 
     for pos in posiciones_lista:
         _tk    = str(pos.get("ticker","")).upper()
-        _pc    = float(pos.get("pc", 0) or 0)
+        _pc    = _parse_precio(pos.get("pc", 0))
         _area  = str(pos.get("area",""))
 
         # v19 FIX D: cerradas usan Precio_Salida; activas usan precio live
-        _ps    = float(pos.get("precio_salida", 0) or 0)
-        _pa    = _ps if _ps > 0 else float(pos.get("pa", 0) or _pc)
+        _ps    = _parse_precio(pos.get("precio_salida", 0))
+        _pa    = _ps if _ps > 0 else _parse_precio(pos.get("pa", 0)) or _pc
 
         # v19 FIX B+C: usar Cantidad_Activa si existe
-        _qty_act = float(pos.get("qty_activa", 0) or 0)
-        _qty     = _qty_act if _qty_act > 0 else float(pos.get("qty", 1) or 1)
+        _qty_act = _parse_precio(pos.get("qty_activa", 0))
+        _qty     = _qty_act if _qty_act > 0 else max(1.0, _parse_precio(pos.get("qty", 1)))
 
         _pnl_p = (_pa - _pc) / _pc * 100 if _pc > 0 else 0
         _area  = _normalizar_sector(_area) if _area and _area not in ("-","","nan")                  else get_sector_from_raw(_tk)
@@ -5436,7 +5443,7 @@ def generar_csv_posiciones_actualizado(posiciones_df: pd.DataFrame,
         if not mask.any():
             continue
         row = posiciones_df[mask].iloc[0]
-        qty_original = float(row.get("Cantidad", 0))
+        qty_original = _parse_precio(row.get("Cantidad", 0))
 
         # Aplicar salidas
         if "STOP" in señal or urgencia == "AHORA" and "Trailing" not in señal:
@@ -8191,6 +8198,22 @@ def _buscar_sheet_id(nombre: str) -> str:
 
 @st.cache_data(ttl=60, show_spinner=False)
 
+
+def _safe_int_pct(val, default=50):
+    """Convierte a int 0-100. Si viene como ALTA/MEDIA/BAJA (texto), mapea a número."""
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    _s = str(val).strip().upper()
+    _map = {"ALTA": 80, "MEDIA": 50, "MEDIO": 50, "BAJA": 30, "BAJO": 30}
+    if _s in _map:
+        return _map[_s]
+    try:
+        return int(float(_s.replace("%","").replace(",",".")))
+    except Exception:
+        return default
+
 def _parse_precio(val) -> float:
     """v19: Convierte precio desde Google Sheets — acepta '46,33' o '46.33'"""
     try:
@@ -9413,14 +9436,14 @@ def render_table(df_sub, show_cols, tab_key="tabla"):
         def _calc_sr(row):
             try:
                 sr = calcular_score_rebote(
-                    dd=float(row.get("DD_pico", 0)),
-                    rsi=float(row.get("RSI", 50)),
-                    vol_ratio=float(row.get("Volumen", 100)),
+                    dd=_parse_precio(row.get("DD_pico", 0)),
+                    rsi=_parse_precio(row.get("RSI", 50)) or 50,
+                    vol_ratio=_parse_precio(row.get("Volumen", 100)) or 100,
                     dias_alcistas=int(row.get("Dias_Alcistas", 0)),
-                    momentum_3d=float(row.get("MACD", 0)),
+                    momentum_3d=_parse_precio(row.get("MACD", 0)),
                     tiene_catalizador=str(row.get("Cat_Fecha","-")) not in ("-","","nan"),
                     dias_para_cat=999,
-                    beta=float(row.get("Beta", 1.5))
+                    beta=_parse_precio(row.get("Beta", 1.5)) or 1.5
                 )
                 return sr["score"], sr["nivel"], sr["detalle"]
             except Exception:
@@ -10273,6 +10296,7 @@ def scan_swing(vol_min_k: float = 200, max_results: int = 100, universo: list = 
         # Guardar metadatos de filtros v14 en attrs
         df_sw.attrs["filtro_limite_activo"] = filtro_limite_activo
         df_sw.attrs["spy_cambio_pct"] = spy_info.get("cambio_pct", 0.0)
+        df_sw.attrs["spy_precio"]     = spy_info.get("spy_ayer", 0.0)
         return df_sw
     except Exception:
         return pd.DataFrame()
@@ -10635,9 +10659,9 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
 
     # Agregar columna "Señal" con interpretación correcta según tab
     def generar_senal(row):
-        rsi  = float(row.get("RSI", 50))
-        dd   = float(row.get("DD_pico", 0))
-        vol  = float(row.get("Volumen", 100))
+        rsi  = _parse_precio(row.get("RSI", 50)) or 50
+        dd   = _parse_precio(row.get("DD_pico", 0))
+        vol  = _parse_precio(row.get("Volumen", 100)) or 100
         dec  = str(row.get("Decision",""))
 
         # Detectadas M1 - solo estados de corrección
@@ -11143,7 +11167,7 @@ if not mkt or _mkt_stale:
 col_spx, col_ndx, col_spy, col_sector, col_signal = st.columns(5)
 
 with col_spx:
-    if "spx" in mkt:
+    if "spx" in mkt and mkt["spx"].get("val") and not (mkt["spx"]["val"] != mkt["spx"]["val"]):  # NaN check
         sc = G if mkt["spx"]["chg"] >= 0 else R
         chg = mkt["spx"]["chg"]
         # Etapa S&P500
@@ -11177,7 +11201,7 @@ with col_spx:
         st.metric("S&P 500", "-")
 
 with col_ndx:
-    if "ndx" in mkt:
+    if "ndx" in mkt and mkt["ndx"].get("val") and not (mkt["ndx"]["val"] != mkt["ndx"]["val"]):  # NaN check
         nc = G if mkt["ndx"]["chg"] >= 0 else R
         chg_n = mkt["ndx"]["chg"]
         # Etapa Nasdaq
@@ -11209,7 +11233,7 @@ with col_ndx:
         st.metric("Nasdaq", "-")
 
 with col_spy:
-    if "spy" in mkt:
+    if "spy" in mkt and mkt["spy"].get("rsi") and not (mkt["spy"]["rsi"] != mkt["spy"]["rsi"]):  # NaN check
         spy_d = mkt["spy"]
         _rsi_spy = spy_d["rsi"]
         # v18 fix: umbrales calibrados al comportamiento real del S&P500
@@ -11239,11 +11263,13 @@ with col_spy:
             spy_desc = "🔴 Sobrecompra extrema"
             spy_tip  = "RSI >76 ocurre solo el 5% del tiempo. Reducir exposición nueva en ETF. Acciones individuales: stops ajustados."
         ec = R if "bajo" in spy_d["ema_status"] else G
+        _spy_precio = spy_d.get("precio", 0)
         st.markdown(
             f'<div style="background:{BG_CARD};border:1px solid {BOR};border-radius:10px;'
             f'padding:10px 14px" title="{spy_tip}">'
-            f'<div style="font-size:10px;color:{TXT_MUT};font-weight:600">SPY — S&P500 ETF</div>'
-            f'<div style="font-size:18px;font-weight:800;color:{rc}">{_rsi_spy}</div>'
+            f'<div style="font-size:10px;color:{TXT_MUT};font-weight:600">SPY — S&P500 ETF '
+            f'<span style="color:{TXT_SOFT};font-weight:400">(${_spy_precio:,.2f})</span></div>'
+            f'<div style="font-size:18px;font-weight:800;color:{rc}">RSI {_rsi_spy}</div>'
             f'<div style="font-size:10px;color:{rc};font-weight:600">{spy_desc}</div>'
             f'<div style="font-size:9px;color:{ec};margin-top:3px">{spy_d["ema_status"]}</div>'
             f'<div style="font-size:8px;color:{TXT_SOFT};margin-top:2px;line-height:1.4">{spy_tip}</div>'
@@ -12138,13 +12164,15 @@ with tab2:
     elif sw_result.empty and sw_result.attrs.get("spy_filtro_activo"):
         # ── Banner: filtro SPY activo (mercado cayó ayer) ────
         cambio_spy = sw_result.attrs.get("spy_cambio_pct", 0.0)
+        precio_spy = sw_result.attrs.get("spy_ayer", 0.0)
         st.markdown(
             f'<div style="background:{R_BG};border:2px solid {R_BOR};border-radius:12px;'+
             f'padding:20px 24px;margin-bottom:12px">'+
             f'<div style="font-size:15px;font-weight:800;color:{R};margin-bottom:6px">'+
             f'🛑 FILTRO SPY ACTIVO - Señales M2 bloqueadas</div>'+
             f'<div style="font-size:13px;color:{TXT}">'+
-            f'SPY cerró <strong>{cambio_spy:+.2f}%</strong> ayer - mercado en rojo.'+
+            f'SPY cerró en <strong>${precio_spy:,.2f}</strong> '+
+            f'(<strong>{cambio_spy:+.2f}%</strong>) ayer - mercado en rojo.'+
             f'<br>El modelo bloquea señales M2 cuando el mercado bajó el día anterior.</div>'+
             f'<div style="font-size:11px;color:{TXT_MUT};margin-top:8px">'+
             f'📖 Regla v14: SPY ayer < SPY anteayer -> no entrar en swings. '+
@@ -12155,6 +12183,7 @@ with tab2:
         _spy_ctx2 = get_spy_filtro()
         _spy_rsi2 = _spy_ctx2.get("spy_rsi", 55)
         _spy_pct2 = _spy_ctx2.get("cambio_pct", 0)
+        _spy_pre2 = _spy_ctx2.get("spy_ayer", 0)
         _dd_ctx2  = _spy_ctx2.get("dd_min_adaptativo", -15)
         _fase_msg = (
             "📈 Mercado en fase **alcista** — correcciones menos profundas de lo normal."
@@ -12180,7 +12209,7 @@ with tab2:
             f'corrija, las señales Swing aparecerán automáticamente.'
             f'</div>'
             f'<div style="margin-top:8px;font-size:10px;color:#9CA3AF">'
-            f'SPY RSI {_spy_rsi2:.0f} · Cambio ayer {_spy_pct2:+.1f}% · '
+            f'SPY ${_spy_pre2:,.2f} · RSI {_spy_rsi2:.0f} · Cambio ayer {_spy_pct2:+.1f}% · '
             f'DD mínimo activo: {_dd_ctx2:.0f}%'
             f'</div></div>',
             unsafe_allow_html=True)
@@ -12198,10 +12227,11 @@ with tab2:
                 f'Se muestran las 5 con mayor Score Rebote.</div>'+
                 f'</div>', unsafe_allow_html=True)
         # ── SPY badge positivo ───────────────────────────────
-        spy_delta = sw_result.attrs.get("spy_cambio_pct", 0.0)
+        spy_delta  = sw_result.attrs.get("spy_cambio_pct", 0.0)
+        spy_precio2= sw_result.attrs.get("spy_precio", 0.0)
         st.markdown(
             f'<div style="font-size:11px;color:{G};margin-bottom:10px;font-weight:600">'+
-            f'✅ Filtro SPY: mercado positivo ({spy_delta:+.2f}% ayer)  - '+
+            f'✅ Filtro SPY: mercado positivo (${spy_precio2:,.2f} · {spy_delta:+.2f}% ayer)  - '+
             f'Señales M2 habilitadas  - v14</div>',
             unsafe_allow_html=True)
 
@@ -14678,7 +14708,7 @@ También puedes descargar la plantilla de abajo y completarla.
         def _prioridad_pos(row):
             try:
                 import yfinance as _yf_ord
-                _pc = float(row.get("Precio_Compra", 0))
+                _pc = _parse_precio(row.get("Precio_Compra", 0))
                 _pa = float(_yf_ord.Ticker(str(row["Ticker"]).upper()).fast_info.last_price or _pc)
                 _pnl = (_pa - _pc) / _pc * 100 if _pc > 0 else 0
                 _cat = str(row.get("Cat_Fecha", "-"))
@@ -15452,7 +15482,7 @@ También puedes descargar la plantilla de abajo y completarla.
                     # v18 fix: unique key suffix to avoid duplicate widget keys
                     _tk_key = f"{tk}_b{_gloop_idx_b}"  # "b" prefix distinguishes from loop1
                     pc  = _parse_precio(pos["Precio_Compra"])
-                    qty = float(pos.get("Cantidad", 1))
+                    qty = max(1.0, _parse_precio(pos.get("Cantidad", 1)))
                     r   = get_row_for_ticker(tk, pc)
                     pa  = float(r["Precio"])
                     pnl_e = round((pa - pc) / pc * 100, 2) if pc > 0 else 0
@@ -15579,7 +15609,7 @@ También puedes descargar la plantilla de abajo y completarla.
                 rows_actualizado = []
                 for row_e in export_rows:
                     señal = row_e["Senal_v12"].lower()
-                    qty_orig = float(row_e["Cantidad"])
+                    qty_orig = _parse_precio(row_e.get("Cantidad", 1))
 
                     if "stop" in señal or "stop activado" in señal:
                         continue  # posición cerrada - no incluir
@@ -15653,7 +15683,7 @@ También puedes descargar la plantilla de abajo y completarla.
                     else []):
             _tkg  = str(_rg.get("Ticker","")).upper().strip()
             _pcg  = _parse_precio(_rg.get("Precio_Compra",0))
-            _qtg  = float(_rg.get("Cantidad",1) or 1)
+            _qtg  = max(1.0, _parse_precio(_rg.get("Cantidad", 1)))
             _fsg  = str(_rg.get("Fecha_Salida","-")).strip()
             _esta_cerrada_g = _fsg not in ("-","","nan","NaT","None")
             if _filtro_greko == "activas" and _esta_cerrada_g:
@@ -15824,6 +15854,386 @@ with tab_score:
             return {"chg30":round(float((_h.iloc[-1]-_h.iloc[0])/_h.iloc[0]*100),1),"ok":True}
         except Exception: return {"chg30":0,"ok":False}
 
+    # ── C-SCORE: Calidad del Catalizador (v19.3) ─────────────────────
+    # Combina técnica con narrativa · 0-100 · complementa Score MVALLE
+    # Fase 1: componentes gratuitos yfinance (C1,C2,C4,C6,C7,C8)
+    # Fase 2: componentes IA (C3,C5) — opcionales, llamados con botón
+
+    _SECTOR_NARRATIVA_2026 = {
+        # Sectores ganadores 2026
+        "ai":15,"cloud":15,"neocloud":15,"nebius":15,"data center":15,
+        "semiconductor":12,"chip":12,"nvidia":12,
+        "solar":12,"clean energy":12,"renewable":12,
+        "defense":12,"aerospace":12,"defense contractor":12,
+        "biotech":8,"pharma":8,           # neutral-positivo
+        "healthcare":8,"medtech":8,
+        "industrial":7,"manufacturing":7,
+        "financial":6,"bank":6,
+        # Sectores adversos 2026
+        "saas":3,"software":4,            # AI cannibalization
+        "it consulting":2,"consulting":2, # ACN/GLOB presión
+        "telecom":3,"wireless":3,         # VZ/TMUS
+        "consumer":4,"luxury":3,          # EL adverso
+        "retail":4,
+        "oil":5,"gas":5,"energy":5,       # fuera del universo preferido
+    }
+
+    def _get_sector_score(sector_str):
+        _s = str(sector_str or "").lower()
+        for _kw, _pts in _SECTOR_NARRATIVA_2026.items():
+            if _kw in _s: return _pts
+        return 7  # default neutro
+
+    _MACRO_CALENDAR = [
+        # Históricos 2026 (fechas reales aproximadas — calendario estándar BLS/FOMC)
+        {"fecha":"2026-01-13","tipo":"CPI",  "impacto":"ALTO"},
+        {"fecha":"2026-01-28","tipo":"FED",  "impacto":"ALTO"},
+        {"fecha":"2026-02-06","tipo":"JOBS", "impacto":"ALTO"},
+        {"fecha":"2026-02-11","tipo":"CPI",  "impacto":"ALTO"},
+        {"fecha":"2026-03-06","tipo":"JOBS", "impacto":"ALTO"},
+        {"fecha":"2026-03-11","tipo":"CPI",  "impacto":"ALTO"},
+        {"fecha":"2026-03-18","tipo":"FED",  "impacto":"ALTO"},
+        {"fecha":"2026-04-03","tipo":"JOBS", "impacto":"ALTO"},
+        {"fecha":"2026-04-10","tipo":"CPI",  "impacto":"ALTO"},
+        {"fecha":"2026-04-29","tipo":"FED",  "impacto":"ALTO"},
+        {"fecha":"2026-05-01","tipo":"JOBS", "impacto":"ALTO"},
+        {"fecha":"2026-05-13","tipo":"CPI",  "impacto":"ALTO"},
+        {"fecha":"2026-05-29","tipo":"PCE",  "impacto":"MEDIO"},
+        {"fecha":"2026-06-05","tipo":"JOBS", "impacto":"ALTO"},
+        # Próximos eventos macro con fecha y tipo
+        {"fecha":"2026-06-10","tipo":"CPI",  "impacto":"ALTO"},
+        {"fecha":"2026-06-17","tipo":"FED",  "impacto":"ALTO"},
+        {"fecha":"2026-06-25","tipo":"PCE",  "impacto":"MEDIO"},
+        {"fecha":"2026-07-07","tipo":"JOBS", "impacto":"ALTO"},
+        {"fecha":"2026-07-08","tipo":"CPI",  "impacto":"ALTO"},
+        {"fecha":"2026-07-29","tipo":"FED",  "impacto":"ALTO"},
+    ]
+
+    def _get_macro_penalty_for_date(fecha_ref, beta):
+        """Versión histórica: penalización macro para una fecha específica del pasado."""
+        import datetime as _dt_mc2
+        for _ev in _MACRO_CALENDAR:
+            try:
+                _ev_date = _dt_mc2.date.fromisoformat(_ev["fecha"])
+                _dias_ev = (_ev_date - fecha_ref).days
+                if 0 <= _dias_ev <= 2:
+                    _beta_mult = min(float(beta or 1.0), 3.0)
+                    if _ev["impacto"] == "ALTO":
+                        return round(-10 * min(_beta_mult / 1.5, 2.0))
+                    return round(-5 * min(_beta_mult / 1.5, 2.0))
+            except Exception: pass
+        return 0
+
+    def _get_macro_penalty(beta):
+        """Penalización si hay dato macro en ≤2 días · amplificada por beta."""
+        import datetime as _dt_mc
+        _hoy_mc = _dt_mc.date.today()
+        for _ev in _MACRO_CALENDAR:
+            try:
+                _ev_date = _dt_mc.date.fromisoformat(_ev["fecha"])
+                _dias_ev = (_ev_date - _hoy_mc).days
+                if 0 <= _dias_ev <= 2:
+                    _beta_mult = min(float(beta or 1.0), 3.0)
+                    if _ev["impacto"] == "ALTO":
+                        return round(-10 * min(_beta_mult / 1.5, 2.0))
+                    return round(-5 * min(_beta_mult / 1.5, 2.0))
+            except Exception: pass
+        return 0
+
+    def _calcular_c_score_free(ticker, sector, beta=1.0):
+        """
+        C-Score Fase 1 — solo yfinance, $0.00, ~3 seg por ticker.
+        
+        C1 Earning timing    0-25pts  más predictivo del dataset
+        C2 Calidad earn      0-20pts  EPS surprise histórico
+        C4 Sector narrativa  0-15pts  régimen sectorial 2026
+        C6 Insider activity  0-10pts  compras vs ventas recientes
+        C7 Volumen momentum  0-10pts  dinero real detrás del movimiento
+        C8 Macro penalty     0 a -10  dato macro en ≤2 días × beta
+        
+        C3+C5 (analistas+deals) se calculan con IA al presionar botón
+        """
+        import datetime as _dt_cs
+        _resultado = {
+            "c_total": 0, "c1": 0, "c2": 0, "c4": 0,
+            "c6": 0, "c7": 0, "c8": 0, "c3": 0, "c5": 0,
+            "earn_dias": None, "earn_surprise": None,
+            "vol_ratio": 0, "insider_flag": "NEUTRO",
+            "detalle": {}, "ok": False
+        }
+        try:
+            import yfinance as _yf_cs
+            _tk_obj = _yf_cs.Ticker(ticker)
+            _info   = _tk_obj.info or {}
+            _hist   = _tk_obj.history(period="30d")["Close"].dropna()
+            _vol_h  = _tk_obj.history(period="30d")["Volume"].dropna()
+
+            # ── C1: Earning timing (0-25pts) ──────────────────────────
+            _c1, _earn_dias = 0, None
+            try:
+                _et = _info.get("earningsTimestamp") or _info.get("earningsTimestampStart")
+                if _et:
+                    _earn_date = _dt_cs.date.fromtimestamp(int(_et))
+                    _earn_dias = (_earn_date - _dt_cs.date.today()).days
+                    if 0 <= _earn_dias <= 2:   _c1 = 0    # riesgo binario
+                    elif _earn_dias <= 7:       _c1 = 25   # zona dorada
+                    elif _earn_dias <= 15:      _c1 = 18   # muy bueno
+                    elif _earn_dias <= 30:      _c1 = 8    # moderado
+                    else:                       _c1 = 0
+                else:
+                    # post-earn reciente ≤10 días
+                    _et_last = _info.get("earningsTimestampEnd")
+                    if _et_last:
+                        _last_earn = _dt_cs.date.fromtimestamp(int(_et_last))
+                        _dias_post = (_dt_cs.date.today() - _last_earn).days
+                        if _dias_post <= 10: _c1 = 12
+            except Exception: pass
+
+            # ── C2: Calidad último earn — EPS surprise (0-20pts) ──────
+            _c2, _earn_surp = 0, None
+            try:
+                _eps_est = _info.get("epsForward") or _info.get("epsCurrentYear")
+                _eps_act = _info.get("epsTrailingTwelveMonths")
+                if _eps_est and _eps_act and _eps_est != 0:
+                    _surp = (_eps_act - _eps_est) / abs(_eps_est) * 100
+                    _earn_surp = round(_surp, 1)
+                    if _surp > 20:    _c2 = 20
+                    elif _surp > 10:  _c2 = 15
+                    elif _surp > 0:   _c2 = 10
+                    elif _surp > -10: _c2 = 5
+                    else:             _c2 = 0
+                else:
+                    # Fallback: earningsGrowth
+                    _eg = _info.get("earningsGrowth") or 0
+                    if _eg > 0.30:   _c2 = 15
+                    elif _eg > 0.10: _c2 = 10
+                    elif _eg > 0:    _c2 = 5
+            except Exception: pass
+
+            # ── C4: Narrativa sectorial 2026 (0-15pts) ─────────────────
+            _c4 = _get_sector_score(sector)
+
+            # ── C6: Insider activity (0-10pts) ─────────────────────────
+            _c6, _insider_flag = 5, "NEUTRO"  # default neutro
+            try:
+                _insiders = _tk_obj.insider_transactions
+                if _insiders is not None and not _insiders.empty:
+                    # Últimos 90 días
+                    _recientes = _insiders.head(10)
+                    _compras = sum(1 for _, r in _recientes.iterrows()
+                                   if str(r.get("Transaction","")).upper() in
+                                   ("BUY","PURCHASE","ACQUISITION"))
+                    _ventas  = sum(1 for _, r in _recientes.iterrows()
+                                   if str(r.get("Transaction","")).upper() in
+                                   ("SELL","SALE","DISPOSITION"))
+                    if _compras > 0 and _ventas == 0:
+                        _c6 = 10; _insider_flag = "COMPRA"
+                    elif _compras >= _ventas:
+                        _c6 = 7;  _insider_flag = "NEUTRO_POS"
+                    elif _ventas > 5:
+                        _c6 = 0;  _insider_flag = "VENTA_MASIVA"
+                    elif _ventas > _compras:
+                        _c6 = 3;  _insider_flag = "VENTA"
+            except Exception: pass
+
+            # ── C7: Volumen momentum (0-10pts) ─────────────────────────
+            _c7, _vol_ratio = 0, 0.0
+            try:
+                if len(_vol_h) >= 10 and len(_hist) >= 5:
+                    _vol_avg = float(_vol_h.iloc[:-1].mean())
+                    _vol_hoy = float(_vol_h.iloc[-1])
+                    _precio_chg = float(
+                        (_hist.iloc[-1] - _hist.iloc[-2]) / _hist.iloc[-2] * 100
+                    ) if len(_hist) >= 2 else 0
+                    _vol_ratio = round(_vol_hoy / _vol_avg, 2) if _vol_avg > 0 else 1.0
+                    # Volumen alto + precio sube = momentum real
+                    if _vol_ratio > 2.0 and _precio_chg > 0:  _c7 = 10
+                    elif _vol_ratio > 1.5 and _precio_chg > 0: _c7 = 7
+                    elif _vol_ratio > 1.2:                      _c7 = 5
+                    elif _vol_ratio > 0.8:                      _c7 = 3
+                    else:                                        _c7 = 1
+            except Exception: pass
+
+            # ── C8: Macro alignment (penalización) ─────────────────────
+            _c8 = _get_macro_penalty(beta)
+
+            # ── Total Fase 1 ────────────────────────────────────────────
+            _total_f1 = _c1 + _c2 + _c4 + _c6 + _c7 + _c8
+            # Normalizar a 0-100 sobre el máximo posible de fase 1 (80pts)
+            _c_norm = round(min(100, max(0, _total_f1 / 80 * 100)))
+
+            _resultado.update({
+                "c_total": _c_norm, "c_total_raw": _total_f1,
+                "c1": _c1, "c2": _c2, "c4": _c4,
+                "c6": _c6, "c7": _c7, "c8": _c8,
+                "earn_dias": _earn_dias, "earn_surprise": _earn_surp,
+                "vol_ratio": _vol_ratio, "insider_flag": _insider_flag,
+                "ok": True,
+                "detalle": {
+                    "earn_timing":   f"C1={_c1}pts · earn en {_earn_dias}d" if _earn_dias is not None else f"C1={_c1}pts",
+                    "earn_calidad":  f"C2={_c2}pts · EPS surprise {_earn_surp}%" if _earn_surp else f"C2={_c2}pts",
+                    "sector":        f"C4={_c4}pts · {sector[:20] if sector else '—'}",
+                    "insider":       f"C6={_c6}pts · {_insider_flag}",
+                    "volumen":       f"C7={_c7}pts · vol ratio {_vol_ratio:.1f}×",
+                    "macro":         f"C8={_c8}pts · CPI/Fed penalty" if _c8 < 0 else "C8=0pts · sin evento próximo",
+                }
+            })
+        except Exception as _ex:
+            _resultado["error"] = str(_ex)[:50]
+        return _resultado
+
+    def _calcular_c_score_historico(ticker, fecha_entrada, sector="", beta=1.0):
+        """
+        C-Score RETROACTIVO — calcula qué C-Score habría tenido el ticker
+        el día de la entrada (fecha_entrada: datetime.date).
+        Usa solo componentes reconstruibles con datos históricos:
+        C1 (earnings timing), C2 (EPS surprise último earn antes de entrada),
+        C4 (sector — estático), C6 (insider antes de entrada),
+        C7 (volumen el día de entrada vs promedio 30d previos),
+        C8 (macro penalty para esa fecha).
+        C3 y C5 (analistas/deals) NO son reconstruibles → excluidos (igual que Fase 1).
+        """
+        import datetime as _dt_h
+        _resultado = {
+            "c_total": None, "c1":0,"c2":0,"c4":0,"c6":0,"c7":0,"c8":0,
+            "earn_dias": None, "earn_surprise": None,
+            "vol_ratio": 0, "insider_flag":"NEUTRO", "ok": False
+        }
+        try:
+            import yfinance as _yf_h
+            _tk_obj = _yf_h.Ticker(ticker)
+            if isinstance(fecha_entrada, str):
+                fecha_entrada = _dt_h.date.fromisoformat(fecha_entrada[:10])
+
+            # ── C1 + C2: earnings históricos ──────────────────────────
+            _c1, _c2, _earn_dias, _earn_surp = 0, 0, None, None
+            try:
+                _eds = _tk_obj.get_earnings_dates(limit=20)
+                if _eds is not None and not _eds.empty:
+                    _eds = _eds.sort_index()
+                    _idx_dates = [d.date() if hasattr(d,"date") else d for d in _eds.index]
+                    # earn más cercano (futuro o pasado) respecto a fecha_entrada
+                    _diffs = [(d - fecha_entrada).days for d in _idx_dates]
+                    _abs_diffs = [abs(d) for d in _diffs]
+                    _i_min = _abs_diffs.index(min(_abs_diffs))
+                    _earn_dias = _diffs[_i_min]
+                    if 0 <= _earn_dias <= 2:   _c1 = 0
+                    elif 0 < _earn_dias <= 7:  _c1 = 25
+                    elif 0 < _earn_dias <= 15: _c1 = 18
+                    elif 0 < _earn_dias <= 30: _c1 = 8
+                    elif -10 <= _earn_dias < 0: _c1 = 12  # post-earn reciente
+                    else: _c1 = 0
+
+                    # C2: surprise del earn MÁS RECIENTE ANTES de la entrada
+                    _past = [(d, i) for i, d in enumerate(_idx_dates) if d <= fecha_entrada]
+                    if _past:
+                        _d_last, _i_last = max(_past, key=lambda x: x[0])
+                        _row = _eds.iloc[_i_last]
+                        _surp = _row.get("Surprise(%)", None)
+                        if _surp is not None and _surp == _surp:  # not NaN
+                            _earn_surp = round(float(_surp)*100 if abs(_surp)<1 else float(_surp), 1)
+                            if _earn_surp > 20:    _c2 = 20
+                            elif _earn_surp > 10:  _c2 = 15
+                            elif _earn_surp > 0:   _c2 = 10
+                            elif _earn_surp > -10: _c2 = 5
+                            else:                  _c2 = 0
+            except Exception: pass
+
+            # ── C4: sector (estático, usa clasificación actual) ────────
+            _c4 = _get_sector_score(sector)
+            if _c4 == 7 and not sector:
+                try:
+                    _info_h = _tk_obj.info or {}
+                    _sector_h = _info_h.get("sector","") or _info_h.get("industry","")
+                    _c4 = _get_sector_score(_sector_h)
+                except Exception: pass
+
+            # ── C6: insider activity ANTES de la entrada ───────────────
+            _c6, _insider_flag = 5, "NEUTRO"
+            try:
+                _ins = _tk_obj.insider_transactions
+                if _ins is not None and not _ins.empty and "Start Date" in _ins.columns:
+                    _ins2 = _ins.copy()
+                    _ins2["_d"] = pd.to_datetime(_ins2["Start Date"], errors="coerce").dt.date
+                    _ins2 = _ins2[_ins2["_d"] <= fecha_entrada].head(10)
+                    if not _ins2.empty:
+                        _compras = sum(1 for _,r in _ins2.iterrows()
+                                       if str(r.get("Transaction","")).upper() in ("BUY","PURCHASE","ACQUISITION"))
+                        _ventas  = sum(1 for _,r in _ins2.iterrows()
+                                       if str(r.get("Transaction","")).upper() in ("SELL","SALE","DISPOSITION"))
+                        if _compras > 0 and _ventas == 0: _c6=10; _insider_flag="COMPRA"
+                        elif _compras >= _ventas:          _c6=7;  _insider_flag="NEUTRO_POS"
+                        elif _ventas > 5:                   _c6=0;  _insider_flag="VENTA_MASIVA"
+                        elif _ventas > _compras:            _c6=3;  _insider_flag="VENTA"
+            except Exception: pass
+
+            # ── C7: volumen el día de entrada vs 30d previos ───────────
+            _c7, _vol_ratio = 0, 0.0
+            try:
+                _start = (fecha_entrada - _dt_h.timedelta(days=50)).isoformat()
+                _end   = (fecha_entrada + _dt_h.timedelta(days=3)).isoformat()
+                _hist_h = _tk_obj.history(start=_start, end=_end)
+                if not _hist_h.empty:
+                    _hist_h = _hist_h.copy()
+                    _hist_h["_d"] = _hist_h.index.date
+                    _entry_rows = _hist_h[_hist_h["_d"] >= fecha_entrada]
+                    _prev_rows  = _hist_h[_hist_h["_d"] < fecha_entrada]
+                    if not _entry_rows.empty and len(_prev_rows) >= 5:
+                        _vol_entry = float(_entry_rows["Volume"].iloc[0])
+                        _vol_avg   = float(_prev_rows["Volume"].tail(20).mean())
+                        _close_chg = (
+                            float(_entry_rows["Close"].iloc[0]) - float(_prev_rows["Close"].iloc[-1])
+                        ) / float(_prev_rows["Close"].iloc[-1]) * 100 if not _prev_rows.empty else 0
+                        _vol_ratio = round(_vol_entry / _vol_avg, 2) if _vol_avg > 0 else 1.0
+                        if _vol_ratio > 2.0 and _close_chg > 0:  _c7 = 10
+                        elif _vol_ratio > 1.5 and _close_chg > 0: _c7 = 7
+                        elif _vol_ratio > 1.2:                     _c7 = 5
+                        elif _vol_ratio > 0.8:                     _c7 = 3
+                        else:                                       _c7 = 1
+            except Exception: pass
+
+            # ── C8: macro penalty para la fecha de entrada ─────────────
+            _c8 = _get_macro_penalty_for_date(fecha_entrada, beta)
+
+            _total_f1 = _c1 + _c2 + _c4 + _c6 + _c7 + _c8
+            _c_norm = round(min(100, max(0, _total_f1 / 80 * 100)))
+
+            _resultado.update({
+                "c_total": _c_norm, "c_total_raw": _total_f1,
+                "c1":_c1,"c2":_c2,"c4":_c4,"c6":_c6,"c7":_c7,"c8":_c8,
+                "earn_dias": _earn_dias, "earn_surprise": _earn_surp,
+                "vol_ratio": _vol_ratio, "insider_flag": _insider_flag,
+                "ok": True,
+            })
+        except Exception as _ex:
+            _resultado["error"] = str(_ex)[:80]
+        return _resultado
+
+    def _c_score_color(c_score):
+        """Retorna (color_fondo, color_texto, emoji, label) según C-Score."""
+        if c_score >= 80:   return "#F0FDF4","#15803D","🔥","EXCEPCIONAL"
+        elif c_score >= 65: return "#F0FDF4","#16A34A","🟢","SÓLIDO"
+        elif c_score >= 45: return "#FFFBEB","#D97706","🟡","MODERADO"
+        elif c_score >= 25: return "#FFF7ED","#C2410C","🟠","DÉBIL"
+        else:               return "#FEF2F2","#DC2626","🔴","SIN CATALIZADOR"
+
+    def _veredicto_cruzado(score_tecnico, c_score, wr):
+        """Veredicto que cruza Score técnico + C-Score."""
+        if wr < 50:
+            return "🚫 NO ENTRAR","#EF4444","#FEF2F2","WR histórico bajo"
+        if score_tecnico >= 15 and c_score >= 80:
+            return "🔥 ENTRAR PLENO","#15803D","#F0FDF4","Score + catalizador excepcional"
+        elif score_tecnico >= 15 and c_score >= 65:
+            return "✅ ENTRAR","#16A34A","#F0FDF4","Señal técnica + catalizador sólido"
+        elif score_tecnico >= 15 and c_score >= 45:
+            return "⚡ PARCIAL","#D97706","#FFFBEB","Técnica ok · catalizador moderado"
+        elif score_tecnico >= 15 and c_score < 45:
+            return "⏸️ ESPERAR CAT","#C2410C","#FFF7ED","Técnica lista · falta catalizador"
+        elif score_tecnico >= 12 and c_score >= 65:
+            return "🟡 MONITOREAR","#D97706","#FFFBEB","Catalizador fuerte · técnica en desarrollo"
+        else:
+            return "⬇️ BAJA PRIO","#94A3B8","#F8FAFC","Score y catalizador insuficientes"
+
     # ── N10: Análisis IA con web_search (Claude API) ────────────────
     def _llamar_prob_entrada(ticker, fase, score, rsi, dd, macd,
                               wr_base, regimen, etf_ticker, etf_chg5d):
@@ -15895,7 +16305,7 @@ with tab_score:
                 st.secrets.get("ANTHROPIC_API_KEY", "")
                 or st.secrets.get("anthropic", {}).get("api_key", "")
                 or st.secrets.get("gcp_service_account", {}).get("ANTHROPIC_API_KEY", "")
-            ))
+            ), timeout=45.0)
             _r_pe  = _cl_pe.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=800,
@@ -15964,7 +16374,7 @@ with tab_score:
                 st.secrets.get("ANTHROPIC_API_KEY", "")
                 or st.secrets.get("anthropic", {}).get("api_key", "")
                 or st.secrets.get("gcp_service_account", {}).get("ANTHROPIC_API_KEY", "")
-            ))
+            ), timeout=45.0)
             _resp = _client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=800,  # suficiente para web_search + JSON completo
@@ -16232,49 +16642,176 @@ with tab_score:
                     f'<div style="font-size:8px;color:#94A3B8">'
                     f'{_etf_s} · {_c30_s:+.1f}%30d · RSI {_rsi_s}</div>'
                     f'</div>', unsafe_allow_html=True)
-        st.markdown(
-            "<div style='font-size:11px;line-height:1.9'>"
-            "<strong style='color:#EA580C'>🎯 Tab Score MVALLE — ¿Qué acción entra a MVALLE mañana?</strong><br>"
-            "Usa a las <strong>16:00 hrs</strong> al cierre del mercado. Primero actualiza fases "
-            "(Tab Posiciones → 🔄 Actualizar Fases), luego recalcula aquí.<br><br>"
+        with st.expander("📋 ¿Qué busca este tab? — Score MVALLE: ¿Qué acción entra mañana?", expanded=False):
+            st.markdown(
+                "<div style='font-size:11px;line-height:1.9'>"
+                "Usa a las <strong>16:00 hrs</strong> al cierre del mercado. Primero actualiza fases "
+                "(Tab Posiciones → 🔄 Actualizar Fases), luego recalcula aquí.<br><br>"
 
-            "<strong style='color:#1D4ED8'>🔄 MODELO REBOTE NBIS — Criterios de selección:</strong><br>"
-            "Busca acciones caídas que comienzan a rebotar con catalizador real.<br>"
-            "🔸 <strong>N1 Fase:</strong> M3 (confirmado) · M2 (en formación)<br>"
-            "🔸 <strong>N2 RSI:</strong> 35-52 → +3pts NBIS · 52-82 → +2pts · 82+ → +1pt<br>"
-            "🔸 <strong>N3 DD:</strong> ≤-25% → +3pts · ≤-15% → +2pts · ≤-10% → +1pt<br>"
-            "🔸 <strong>N4 Prob NBIS:</strong> 30-45% → +3pts · 45-50% → +2pts<br>"
-            "🔸 <strong>N5 MACD:</strong> positivo → +3pts · negativo → -1pt<br>"
-            "🔸 <strong>N6 SPY RSI:</strong> ≤60 → +2pts · ≤68 → +1pt · >68 → -2pts<br>"
-            "🔸 <strong>N7 Urgencia:</strong> Post-earn BEAT → +3 · Earn 3-7d → +2 · MISS → -2<br>"
-            "<strong>Gestión NBIS:</strong> Stop -7% · T1 +8% (vender 40%) · T2 +12% · Trailing -5%<br><br>"
+                "<strong style='color:#1D4ED8'>🔄 MODELO REBOTE NBIS — Criterios de selección:</strong><br>"
+                "Busca acciones caídas que comienzan a rebotar con catalizador real.<br>"
+                "🔸 <strong>N1 Fase:</strong> M3 (confirmado) · M2 (en formación)<br>"
+                "🔸 <strong>N2 RSI:</strong> 35-52 → +3pts NBIS · 52-82 → +2pts · 82+ → +1pt<br>"
+                "🔸 <strong>N3 DD:</strong> ≤-25% → +3pts · ≤-15% → +2pts · ≤-10% → +1pt<br>"
+                "🔸 <strong>N4 Prob NBIS:</strong> 30-45% → +3pts · 45-50% → +2pts<br>"
+                "🔸 <strong>N5 MACD:</strong> positivo → +3pts · negativo → -1pt<br>"
+                "🔸 <strong>N6 SPY RSI:</strong> ≤60 → +2pts · ≤68 → +1pt · >68 → -2pts<br>"
+                "🔸 <strong>N7 Urgencia:</strong> Post-earn BEAT → +3 · Earn 3-7d → +2 · MISS → -2<br>"
+                "<strong>Gestión NBIS:</strong> Stop -7% · T1 +8% (vender 40%) · T2 +12% · Trailing -5%<br><br>"
 
-            "<strong style='color:#D97706'>⚡ MODELO MOMENTUM — Criterios de selección:</strong><br>"
-            "Busca acciones con catalizador activo subiendo con volumen y MACD+.<br>"
-            "🔸 <strong>M1 Fuente:</strong> Momentum scan · Sympathy · Watchlist RSI≥65<br>"
-            "🔸 <strong>M2 RSI:</strong> 65-75 → +3pts · 75-82 → +2pts · >82 → +1pt<br>"
-            "🔸 <strong>M3 MACD:</strong> positivo → +3pts · negativo → -2pts<br>"
-            "🔸 <strong>M4 Score:</strong> basado en señal del scan<br>"
-            "🔸 <strong>M5 SPY · M6 Prob · M7 Urgencia:</strong> igual que NBIS<br>"
-            "<strong>Gestión Momentum:</strong> 20-30% · Stop -5% · T1 +15% · T2 +30%<br><br>"
+                "<strong style='color:#D97706'>⚡ MODELO MOMENTUM — Criterios de selección:</strong><br>"
+                "Busca acciones con catalizador activo subiendo con volumen y MACD+.<br>"
+                "🔸 <strong>M1 Fuente:</strong> Momentum scan · Sympathy · Watchlist RSI≥65<br>"
+                "🔸 <strong>M2 RSI:</strong> 65-75 → +3pts · 75-82 → +2pts · >82 → +1pt<br>"
+                "🔸 <strong>M3 MACD:</strong> positivo → +3pts · negativo → -2pts<br>"
+                "🔸 <strong>M4 Score:</strong> basado en señal del scan<br>"
+                "🔸 <strong>M5 SPY · M6 Prob · M7 Urgencia:</strong> igual que NBIS<br>"
+                "<strong>Gestión Momentum:</strong> 20-30% · Stop -5% · T1 +15% · T2 +30%<br><br>"
 
-            "<strong style='color:#0284C7'>👁️ ALERTA M2 PRÓXIMAS A M3:</strong><br>"
-            "Las posiciones en fase M2 con score ≥9 aparecen arriba como alerta de vigilancia. "
-            "Cuando el MACD cruce a positivo → suben a M3 → aparecen como candidatas. "
-            "<strong>Revisar diariamente al cierre para no perder el cruce (caso ENPH).</strong><br><br>"
-            "<strong style='color:#16A34A'>✅ REGLA DE DECISIÓN (misma para ambos modelos):</strong><br>"
-            "🔴 <strong>WR histórico &lt;50%</strong> → 🚫 NO ENTRAR siempre · WR mide cuántas señales similares ganaron<br>"
-            "🟢 <strong>Score ≥15</strong> + WR≥50% + RE&lt;75 → ✅ ENTRAR · señal calificada<br>"
-            "🟡 <strong>Score ≥15</strong> + RE≥75 → ⚡ PARCIAL · extensión elevada, reducir tamaño<br>"
-            "🟡 <strong>Score 11-14</strong> + WR≥50% → 🟡 Buena Señal · evaluar, no entrar aún<br>"
-            "⚪ <strong>Score &lt;11</strong> → ⏳ Esperar · señal débil<br><br>"
+                "<strong style='color:#0284C7'>👁️ ALERTA M2 PRÓXIMAS A M3:</strong><br>"
+                "Las posiciones en fase M2 con score ≥9 aparecen arriba como alerta de vigilancia. "
+                "Cuando el MACD cruce a positivo → suben a M3 → aparecen como candidatas. "
+                "<strong>Revisar diariamente al cierre para no perder el cruce (caso ENPH).</strong><br><br>"
 
-            "<strong>🔰 Riesgo Extensión (RE):</strong> NBIS: &lt;65 ok · ≥65 parcial · "
-            "Momentum: &lt;75 ok · ≥75 parcial<br>"
-            "<strong>📊 Rango Histórico:</strong> WR% y P50% de señales similares en tus 104 posiciones reales<br>"
-            "<strong>📈 Fundamentales:</strong> Rev YoY · Upside analistas · N° analistas<br>"
-            "<strong>🌡️ Régimen mercado:</strong> ajusta el umbral dinámicamente (Bull→13 · Normal→15 · Bear→17)"
-            "</div>", unsafe_allow_html=True)
+                "<strong style='color:#16A34A'>✅ REGLA DE DECISIÓN (Score + WR + C-Score):</strong><br>"
+                "🔴 <strong>WR histórico &lt;50%</strong> → 🚫 NO ENTRAR siempre · WR mide cuántas señales similares ganaron<br>"
+                "🔥 <strong>Score≥15 + C-Score≥80</strong> → ENTRAR PLENO · catalizador excepcional<br>"
+                "🟢 <strong>Score≥15 + C-Score≥65</strong> → ✅ ENTRAR · catalizador sólido<br>"
+                "🟡 <strong>Score≥15 + C-Score≥45</strong> → ⚡ PARCIAL · catalizador moderado<br>"
+                "🟠 <strong>Score≥15 + C-Score&lt;45</strong> → ⏸️ ESPERAR CAT · técnica lista, sin catalizador<br>"
+                "🟡 <strong>Score 11-14</strong> + WR≥50% → 🟡 Buena Señal · evaluar, no entrar aún<br>"
+                "⚪ <strong>Score &lt;11</strong> → ⏳ Esperar · señal débil<br><br>"
+
+                "<strong>🔬 C-Score (0-100):</strong> mide la calidad del catalizador (earnings timing, "
+                "sector 2026, insider activity, volumen, alineación macro) — complementa el Score técnico<br>"
+                "<strong>🔰 Riesgo Extensión (RE):</strong> NBIS: &lt;65 ok · ≥65 parcial · "
+                "Momentum: &lt;75 ok · ≥75 parcial<br>"
+                "<strong>📊 Rango Histórico:</strong> WR% y P50% de señales similares en tus 104 posiciones reales<br>"
+                "<strong>📈 Fundamentales:</strong> Rev YoY · Upside analistas · N° analistas<br>"
+                "<strong>🌡️ Régimen mercado:</strong> ajusta el umbral dinámicamente (Bull→13 · Normal→15 · Bear→17)"
+                "</div>", unsafe_allow_html=True)
+
+        # ══ BACKTEST C-SCORE — Validación retroactiva con Trades_Reales ══
+        with st.expander("🔬 Backtest C-Score — Validar con posiciones cerradas", expanded=False):
+            st.markdown(
+                "<div style='font-size:11px;line-height:1.7;color:#64748B'>"
+                "Calcula el C-Score que habría tenido cada posición CERRADA "
+                "el día de su entrada (usando datos históricos de yfinance) "
+                "y lo cruza con el resultado real (%). "
+                "Solo componentes reconstruibles: C1 Earn timing, C2 EPS surprise, "
+                "C4 Sector, C6 Insider, C7 Volumen, C8 Macro (6/8 — igual que Fase 1 en producción). "
+                "C3/C5 (analistas/deals) no son reconstruibles retroactivamente."
+                "</div>", unsafe_allow_html=True)
+
+            if st.button("▶️ Ejecutar Backtest C-Score", key="btn_backtest_cscore",
+                          use_container_width=True, type="secondary"):
+                with st.spinner("Leyendo Trades_Reales y calculando C-Score histórico..."):
+                    _df_trades = leer_posiciones_sheets(_SHEET_NAME_TRADES)
+                    if _df_trades is None or _df_trades.empty:
+                        st.warning("No se pudo leer GrekoTrader_Trades_Reales o está vacío.")
+                    else:
+                        _bt_rows = []
+                        _df_t = _df_trades.copy()
+                        for _, _row_t in _df_t.iterrows():
+                            _tk_bt = str(_row_t.get("Ticker","")).strip().upper()
+                            _fs_bt = str(_row_t.get("Fecha_Salida","")).strip()
+                            _res_bt_raw = str(_row_t.get("Resultado_Pct","")).strip()
+                            _fe_bt = str(_row_t.get("Fecha_Señal","") or _row_t.get("Fecha_Entrada","")).strip()
+                            if not _tk_bt or not _fs_bt or _fs_bt in ("","-","nan","None"):
+                                continue
+                            try:
+                                _res_bt = _parse_precio(_res_bt_raw.replace("%",""))
+                            except Exception:
+                                continue
+                            if not _fe_bt or _fe_bt in ("","-","nan","None"):
+                                continue
+                            try:
+                                _fecha_bt = pd.to_datetime(_fe_bt, errors="coerce", dayfirst=True)
+                                if pd.isna(_fecha_bt): continue
+                                _fecha_bt = _fecha_bt.date()
+                            except Exception:
+                                continue
+                            _sector_bt = str(_row_t.get("Area","") or "")
+                            _bt_rows.append({
+                                "Ticker": _tk_bt, "Fecha_Entrada": _fecha_bt,
+                                "Sector": _sector_bt, "Resultado_Pct": _res_bt,
+                                "Fase": str(_row_t.get("Fase","")),
+                            })
+
+                        if not _bt_rows:
+                            st.warning("No hay posiciones cerradas con Fecha_Señal + Resultado_Pct válidos.")
+                        else:
+                            from concurrent.futures import ThreadPoolExecutor as _TpE_bt
+                            def _calc_bt(row):
+                                _cs = _calcular_c_score_historico(
+                                    row["Ticker"], row["Fecha_Entrada"],
+                                    row["Sector"], beta=1.0)
+                                return {**row, "C_Score": _cs.get("c_total"),
+                                        "C1": _cs.get("c1"), "C2": _cs.get("c2"),
+                                        "C4": _cs.get("c4"), "C6": _cs.get("c6"),
+                                        "C7": _cs.get("c7"), "C8": _cs.get("c8"),
+                                        "Earn_dias": _cs.get("earn_dias"),
+                                        "Vol_ratio": _cs.get("vol_ratio"),
+                                        "ok": _cs.get("ok", False)}
+                            with _TpE_bt(max_workers=5) as _ex_bt:
+                                _bt_results = list(_ex_bt.map(_calc_bt, _bt_rows))
+
+                            st.session_state["_backtest_cscore_result"] = _bt_results
+
+            _bt_res = st.session_state.get("_backtest_cscore_result")
+            if _bt_res:
+                _df_bt = pd.DataFrame(_bt_res)
+                _df_bt_ok = _df_bt[_df_bt["ok"] == True].copy()
+                if _df_bt_ok.empty:
+                    st.warning("Ninguna posición pudo calcularse (revisa conexión yfinance).")
+                else:
+                    _df_bt_ok["Ganador"] = _df_bt_ok["Resultado_Pct"] > 0
+
+                    def _bucket(cs):
+                        if cs is None: return "Sin dato"
+                        if cs >= 65: return "🟢 ≥65 (Sólido+)"
+                        if cs >= 45: return "🟡 45-64 (Moderado)"
+                        if cs >= 25: return "🟠 25-44 (Débil)"
+                        return "🔴 <25 (Sin catalizador)"
+                    _df_bt_ok["Bucket"] = _df_bt_ok["C_Score"].apply(_bucket)
+
+                    _resumen = _df_bt_ok.groupby("Bucket").agg(
+                        N=("Ticker","count"),
+                        WR=("Ganador","mean"),
+                        Prom_Pct=("Resultado_Pct","mean"),
+                    ).reset_index()
+                    _resumen["WR"] = (_resumen["WR"]*100).round(1)
+                    _resumen["Prom_Pct"] = _resumen["Prom_Pct"].round(1)
+                    _orden = ["🟢 ≥65 (Sólido+)","🟡 45-64 (Moderado)",
+                              "🟠 25-44 (Débil)","🔴 <25 (Sin catalizador)","Sin dato"]
+                    _resumen["_ord"] = _resumen["Bucket"].apply(
+                        lambda b: _orden.index(b) if b in _orden else 99)
+                    _resumen = _resumen.sort_values("_ord").drop(columns="_ord")
+
+                    st.markdown("**📊 Resultado por bucket de C-Score histórico**")
+                    st.dataframe(_resumen, use_container_width=True, hide_index=True,
+                                  column_config={
+                                      "WR": st.column_config.NumberColumn("WR %", format="%.1f%%"),
+                                      "Prom_Pct": st.column_config.NumberColumn("Prom. Resultado", format="%.1f%%"),
+                                  })
+
+                    try:
+                        _corr = _df_bt_ok[["C_Score","Resultado_Pct"]].dropna().corr().iloc[0,1]
+                        st.markdown(f"**Correlación C-Score vs Resultado%: `{_corr:.2f}`** "
+                                     f"(>0.3 = el C-Score separa ganadores de perdedores)")
+                    except Exception: pass
+
+                    st.markdown("**📋 Detalle por posición**")
+                    _cols_show = ["Ticker","Fecha_Entrada","Fase","Resultado_Pct",
+                                   "C_Score","Bucket","Earn_dias","Vol_ratio",
+                                   "C1","C2","C4","C6","C7","C8"]
+                    _df_show = _df_bt_ok[_cols_show].sort_values("C_Score", ascending=False)
+                    st.dataframe(_df_show, use_container_width=True, hide_index=True)
+
+                    _n_err = len(_df_bt) - len(_df_bt_ok)
+                    if _n_err > 0:
+                        st.caption(f"⚠️ {_n_err} posiciones no se pudieron calcular (sin datos yfinance suficientes)")
+
         st.markdown(
             "<div style='font-size:11px;line-height:1.8'>"
             "<strong style='color:#EA580C'>🎯 Tab Score MVALLE — Decisión para mañana al abrir mercado</strong><br>"
@@ -16843,9 +17380,13 @@ with tab_score:
                             "N2_l":_n2_l,"N3_l":_n3_l,"N4_l":_n4_l,"N5_l":_n5_l,
                             "N6_l":_spy_l,"N7_l":_urg_l,"Precio":_pa_live,
                             "RSI":_rsi_ac,"MACD":_macd_e,"DD":_dd_p,
+                            "Prob_real":_prob,
                             "RSI_over":_rsi_over,
                             "Beta":round(_beta_f,2),
                             "Beta_pen":_beta_pen,
+                            "_wr_pre":_wr_pre,
+                            "C_Score": st.session_state.get(f"cscore_{_tk}", {}).get("c_total", None),
+                            "C_Data":  st.session_state.get(f"cscore_{_tk}", {}),
                             "Gestion":"100% · Stop -7% · T1 +8% · T2 +12%",
                             "Analistas":_n_an_f,
                             "Analistas_Label":_n_an_lbl,
@@ -16890,7 +17431,12 @@ with tab_score:
                         # Agregar puntos de consenso analistas al total Momentum
                         _n_an_pts_m = _n_an_pts
                         _n_an_lbl_m = _n_an_lbl
-                        _total=max(0,min(20,_m1+_m2+_m3+_m4+_m5+_m6+_urg+_n_an_pts_m))
+                        # v19.3: Beta penalty también en Momentum (igual que NBIS)
+                        if _beta_f >= 2.5:   _beta_pen_m = -3
+                        elif _beta_f >= 1.8: _beta_pen_m = -2
+                        elif _beta_f >= 1.4: _beta_pen_m = -1
+                        else:                _beta_pen_m = 0
+                        _total=max(0,min(20,_m1+_m2+_m3+_m4+_m5+_m6+_urg+_n_an_pts_m+_beta_pen_m))
                         # Riesgo Extensión Momentum — calcular ANTES de _rec
                         _ld_re_m       = _live_sc.get(_tk, {})
                         _dist_ema_re_m = _ld_re_m.get("dist_ema50", 0)
@@ -16924,6 +17470,10 @@ with tab_score:
                             "M2_l":_m2_l,"M3_l":_m3_l,"M4_l":_m4_l,"M5_l":_m5_l,
                             "M6_l":_m6_l,"M7_l":_urg_l,"Precio":_pa_live,
                             "RSI":_rsi_ac,"MACD":_macd_e,
+                            "DD_real":_dd_p,"Prob_real":_prob,
+                            "Beta":round(_beta_f,2),
+                            "Beta_pen":_beta_pen_m,
+                            "C_Score": st.session_state.get(f"cscore_{_tk}", {}).get("c_total", None),
                             "Gestion":"20-30% · Stop -5% · T1 +15% · T2 +30%",
                             "Analistas":_n_an_f,
                             "Upside":f"+{_up_f:.0f}%" if _info_ok else "N/D",
@@ -16931,6 +17481,7 @@ with tab_score:
                             "Alertas":_alerta_str,"Bloqueado":_bloq,
                             "Cartera":str(_r.get("_cartera","Greko")),
                             "RE":_re_result_m,
+                            "_wr_pre":_wr_pre_m,
                         })
 
             _nbis_rows_new.sort(key=lambda x: x["TOTAL"], reverse=True)
@@ -17027,7 +17578,7 @@ with tab_score:
                 f'<span style="font-size:10px;color:#64748B;margin-left:10px">'
                 f'Gestión: 100% · Stop -7% · T1 +8% · T2 +12%</span>'
                 f'</div>', unsafe_allow_html=True)
-            _CN = "70px 75px 40px 55px 55px 55px 50px 50px 45px 50px 55px 55px 110px"
+            _CN = "70px 75px 40px 55px 55px 55px 50px 50px 45px 50px 55px 60px 110px"
             st.markdown(
                 f'<div style="display:grid;grid-template-columns:{_CN};gap:3px;'
                 f'padding:5px 8px;background:#F8FAFF;border:1px solid #BFDBFE;'
@@ -17041,9 +17592,35 @@ with tab_score:
                 f'<div style="text-align:center;font-weight:900;color:#1D4ED8">TOTAL</div>'
                 f'<div style="text-align:center">Beta</div>'
                 f'<div style="text-align:center">An.<br>Up%</div>'
-                f'<div style="text-align:center">Rev<br>YoY</div>'
-                f'<div>Recomendación / Alertas</div>'
+                f'<div style="text-align:center;font-weight:900;color:#7C3AED">C-Score</div>'
+                f'<div>Veredicto</div>'
                 f'</div>', unsafe_allow_html=True)
+
+            # Calcular C-Score en background para candidatos Score≥12 (NBIS + Momentum)
+            _cands_cs = [r for r in _nbis_rows + _mom_rows if r["TOTAL"] >= 12]
+            if _cands_cs:
+                _cs_pending = [r for r in _cands_cs
+                               if f"cscore_{r['Ticker']}" not in st.session_state]
+                if _cs_pending:
+                    with st.spinner(f"🔬 Calculando C-Score para {len(_cs_pending)} candidatos..."):
+                        from concurrent.futures import ThreadPoolExecutor as _TpE_cs
+                        def _calc_cs(row):
+                            # NO escribir session_state aquí (thread sin ScriptRunContext)
+                            try:
+                                _cs = _calcular_c_score_free(
+                                    row["Ticker"], row.get("Sector",""), row.get("Beta",1.0))
+                            except Exception as _ex_cs2:
+                                _cs = {"c_total": 0, "ok": False, "error": str(_ex_cs2)[:60]}
+                            return row["Ticker"], _cs
+                        with _TpE_cs(max_workers=4) as _ex_cs:
+                            _cs_results = list(_ex_cs.map(_calc_cs, _cs_pending))
+                    # Escribir resultados en session_state desde el hilo principal
+                    for _tk_cs, _cs_res in _cs_results:
+                        st.session_state[f"cscore_{_tk_cs}"] = _cs_res
+                    # Actualizar C_Score en los rows para que aparezca en tabla
+                    for _r in _nbis_rows + _mom_rows:
+                        _r["C_Score"] = st.session_state.get(
+                            f"cscore_{_r['Ticker']}", {}).get("c_total")
             # Agrupar por sector
             # Agrupar por sector preservando orden por score (mejor primero)
             _nbis_sectores = {}
@@ -17093,6 +17670,17 @@ with tab_score:
                         f'color:{"#DC2626" if p<=-3 else "#C2410C" if p==-2 else "#D97706" if p==-1 else "#16A34A"}">'
                         f'β{b:.1f}{"⚡" if p<=-2 else "⚠️" if p==-1 else "✅"}</div>'
                     ))(float(_rn.get("Beta",1.0) or 1.0), int(_rn.get("Beta_pen",0) or 0))
+                    # C-Score cell
+                    + (lambda cs: (
+                        f'<div style="text-align:center;font-size:11px;font-weight:800;'
+                        f'color:{"#15803D" if cs>=80 else "#16A34A" if cs>=65 else "#D97706" if cs>=45 else "#C2410C" if cs>=25 else "#DC2626"};'
+                        f'background:{"#F0FDF4" if cs>=65 else "#FFFBEB" if cs>=45 else "#FEF2F2" if cs<45 else "#F8FAFC"};'
+                        f'border-radius:4px;padding:2px 4px">'
+                        f'{"🔥" if cs>=80 else "🟢" if cs>=65 else "🟡" if cs>=45 else "🔴"}'
+                        f'{cs}</div>'
+                        if cs is not None else
+                        '<div style="text-align:center;font-size:10px;color:#CBD5E1">—</div>'
+                    ))(_rn.get("C_Score"))
                     + f'<div style="font-size:10px;font-weight:700;color:{_rn["Rc"]}">{_rn["Rec"]}</div>'
                     f'</div>', unsafe_allow_html=True)
 
@@ -17101,10 +17689,10 @@ with tab_score:
                 _an_display = _rn.get("Analistas_Label", f"{_an_rn} analistas" if _an_rn > 0 else "Sin cobertura")
                 _rev_display= _rev_rn if _rev_rn not in ("","None","nan") else "N/D"
                 _up_display = _up_rn if _up_rn not in ("","None","nan","+0%") else "N/D"
-                # v19.3 fix: usar valores del dict _rn, no variables del loop de cálculo
+                # v19.3 fix: usar valores REALES (DD%, Prob%) — no los puntos N3/N4 (0-3)
                 _rsi_rn    = float(_rn.get("RSI", 0) or 0)
-                _dd_rn     = abs(float(_rn.get("N3", 0) or 0))
-                _prob_rn   = float(_rn.get("N4", 0) or 0)
+                _dd_rn     = abs(float(_rn.get("DD", 0) or 0))         # DD% real (ej. -23.5)
+                _prob_rn   = float(_rn.get("Prob_real", 0) or 0)       # Prob% real (ej. 35.0)
                 _rh_perfil = _gtu_get_rh(_rsi_rn, _dd_rn, _prob_rn)
                 _rh_wr      = _rh_perfil.get("rh_wr", 0)
                 _rh_p50     = _rh_perfil.get("rh_p50", 0)
@@ -17223,8 +17811,34 @@ with tab_score:
                         f'✅ Beta {_beta_n:.1f} → bajo riesgo · sin penalización '
                         f'(patrón HPE/DELL/APTV)</div>',
                         unsafe_allow_html=True)
+                # ── C-Score: calcular ANTES del grid para mostrarlo como 3ra columna
+                _cs_data = st.session_state.get(f"cscore_{_rn['Ticker']}", {})
+                _cs_val  = _cs_data.get("c_total")
+                if _cs_val is not None:
+                    _cs_bg, _cs_tc, _cs_ico, _cs_lbl = _c_score_color(_cs_val)
+                    _cs_detalle = _cs_data.get("detalle", {})
+                    _cs_box = (
+                        f'<div style="background:{_cs_tc}18;border:1px solid {_cs_tc}50;border-radius:6px;padding:5px 8px">'
+                        f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase;letter-spacing:.8px">🔬 C-Score</div>'
+                        f'<div style="font-size:12px;font-weight:800;color:{_cs_tc}">{_cs_ico} {_cs_val}/100 · {_cs_lbl}</div>'
+                        f'<div style="font-size:9px;color:#94A3B8">'
+                        f'Earn:{"en "+str(_cs_data.get("earn_dias"))+"d" if _cs_data.get("earn_dias") is not None else "—"} · '
+                        f'Vol:{_cs_data.get("vol_ratio",0):.1f}× · '
+                        f'Ins:{_cs_data.get("insider_flag","—")[:4]}</div>'
+                        f'</div>'
+                    )
+                    _grid_cols = "1fr 1fr 1fr"
+                else:
+                    _cs_box = (
+                        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:5px 8px;'
+                        f'display:flex;align-items:center;justify-content:center">'
+                        f'<div style="font-size:10px;color:#94A3B8">🔬 Calculando C-Score...</div>'
+                        f'</div>'
+                    )
+                    _grid_cols = "1fr 1fr 1fr"
+
                 st.markdown(
-                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;'
+                    f'<div style="display:grid;grid-template-columns:{_grid_cols};gap:4px;'
                     f'padding:4px 8px 0px 8px;background:{_bg};border:1px solid {_bl};'
                     f'border-top:none;border-left:3px solid {_bl}">'
                     f'<div style="background:{_rh_color}18;border:1px solid {_rh_color}50;border-radius:6px;padding:5px 8px">'
@@ -17237,6 +17851,7 @@ with tab_score:
                     f'<div style="font-size:12px;font-weight:800;color:{_fund_color}">{_fund_human}</div>'
                     f'<div style="font-size:9px;color:#94A3B8">Rev:{_rev_display} · Up:{_up_display} · {_an_display[:20]}</div>'
                     f'</div>'
+                    + _cs_box +
                     f'</div>',
                     unsafe_allow_html=True)
                 # RE badge NBIS
@@ -17254,7 +17869,22 @@ with tab_score:
                         f'<div style="padding:0 8px 0 8px;background:{_vbg};'
                         f'border:1px solid {_vc}40;border-top:none;border-left:3px solid {_vc}">'
                         + _etf_html_n + f'</div>', unsafe_allow_html=True)
-                # ── Veredicto NBIS (siempre visible) ────────────────
+                # ── Veredicto NBIS cruzado (Score + C-Score) ────────
+                _wr_card = _rh_perfil.get("rh_wr", 50) if "_rh_perfil" in dir() else 50
+
+                # Siempre calcular veredicto — con o sin C-Score
+                if _cs_val is not None:
+                    _vered, _vc, _vbg, _vreason = _veredicto_cruzado(
+                        _rn["TOTAL"], _cs_val, _wr_card)
+                else:
+                    # Sin C-Score aún → usar veredicto técnico clásico
+                    _vered = _rn.get("Rec", "⚪ Esperar")
+                    _vc    = _rn.get("Rc",  "#64748B")
+                    _vbg   = "#F0FDF4" if _vered.startswith("✅") else \
+                             "#FFF7ED" if _vered.startswith("⚡") else \
+                             "#FFFBEB" if _vered.startswith("🟡") else "#F8FAFC"
+                    _vreason = "calculando C-Score..."
+
                 st.markdown(
                     f'<div style="padding:6px 10px;margin-bottom:4px;background:{_vbg};'
                     f'border:1px solid {_vc}60;border-top:none;border-left:3px solid {_vc};'
@@ -17314,8 +17944,20 @@ with tab_score:
                                 with ThreadPoolExecutor(max_workers=2) as _ex:
                                     _f_n10  = _ex.submit(_run_n10)
                                     _f_prob = _ex.submit(_run_prob)
-                                    _n10_res  = _f_n10.result()
-                                    _prob_res = _f_prob.result()
+                                    try:
+                                        _n10_res  = _f_n10.result(timeout=55)
+                                    except Exception:
+                                        _n10_res = {"n10_score":0,"n10_label":"Timeout",
+                                            "catalizador":"—","riesgo_oculto":"—",
+                                            "sector_viento":"NEUTRO","confianza":"BAJA",
+                                            "razon_2lineas":"Análisis tardó demasiado · intenta de nuevo"}
+                                    try:
+                                        _prob_res = _f_prob.result(timeout=55)
+                                    except Exception:
+                                        _prob_res = {"probabilidad":50,"nivel":"MEDIA",
+                                            "bloqueador":"NINGUNO","razon_principal":"Timeout — intenta de nuevo",
+                                            "factores_positivos":[],"factores_negativos":[],
+                                            "confianza":30}
                             st.session_state[f"n10_nbis_{_rn['Ticker']}"]  = _n10_res
                             st.session_state[f"prob_nbis_{_rn['Ticker']}"] = _prob_res
                     # Mostrar N10
@@ -17352,12 +17994,12 @@ with tab_score:
                             f'</div>', unsafe_allow_html=True)
                     # Mostrar Probabilidad
                     if _prob_res:
-                        _pval  = int(_prob_res.get("probabilidad", 50))
+                        _pval  = _safe_int_pct(_prob_res.get("probabilidad", 50))
                         _pblk  = _prob_res.get("bloqueador", "NINGUNO")
                         _prazon= _prob_res.get("razon_principal", "")
                         _pfpos = _prob_res.get("factores_positivos", [])
                         _pfneg = _prob_res.get("factores_negativos", [])
-                        _pconf = int(_prob_res.get("confianza", 50))
+                        _pconf = _safe_int_pct(_prob_res.get("confianza", 50))
                         if _pblk != "NINGUNO":
                             _pc,_pbg,_pico,_pdec = "#EF4444","#FEF2F2","🚫","BLOQUEADO"
                         elif _pval >= 80: _pc,_pbg,_pico,_pdec = "#16A34A","#F0FDF4","🟢","MUY FAVORABLE"
@@ -17395,7 +18037,45 @@ with tab_score:
                 f'<span style="font-size:10px;color:#64748B;margin-left:10px">'
                 f'Gestión: 20-30% · Stop -5% · T1 +15% · T2 +30%</span>'
                 f'</div>', unsafe_allow_html=True)
-            _CM = "70px 75px 40px 55px 55px 55px 50px 50px 45px 55px 55px 110px"
+
+            with st.expander("📋 ¿Qué busca este ítem? — Cómo se calculan Score y β en Momentum", expanded=False):
+                st.markdown(
+                    "<div style='font-size:11px;line-height:1.9'>"
+                    "<strong style='color:#D97706'>¿Qué busca MOMENTUM?</strong><br>"
+                    "Acciones con catalizador <strong>activo ahora</strong>: subiendo con volumen, "
+                    "MACD positivo y RSI fuerte (no en rebote desde mínimos como NBIS, "
+                    "sino ya en movimiento confirmado).<br><br>"
+
+                    "<strong style='color:#1D4ED8'>📐 Cómo se calcula el Score (0-20):</strong><br>"
+                    "🔸 <strong>M1 Fuente:</strong> Momentum scan · Sympathy · Watchlist (RSI≥65)<br>"
+                    "🔸 <strong>M2 RSI:</strong> 65-75 → +3pts (zona ideal) · 75-82 → +2pts · >82 → +1pt (sobrecomprado)<br>"
+                    "🔸 <strong>M3 MACD:</strong> positivo → +3pts · negativo → -2pts (penaliza fuerte, sin MACD+ no hay momentum)<br>"
+                    "🔸 <strong>M4 Score base:</strong> según fuerza de la señal del scanner<br>"
+                    "🔸 <strong>M5 SPY:</strong> contexto de mercado (igual que NBIS) — RSI SPY ≤60 favorece, >68 penaliza<br>"
+                    "🔸 <strong>M6 Prob NBIS:</strong> probabilidad histórica de continuación<br>"
+                    "🔸 <strong>M7 Urgencia:</strong> earnings próximos, post-earn beat, etc.<br>"
+                    "🔸 <strong>Analistas:</strong> +0 a +3pts según % Buy y cobertura<br>"
+                    "🔸 <strong>β Beta penalty:</strong> -1 a -3pts (ver abajo)<br>"
+                    "Suma total capada en 0-20<br><br>"
+
+                    "<strong style='color:#7C3AED'>📊 ¿Qué significa β (Beta)?</strong><br>"
+                    "Mide qué tanto se mueve la acción comparado con el mercado (SPY):<br>"
+                    "🔸 <strong>β &lt; 1.0:</strong> se mueve menos que el mercado — más estable<br>"
+                    "🔸 <strong>β = 1.0:</strong> se mueve igual que el mercado<br>"
+                    "🔸 <strong>β &gt; 1.0:</strong> se mueve más — amplifica subidas Y bajadas<br>"
+                    "Ej: β=2.5 significa que si SPY cae -1%, la acción puede caer -2.5%<br><br>"
+                    "<strong>Penalización aplicada al Score:</strong><br>"
+                    "✅ β &lt; 1.4 → 0pts (riesgo normal)<br>"
+                    "⚠️ β 1.4-1.8 → -1pt (cautela)<br>"
+                    "⚡ β 1.8-2.5 → -2pts (alto riesgo)<br>"
+                    "⚡ β ≥ 2.5 → -3pts (muy especulativo — validado: ganadores promedio β~0.94, perdedores β~2.28)<br><br>"
+
+                    "<strong style='color:#16A34A'>✅ Veredicto (Score + WR + C-Score):</strong><br>"
+                    "Misma regla cruzada que NBIS — ver expander de arriba para el detalle completo de "
+                    "🔥 ENTRAR PLENO / ✅ ENTRAR / ⚡ PARCIAL / ⏸️ ESPERAR CAT / 🚫 NO ENTRAR (WR&lt;50%)"
+                    "</div>", unsafe_allow_html=True)
+
+            _CM = "70px 75px 40px 55px 55px 55px 50px 50px 45px 50px 55px 60px 110px"
             st.markdown(
                 f'<div style="display:grid;grid-template-columns:{_CM};gap:3px;'
                 f'padding:5px 8px;background:#FFFEF0;border:1px solid #FDE68A;'
@@ -17407,9 +18087,10 @@ with tab_score:
                 f'<div style="text-align:center">M5<br>SPY</div>'
                 f'<div style="text-align:center">M6<br>Prob</div>'
                 f'<div style="text-align:center;font-weight:900;color:#D97706">TOTAL</div>'
+                f'<div style="text-align:center">Beta</div>'
                 f'<div style="text-align:center">An.<br>Up%</div>'
-                f'<div style="text-align:center">Rev<br>YoY</div>'
-                f'<div>Recomendación / Alertas</div>'
+                f'<div style="text-align:center;font-weight:900;color:#7C3AED">C-Score</div>'
+                f'<div>Veredicto</div>'
                 f'</div>', unsafe_allow_html=True)
             # Agrupar por sector
             # Agrupar por sector preservando orden por score
@@ -17450,18 +18131,33 @@ with tab_score:
                         f'{_cel(_rm["M4"],_rm["M4_l"])}{_cel(_rm["M5"],_rm["M5_l"])}'
                         f'{_cel(_rm["M6"],_rm["M6_l"])}'
                         f'<div style="text-align:center;font-size:18px;font-weight:900;color:{_sc_m}">{_rm["TOTAL"]}</div>'
-                        f'<div style="font-size:10px;font-weight:700;color:{_rm["Rc"]}">{_rm["Rec"]}</div>'
+                        + (lambda b,p: (
+                            f'<div style="text-align:center;font-size:10px;font-weight:700;'
+                            f'color:{"#DC2626" if p<=-3 else "#C2410C" if p==-2 else "#D97706" if p==-1 else "#16A34A"}">'
+                            f'β{b:.1f}{"⚡" if p<=-2 else "⚠️" if p==-1 else "✅"}</div>'
+                        ))(float(_rm.get("Beta",1.0) or 1.0), int(_rm.get("Beta_pen",0) or 0))
+                        + f'<div style="font-size:9px;text-align:center;color:{TXT_MUT}">{_an_rm} an.<br>{_up_rm}</div>'
+                        # C-Score cell
+                        + (lambda cs: (
+                            f'<div style="text-align:center;font-size:11px;font-weight:800;'
+                            f'color:{"#15803D" if cs>=80 else "#16A34A" if cs>=65 else "#D97706" if cs>=45 else "#C2410C" if cs>=25 else "#DC2626"};'
+                            f'background:{"#F0FDF4" if cs>=65 else "#FFFBEB" if cs>=45 else "#FEF2F2" if cs<45 else "#F8FAFC"};'
+                            f'border-radius:4px;padding:2px 4px">'
+                            f'{"🔥" if cs>=80 else "🟢" if cs>=65 else "🟡" if cs>=45 else "🔴"}'
+                            f'{cs}</div>'
+                            if cs is not None else
+                            '<div style="text-align:center;font-size:10px;color:#CBD5E1">—</div>'
+                        ))(_rm.get("C_Score"))
+                        + f'<div style="font-size:10px;font-weight:700;color:{_rm["Rc"]}">{_rm["Rec"]}</div>'
                         f'</div>', unsafe_allow_html=True)
                     # Rango Histórico + Fundamentales + RE + Veredicto
                     _rev_disp_m = _rev_rm if _rev_rm not in ("","None","nan") else "N/D"
                     _up_disp_m  = _up_rm  if _up_rm  not in ("","None","nan","+0%") else "N/D"
                     _an_disp_m  = _rm.get("Analistas_Label", f"{_an_rm} analistas" if _an_rm > 0 else "Sin cobertura")
-                    # v19.3 fix: usar Dist_ATH como DD real para Momentum
-                    # Dist_ATH = distancia desde máximo 52 semanas (ej: -23% → DD=23)
-                    _dist_ath_rm = str(_rm.get("Dist_ATH","0%")).replace("%","").replace("+","")
-                    try: _dd_rm_val = abs(float(_dist_ath_rm))
-                    except: _dd_rm_val = 0
-                    _rh_rm_p    = _gtu_get_rh(float(_rm.get("RSI",0) or 0), _dd_rm_val, float(_rm.get("M4",0) or 0))
+                    # v19.3 fix: usar valores REALES (DD%, Prob%) — no Dist_ATH/M4 (puntos)
+                    _dd_rm_val  = abs(float(_rm.get("DD_real", 0) or 0))
+                    _prob_rm_val= float(_rm.get("Prob_real", 0) or 0)
+                    _rh_rm_p    = _gtu_get_rh(float(_rm.get("RSI",0) or 0), _dd_rm_val, _prob_rm_val)
                     _rh_rm_wr   = _rh_rm_p.get("rh_wr",0);  _rh_rm_p50=_rh_rm_p.get("rh_p50",0)
                     _rh_rm_p25  = _rh_rm_p.get("rh_p25",0); _rh_rm_p75=_rh_rm_p.get("rh_p75",0)
                     _rh_rm_n    = _rh_rm_p.get("rh_n",0);   _rh_rm_c  =_rh_rm_p.get("rh_color","#64748B")
@@ -17480,30 +18176,30 @@ with tab_score:
                     _re_niv_m=_re_rm.get("nivel","NORMAL") if _re_rm else "NORMAL"
                     _re_score_m = float(_re_rm.get("re",0)) if _re_rm else 0
                     _rm_score   = int(_rm.get("TOTAL",0))
-                    # REGLA UNIFICADA MOMENTUM — misma lógica que badge
-                    if _rh_rm_wr < 50:
-                        _vm="🚫 NO ENTRAR"; _vmc="#EF4444"; _vmbg="#FEF2F2"
-                        _vmr=f"WR histórico {int(_rh_rm_wr)}% — señales similares perdieron {100-int(_rh_rm_wr)}%"
-                    elif _rm_score >= 15 and _re_score_m < 75:
-                        # Score ≥15 = señal calificada + RE ok
-                        _vm="✅ ENTRAR"; _vmc="#16A34A"; _vmbg="#F0FDF4"
-                        _vmr=f"Score {_rm_score} ✓ · WR {int(_rh_rm_wr)}% · P50:{_rh_rm_p50:+.0f}% · RE {_re_score_m:.0f} ok"
-                    elif _rm_score >= 15 and _re_score_m >= 75:
-                        # Score califica pero RE elevado → reducir tamaño
-                        _vm="⚡ PARCIAL"; _vmc="#F97316"; _vmbg="#FFF7ED"
-                        _vmr=f"Score {_rm_score} ✓ · RE {_re_score_m:.0f} elevado — 50% del tamaño"
-                    elif _rm_score >= 11:
-                        # Buena señal pero no llega al umbral de entrada
-                        _vm="🟡 BUENA SEÑAL"; _vmc="#D97706"; _vmbg="#FFFBEB"
-                        _vmr=f"Score {_rm_score} — evaluar, aún no cumple umbral ≥15 para entrar"
-                    elif _rm_score >= 7:
-                        _vm="⏳ ESPERAR"; _vmc="#64748B"; _vmbg="#F8FAFC"
-                        _vmr=f"Score {_rm_score} — esperar confirmación técnica"
+                    # ── C-Score: calcular ANTES del grid para mostrarlo como 3ra columna
+                    _cs_data_m = st.session_state.get(f"cscore_{_rm['Ticker']}", {})
+                    _cs_val_m  = _cs_data_m.get("c_total")
+                    if _cs_val_m is not None:
+                        _cs_bg_m, _cs_tc_m, _cs_ico_m, _cs_lbl_m = _c_score_color(_cs_val_m)
+                        _cs_box_m = (
+                            f'<div style="background:{_cs_tc_m}18;border:1px solid {_cs_tc_m}50;border-radius:6px;padding:5px 8px">'
+                            f'<div style="font-size:8px;color:#64748B;font-weight:700;text-transform:uppercase;letter-spacing:.8px">🔬 C-Score</div>'
+                            f'<div style="font-size:12px;font-weight:800;color:{_cs_tc_m}">{_cs_ico_m} {_cs_val_m}/100 · {_cs_lbl_m}</div>'
+                            f'<div style="font-size:9px;color:#94A3B8">'
+                            f'Earn:{"en "+str(_cs_data_m.get("earn_dias"))+"d" if _cs_data_m.get("earn_dias") is not None else "—"} · '
+                            f'Vol:{_cs_data_m.get("vol_ratio",0):.1f}× · '
+                            f'Ins:{_cs_data_m.get("insider_flag","—")[:4]}</div>'
+                            f'</div>'
+                        )
                     else:
-                        _vm="⬇️ BAJA PRIO"; _vmc="#94A3B8"; _vmbg="#F8FAFC"
-                        _vmr="Señal débil"
+                        _cs_box_m = (
+                            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:5px 8px;'
+                            f'display:flex;align-items:center;justify-content:center">'
+                            f'<div style="font-size:10px;color:#94A3B8">🔬 Calculando C-Score...</div>'
+                            f'</div>'
+                        )
                     st.markdown(
-                        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;'
+                        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;'
                         f'padding:4px 8px 0px 8px;background:{_bg_m};border:1px solid {_bl_m};'
                         f'border-top:none;border-left:3px solid {_bl_m}">'
                         f'<div style="background:{_rh_rm_c}18;border:1px solid {_rh_rm_c}50;border-radius:6px;padding:5px 8px">'
@@ -17516,6 +18212,26 @@ with tab_score:
                         f'<div style="font-size:12px;font-weight:800;color:{_fc}">{_fm}</div>'
                         f'<div style="font-size:9px;color:#94A3B8">Rev:{_rev_disp_m} · Up:{_up_disp_m} · {_an_disp_m[:20]}</div>'
                         f'</div>'
+                        + _cs_box_m +
+                        f'</div>', unsafe_allow_html=True)
+
+                    # ── Veredicto Momentum cruzado (Score + WR + C-Score) ──
+                    if _cs_val_m is not None:
+                        _vm, _vmc, _vmbg, _vmr = _veredicto_cruzado(
+                            _rm_score, _cs_val_m, _rh_rm_wr)
+                    else:
+                        _vm  = _rm.get("Rec", "⚪ Esperar")
+                        _vmc = _rm.get("Rc",  "#64748B")
+                        _vmbg = "#F0FDF4" if _vm.startswith("✅") else \
+                                "#FFF7ED" if _vm.startswith("⚡") else \
+                                "#FFFBEB" if _vm.startswith("🟡") else "#F8FAFC"
+                        _vmr = "calculando C-Score..."
+                    st.markdown(
+                        f'<div style="padding:6px 10px;margin-bottom:4px;background:{_vmbg};'
+                        f'border:1px solid {_vmc}60;border-top:none;border-left:3px solid {_vmc};'
+                        f'border-bottom:3px solid {_vmc};border-radius:0 0 6px 6px">'
+                        f'<span style="font-size:12px;font-weight:900;color:{_vmc}">{_vm}</span>'
+                        f'<span style="font-size:10px;color:{_vmc}90;margin-left:8px">{_vmr}</span>'
                         f'</div>', unsafe_allow_html=True)
                     if _re_rm and _re_rm.get("badge_html"):
                         st.markdown(
@@ -17578,8 +18294,20 @@ with tab_score:
                                     with _TpE(max_workers=2) as _ex_m:
                                         _fn10m  = _ex_m.submit(_run_n10m)
                                         _fprobm = _ex_m.submit(_run_probm)
-                                        _n10_res_m  = _fn10m.result()
-                                        _prob_res_m = _fprobm.result()
+                                        try:
+                                            _n10_res_m  = _fn10m.result(timeout=55)
+                                        except Exception:
+                                            _n10_res_m = {"n10_score":0,"n10_label":"Timeout",
+                                                "catalizador":"—","riesgo_oculto":"—",
+                                                "sector_viento":"NEUTRO","confianza":"BAJA",
+                                                "razon_2lineas":"Análisis tardó demasiado · intenta de nuevo"}
+                                        try:
+                                            _prob_res_m = _fprobm.result(timeout=55)
+                                        except Exception:
+                                            _prob_res_m = {"probabilidad":50,"nivel":"MEDIA",
+                                                "bloqueador":"NINGUNO","razon_principal":"Timeout — intenta de nuevo",
+                                                "factores_positivos":[],"factores_negativos":[],
+                                                "confianza":30}
                                     st.session_state[f"n10_mom_{_rm['Ticker']}"]  = _n10_res_m
                                     st.session_state[f"prob_mom_{_rm['Ticker']}"] = _prob_res_m
                         if _n10_res_m:
@@ -17619,13 +18347,13 @@ with tab_score:
                         f'</div>', unsafe_allow_html=True)
                     # Mostrar Probabilidad Momentum
                     if _prob_res_m:
-                            _pval_m = int(_prob_res_m.get("probabilidad", 50))
+                            _pval_m = _safe_int_pct(_prob_res_m.get("probabilidad", 50))
                             _pdir_m = _prob_res_m.get("direccion","NEUTRAL")
                             _pblk_m = _prob_res_m.get("bloqueador","NINGUNO")
                             _prazon_m = _prob_res_m.get("razon_principal","")
                             _pfpos_m = _prob_res_m.get("factores_positivos",[])
                             _pfneg_m = _prob_res_m.get("factores_negativos",[])
-                            _pconf_m = int(_prob_res_m.get("confianza",50))
+                            _pconf_m = _safe_int_pct(_prob_res_m.get("confianza", 50))
                             if _pblk_m != "NINGUNO":
                                 _pmc,_pmbg,_pmico = "#EF4444","#FEF2F2","🚫"
                                 _pmdec = "BLOQUEADO"
@@ -17654,17 +18382,23 @@ with tab_score:
                                 + '</div>', unsafe_allow_html=True)
 
         # ══ CAPITAL ALLOCATOR — Candidatos para MVALLE ════════════
-        # Solo mostrar acciones con veredicto ✅ ENTRAR o ⚡ PARCIAL
-        # (Score ≥15 + WR ≥50%) — misma lógica que el badge
+        # Solo mostrar acciones con veredicto cruzado ✅/🔥 ENTRAR o ⚡ PARCIAL
+        # Mismo cálculo que las cards: Score + WR + C-Score
+        def _es_candidato(r):
+            if r["TOTAL"] < 15: return False
+            _wr_r = r.get("_wr_pre", 50)
+            _cs_r = st.session_state.get(f"cscore_{r['Ticker']}", {}).get("c_total")
+            if _cs_r is not None:
+                _v, _, _, _ = _veredicto_cruzado(r["TOTAL"], _cs_r, _wr_r)
+                return _v.startswith(("✅","⚡","🔥"))
+            # Sin C-Score aún → fallback a Rec clásico
+            return str(r.get("Rec","")).startswith(("✅","⚡"))
+
         _top_nbis = sorted(
-            [r for r in _nbis_rows
-             if r["TOTAL"] >= 15 and
-             str(r.get("Rec","")).startswith(("✅","⚡"))],
+            [r for r in _nbis_rows if _es_candidato(r)],
             key=lambda x: x["TOTAL"], reverse=True)
         _top_mom = sorted(
-            [r for r in _mom_rows
-             if r["TOTAL"] >= 15 and
-             str(r.get("Rec","")).startswith(("✅","⚡"))],
+            [r for r in _mom_rows if _es_candidato(r)],
             key=lambda x: x["TOTAL"], reverse=True)
 
         if _top_nbis or _top_mom:
@@ -18073,6 +18807,17 @@ with tab_noticias:
             "  RIESGO_OCULTO: algo que el mercado no ha descontado aún\n\n"
             "Narrative Score (0-9): Claridad(0-3) + Impacto(0-3) + Confirmación(0-3)\n"
             "  8-9: ROJO · actuar · 5-7: NARANJA · precaución · 3-4: AMARILLO · monitorear\n\n"
+            "=== BÚSQUEDA OBLIGATORIA (usa web_search) ===\n"
+            f"Busca en este orden EXACTO para {tk}:\n"
+            f"1. '{tk} deal contract lease agreement MW capacity hyperscaler {_hoy}' — contratos nuevos\n"
+            f"2. '{tk} after hours after-hours news June 2026' — noticias after-hours recientes\n"
+            f"3. '{tk} analyst upgrade target raise price {_hoy}' — upgrades de analistas\n"
+            f"4. '{tk} investment infrastructure billion 2026' — inversiones en infraestructura\n"
+            f"5. '{tk} earnings revenue guidance 2026' — resultados y guía\n"
+            "PRIORIDAD: contratos de capacidad (MW, GB, data center, cloud), "
+            "deals con hyperscalers (Amazon, Google, Microsoft, Meta, Oracle), "
+            "inversiones en infraestructura AI, noticias after-hours del día anterior. "
+            "Un deal de $1B+ firmado after-hours es más importante que cualquier movimiento técnico.\n\n"
             "RETORNA SOLO JSON sin markdown:\n"
             '{"noticia_principal":"1-2 oraciones qué pasó HOY",'
             '"por_que":"por qué el mercado reaccionó así",'
@@ -18190,6 +18935,60 @@ with tab_noticias:
         _rows = _df.to_dict("records") if hasattr(_df,"to_dict") else _df
         return [r for r in _rows if not r.get("Fecha_Salida") and r.get("Ticker")]
 
+    def _escribir_cscore_entrada(sheet_name, ticker, c_score_valor):
+        """Escribe C_Score_Entrada en el Sheet para un ticker específico."""
+        try:
+            from googleapiclient.discovery import build
+            from google.oauth2 import service_account
+            import os
+            os.environ["PYTHONHTTPSVERIFY"] = "0"
+            os.environ["CURL_CA_BUNDLE"]    = ""
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
+            svc = build("sheets","v4",credentials=creds,cache_discovery=False)
+            _sheet_ids = dict(st.secrets.get("sheets", {}))
+            _sheet_id  = _sheet_ids.get(
+                "posiciones_mauri_id" if "Mauri" in sheet_name else "posiciones_amparito_id",
+                ""
+            )
+            if not _sheet_id: return False
+            # Leer la hoja para encontrar la fila y columna de C_Score_Entrada
+            _data = svc.spreadsheets().values().get(
+                spreadsheetId=_sheet_id, range="A1:ZZ500").execute()
+            _vals = _data.get("values", [])
+            if not _vals: return False
+            _headers = [str(h).strip() for h in _vals[0]]
+            # Encontrar columna C_Score_Entrada
+            if "C_Score_Entrada" not in _headers: return False
+            _col_idx = _headers.index("C_Score_Entrada")
+            _col_letter = chr(ord("A") + _col_idx) if _col_idx < 26 else \
+                f"A{chr(ord('A') + _col_idx - 26)}"
+            # Encontrar fila del ticker
+            _tk_col = "A"
+            if "Ticker" in _headers:
+                _tk_idx = _headers.index("Ticker")
+                _tk_col = chr(ord("A") + _tk_idx) if _tk_idx < 26 else \
+                    f"A{chr(ord('A') + _tk_idx - 26)}"
+            for _i, _row in enumerate(_vals[1:], 2):
+                _row_padded = _row + [""] * (len(_headers) - len(_row))
+                if str(_row_padded[_headers.index("Ticker")] if "Ticker" in _headers else "").upper() == ticker.upper():
+                    # Solo escribir si la celda está vacía
+                    _current = _row_padded[_col_idx] if _col_idx < len(_row_padded) else ""
+                    if not str(_current).strip():
+                        svc.spreadsheets().values().update(
+                            spreadsheetId=_sheet_id,
+                            range=f"{_col_letter}{_i}",
+                            valueInputOption="RAW",
+                            body={"values": [[str(c_score_valor)]]}
+                        ).execute()
+                        return True
+            return False
+        except Exception as _ex:
+            return False
+
     def _prioridad_pos(p, pnl=0):
         fase = str(p.get("Fase","")).upper()
         if "M1" in fase: return 0
@@ -18216,7 +19015,7 @@ with tab_noticias:
         def _procesar_una(p):
             _tk = str(p.get("Ticker","")).upper()
             try:
-                _pc = float(p.get("Precio_Compra",0) or 0)
+                _pc = _parse_precio(p.get("Precio_Compra", 0))
                 _pa = float(get_row_for_ticker(_tk,_pc)["Precio"])
                 _pnl = round((_pa-_pc)/_pc*100,1) if _pc>0 else 0
             except Exception: _pc=0; _pnl=0
@@ -18289,7 +19088,7 @@ with tab_noticias:
         for _p in posiciones:
             _tk = str(_p.get("Ticker","")).upper()
             try:
-                _pc = float(_p.get("Precio_Compra",0) or 0)
+                _pc = _parse_precio(_p.get("Precio_Compra", 0))
                 _pa = float(get_row_for_ticker(_tk,_pc)["Precio"])
                 _pnls[_tk] = round((_pa-_pc)/_pc*100,1) if _pc>0 else 0
             except Exception: _pnls[_tk]=0
@@ -18298,7 +19097,7 @@ with tab_noticias:
         for _p2 in _pos_sorted:
             _tk2   = str(_p2.get("Ticker","")).upper()
             _pnl2  = _pnls.get(_tk2, 0)
-            _pc2   = float(_p2.get("Precio_Compra",0) or 0)
+            _pc2   = _parse_precio(_p2.get("Precio_Compra", 0))
             _an    = resultados.get(_tk2)
             _fase2 = str(_p2.get("Fase","—"))
             _pnl_col = "#16A34A" if _pnl2>=0 else "#EF4444"
@@ -18324,7 +19123,7 @@ with tab_noticias:
                         _mkt_r = st.session_state.get("mercado_data",{}).get("regimen","NEUTRO")
                         _tech_i = _get_technicals_live(_tk2)
                         try:
-                            _pc_i = float(_p2.get("Precio_Compra",0) or 0)
+                            _pc_i = _parse_precio(_p2.get("Precio_Compra", 0))
                             _pa_i = float(get_row_for_ticker(_tk2,_pc_i)["Precio"])
                             _pnl_i = round((_pa_i-_pc_i)/_pc_i*100,1) if _pc_i>0 else 0
                         except Exception: _pc_i=0; _pnl_i=0
@@ -18419,16 +19218,325 @@ with tab_noticias:
     # Flujo: scan técnico rápido → detectar alertas → IA solo si hay motivo
     import datetime as _dt_not2, json as _json_nc, os as _os_nc, time as _time_nc
 
-    # ── Toggle modo dev ──────────────────────────────────────────────
+    # ── Toggle modo dev (definido antes del Radar Macro) ──────────
     _col_dev1, _col_dev2 = st.columns([5,1])
     with _col_dev2:
         _modo_dev = st.toggle("🛠️ Dev", value=False, key="modo_dev_noticias",
                               help="Modo desarrollo: desactiva IA para ahorrar tokens")
 
+    # ══ RADAR MACRO — Impacto eventos macro en posiciones ══════════
+    # Calendario hardcodeado + lógica beta/sector · costo $0.00
+    _RADAR_EVENTOS = [
+        # Junio 2026
+        {"fecha":"10-Jun-2026","hora":"8:30 AM ET","mes":"Junio",
+         "evento":"CPI Mayo 2026","tipo":"CPI",
+         "consenso":"4.2% YoY","anterior":"3.8% YoY","impacto":"ALTO",
+         "peor_desc":"CPI > 4.3% — sorpresa negativa · Fed no baja tasas",
+         "base_desc":"CPI 3.9–4.2% — en línea con consenso",
+         "mejor_desc":"CPI < 3.8% — baja inesperada · apertura a recortes"},
+        {"fecha":"17-Jun-2026","hora":"2:00 PM ET","mes":"Junio",
+         "evento":"Fed Decision FOMC Junio","tipo":"FED",
+         "consenso":"Sin cambio 5.25–5.50%","anterior":"5.25–5.50%","impacto":"ALTO",
+         "peor_desc":"Tono hawkish — posible alza · sin cortes en 2026",
+         "base_desc":"Pausa con lenguaje neutral — sin cambio",
+         "mejor_desc":"Señal dovish — abre puerta a corte en Sep"},
+        {"fecha":"25-Jun-2026","hora":"8:30 AM ET","mes":"Junio",
+         "evento":"PCE Inflation Mayo","tipo":"PCE",
+         "consenso":"2.8% core YoY","anterior":"2.8%","impacto":"MEDIO",
+         "peor_desc":"PCE core > 3.0% — inflación estructural",
+         "base_desc":"PCE core 2.7–2.9% — en línea",
+         "mejor_desc":"PCE core < 2.5% — desinflación clara"},
+        # Julio 2026
+        {"fecha":"07-Jul-2026","hora":"8:30 AM ET","mes":"Julio",
+         "evento":"Jobs Report Junio 2026","tipo":"JOBS",
+         "consenso":"~150k empleos","anterior":"172k","impacto":"ALTO",
+         "peor_desc":"Jobs > 200k — economía caliente · Fed no corta",
+         "base_desc":"Jobs 100–160k — aterrizaje suave",
+         "mejor_desc":"Jobs < 80k — Fed puede actuar en Sep"},
+        {"fecha":"08-Jul-2026","hora":"8:30 AM ET","mes":"Julio",
+         "evento":"CPI Junio 2026","tipo":"CPI",
+         "consenso":"~4.0% YoY","anterior":"4.2% YoY","impacto":"ALTO",
+         "peor_desc":"CPI > 4.2% — inflación no cede",
+         "base_desc":"CPI 3.8–4.1% — leve mejora",
+         "mejor_desc":"CPI < 3.5% — tendencia a la baja clara"},
+        {"fecha":"29-Jul-2026","hora":"2:00 PM ET","mes":"Julio",
+         "evento":"Fed Decision FOMC Julio","tipo":"FED",
+         "consenso":"Sin cambio","anterior":"5.25–5.50%","impacto":"ALTO",
+         "peor_desc":"Alza sorpresiva o hawkish extremo",
+         "base_desc":"Pausa — esperar más datos",
+         "mejor_desc":"Corte 25bps o señal explícita de corte Sep"},
+        {"fecha":"29-Jul-2026","hora":"AMC","mes":"Julio",
+         "evento":"NBIS Earnings Q2 2026","tipo":"EARNINGS",
+         "consenso":"Revenue ~$700M · EPS -$0.30","anterior":"Q1: +684% YoY","impacto":"ALTO",
+         "peor_desc":"Revenue miss · guidance baja · capex se dispara",
+         "base_desc":"In-line · guidance mantenida",
+         "mejor_desc":"Revenue beat · guidance subida · contratos nuevos"},
+    ]
+
+    # Sensibilidad por sector y tipo de evento
+    _SENSIB = {
+        "CPI":  {
+            "AI":         {"p":-0.14,"b":-0.02,"m":+0.10},
+            "Cloud":      {"p":-0.13,"b":-0.02,"m":+0.09},
+            "Solar":      {"p":-0.11,"b":-0.02,"m":+0.08},
+            "SaaS":       {"p":-0.10,"b":-0.02,"m":+0.07},
+            "Semiconductor":{"p":-0.10,"b":-0.02,"m":+0.07},
+            "Biotech":    {"p":-0.05,"b":0.00, "m":+0.04},
+            "Pharma":     {"p":-0.04,"b":0.00, "m":+0.03},
+            "Healthcare": {"p":-0.04,"b":0.00, "m":+0.03},
+            "Defense":    {"p":+0.02,"b":+0.01,"m":0.00},
+            "Energy":     {"p":+0.04,"b":+0.02,"m":-0.02},
+            "Telecom":    {"p":-0.03,"b":-0.01,"m":+0.02},
+            "Consumer":   {"p":-0.05,"b":-0.01,"m":+0.03},
+            "Default":    {"p":-0.06,"b":-0.01,"m":+0.05},
+        },
+        "FED":  {
+            "AI":         {"p":-0.12,"b":0.00,"m":+0.12},
+            "Cloud":      {"p":-0.11,"b":0.00,"m":+0.11},
+            "Solar":      {"p":-0.10,"b":0.00,"m":+0.10},
+            "SaaS":       {"p":-0.09,"b":0.00,"m":+0.09},
+            "Biotech":    {"p":-0.04,"b":0.00,"m":+0.05},
+            "Defense":    {"p":+0.01,"b":+0.01,"m":0.00},
+            "Default":    {"p":-0.07,"b":0.00,"m":+0.07},
+        },
+        "JOBS": {
+            "AI":         {"p":-0.09,"b":0.00,"m":+0.08},
+            "Cloud":      {"p":-0.08,"b":0.00,"m":+0.07},
+            "Solar":      {"p":-0.07,"b":0.00,"m":+0.06},
+            "Default":    {"p":-0.05,"b":0.00,"m":+0.05},
+        },
+        "PCE":  {
+            "AI":         {"p":-0.08,"b":-0.01,"m":+0.07},
+            "Default":    {"p":-0.04,"b":0.00, "m":+0.04},
+        },
+        "EARNINGS": {
+            "Default":    {"p":-0.15,"b":+0.02,"m":+0.18},
+        },
+    }
+
+    def _sector_key(sector_str):
+        """Mapea sector a clave de sensibilidad."""
+        _s = str(sector_str or "").lower()
+        if any(x in _s for x in ["ai","cloud","nebius","neocloud"]): return "AI"
+        if any(x in _s for x in ["software","saas","tech"]): return "SaaS"
+        if any(x in _s for x in ["solar","clean","renew","array"]): return "Solar"
+        if any(x in _s for x in ["semi","chip","nvidia","amd"]): return "Semiconductor"
+        if any(x in _s for x in ["bio","therapeut","kros","cmpx"]): return "Biotech"
+        if any(x in _s for x in ["pharma","drug","incyte"]): return "Pharma"
+        if any(x in _s for x in ["health","medic","gehc","iqv"]): return "Healthcare"
+        if any(x in _s for x in ["defense","aerosp","raytheon","northrop","rcat"]): return "Defense"
+        if any(x in _s for x in ["energy","oil","gas","petro"]): return "Energy"
+        if any(x in _s for x in ["telecom","wireless","verizon","at&t"]): return "Telecom"
+        if any(x in _s for x in ["consumer","retail","luxury","estee"]): return "Consumer"
+        return "Default"
+
+    def _calc_impacto(beta, sector, tipo_evento, escenario):
+        _sk    = _sector_key(sector)
+        _tbl   = _SENSIB.get(tipo_evento, _SENSIB["CPI"])
+        _sens  = _tbl.get(_sk, _tbl.get("Default", {"p":-0.06,"b":0.00,"m":+0.05}))
+        _base  = _sens[escenario]
+        # Beta amplifica linealmente (cap en 3x)
+        _beta_mult = min(float(beta or 1.0), 3.0)
+        return round(_base * _beta_mult, 3)
+
+    # ── UI del Radar Macro ────────────────────────────────────────
+    with st.expander("🌐 Radar Macro — Impacto en tu portafolio", expanded=False):
+        # Selector de evento
+        _ev_labels = [f"📅 {e['fecha']} · {e['evento']}" for e in _RADAR_EVENTOS]
+        _ev_idx    = st.selectbox("Selecciona el evento macro:", range(len(_ev_labels)),
+                                  format_func=lambda i: _ev_labels[i],
+                                  key="radar_evento_sel")
+        _ev = _RADAR_EVENTOS[_ev_idx]
+
+        # Info del evento
+        _ev_tipo_c = {"CPI":"#EF4444","FED":"#7C3AED","JOBS":"#D97706",
+                      "PCE":"#F97316","EARNINGS":"#0891B2"}.get(_ev["tipo"],"#64748B")
+        st.markdown(
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            f'border-left:4px solid {_ev_tipo_c};border-radius:8px;'
+            f'padding:10px 14px;margin:8px 0">'
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+            f'<span style="background:{_ev_tipo_c};color:white;font-size:10px;'
+            f'font-weight:800;padding:2px 7px;border-radius:4px">{_ev["tipo"]}</span>'
+            f'<strong style="color:#1E293B">{_ev["evento"]}</strong>'
+            f'<span style="font-size:11px;color:#64748B;margin-left:auto">'
+            f'{_ev["fecha"]} · {_ev.get("hora","")}</span>'
+            f'</div>'
+            f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px">'
+            f'<div><span style="color:#94A3B8">Consenso:</span> '
+            f'<strong>{_ev["consenso"]}</strong></div>'
+            f'<div><span style="color:#94A3B8">Anterior:</span> '
+            f'<strong>{_ev["anterior"]}</strong></div>'
+            f'</div></div>', unsafe_allow_html=True)
+
+        # Selector escenario
+        _esc_col1, _esc_col2, _esc_col3 = st.columns(3)
+        with _esc_col1:
+            _btn_peor  = st.button("🔴 Escenario PEOR",  key="radar_peor",
+                                    use_container_width=True)
+        with _esc_col2:
+            _btn_base  = st.button("🟡 Escenario BASE",  key="radar_base",
+                                    use_container_width=True)
+        with _esc_col3:
+            _btn_mejor = st.button("🟢 Escenario MEJOR", key="radar_mejor",
+                                    use_container_width=True)
+
+        # Determinar escenario activo
+        if _btn_peor:  st.session_state["radar_esc"] = "p"
+        if _btn_base:  st.session_state["radar_esc"] = "b"
+        if _btn_mejor: st.session_state["radar_esc"] = "m"
+        _esc_act = st.session_state.get("radar_esc", "b")
+        _esc_labels = {"p":"🔴 PEOR","b":"🟡 BASE","m":"🟢 MEJOR"}
+        _esc_desc   = {"p":_ev["peor_desc"],"b":_ev["base_desc"],"m":_ev["mejor_desc"]}
+        st.markdown(
+            f'<div style="background:#F1F5F9;border-radius:6px;'
+            f'padding:7px 12px;font-size:11px;margin-bottom:8px">'
+            f'<strong>{_esc_labels[_esc_act]}:</strong> {_esc_desc[_esc_act]}'
+            f'</div>', unsafe_allow_html=True)
+
+        # Calcular impacto por posición — cargar independiente (Radar va antes del scan)
+        try:
+            _pm_radar = _leer_activas(_SHEET_NAME_MAURI)
+            for _p in _pm_radar: _p["_portfolio"] = "MVALLE"
+            _pa_radar = _leer_activas(_SHEET_NAME_AMPARITO)
+            for _p in _pa_radar: _p["_portfolio"] = "Amparito"
+            _tks_seen_radar = set()
+            _pos_all = []
+            for _p in _pm_radar + _pa_radar:
+                _tk_dd = str(_p.get("Ticker","")).upper()
+                if _tk_dd and _tk_dd not in _tks_seen_radar:
+                    _tks_seen_radar.add(_tk_dd)
+                    _pos_all.append(_p)
+        except Exception:
+            _pos_all = []
+
+        if _pos_all:
+            _radar_rows = []
+            for _p in _pos_all:
+                _tk  = str(_p.get("Ticker","")).upper()
+                _sec = str(_p.get("Sector","") or _p.get("Area",""))
+                _pf  = _p.get("_portfolio", _p.get("_pf",""))
+                # Beta desde session_state si ya fue calculado, si no default por sector
+                _beta_r = float(st.session_state.get(
+                    f"beta_cache_{_tk}", 1.0) or 1.0)
+                _pct = _calc_impacto(_beta_r, _sec, _ev["tipo"], _esc_act)
+                # Precio entrada para calcular impacto en $
+                _pc_r = _parse_precio(_p.get("Precio_Compra", 0))
+                _qty_r= int(max(1.0, _parse_precio(_p.get("Cantidad", 1))))
+                _impacto_usd = round(_pc_r * _qty_r * _pct, 0) if _pc_r > 0 else 0
+                _nivel = ("ALTO" if abs(_pct) >= 0.08
+                          else "MEDIO" if abs(_pct) >= 0.04
+                          else "BAJO")
+                _radar_rows.append({
+                    "tk": _tk, "sector": _sec, "pf": _pf,
+                    "beta": _beta_r, "pct": _pct,
+                    "impacto_usd": _impacto_usd, "nivel": _nivel
+                })
+
+            # Ordenar por impacto absoluto descendente
+            _radar_rows.sort(key=lambda x: abs(x["pct"]), reverse=True)
+
+            # Totales
+            _tot_usd = sum(r["impacto_usd"] for r in _radar_rows)
+            _n_alto  = sum(1 for r in _radar_rows if r["nivel"]=="ALTO")
+            _n_medio = sum(1 for r in _radar_rows if r["nivel"]=="MEDIO")
+            _n_bajo  = sum(1 for r in _radar_rows if r["nivel"]=="BAJO")
+            _tot_c   = "#EF4444" if _tot_usd < 0 else "#16A34A"
+
+            st.markdown(
+                f'<div style="background:#0F172A;border-radius:8px;'
+                f'padding:10px 14px;margin:8px 0;display:flex;'
+                f'align-items:center;gap:16px">'
+                f'<div style="color:#94A3B8;font-size:11px">Impacto total portafolio</div>'
+                f'<div style="font-size:20px;font-weight:900;color:{_tot_c}">'
+                f'{"+" if _tot_usd >= 0 else ""}${_tot_usd:,.0f}</div>'
+                f'<div style="margin-left:auto;font-size:10px;color:#64748B">'
+                f'{_n_alto} alto · {_n_medio} medio · {_n_bajo} bajo</div>'
+                f'</div>', unsafe_allow_html=True)
+
+            # Tabla por posición
+            for _r in _radar_rows:
+                _pc  = "#EF4444" if _r["pct"] < -0.07 else "#D97706" if _r["pct"] < -0.03 else "#16A34A" if _r["pct"] > 0.03 else "#64748B"
+                _pbg = "#FEF2F2" if _r["pct"] < -0.07 else "#FFFBEB" if _r["pct"] < -0.03 else "#F0FDF4" if _r["pct"] > 0.03 else "#F8FAFC"
+                _usd_str = f'{"+" if _r["impacto_usd"]>=0 else ""}${_r["impacto_usd"]:,.0f}' if _r["impacto_usd"] != 0 else "—"
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:10px;'
+                    f'padding:7px 10px;background:{_pbg};border-radius:6px;'
+                    f'border:1px solid {_pc}30;margin-bottom:4px">'
+                    f'<strong style="min-width:52px;font-size:13px;color:#1E293B">{_r["tk"]}</strong>'
+                    f'<span style="font-size:10px;color:#64748B;flex:1">'
+                    f'{_sector_key(_r["sector"])} · β{_r["beta"]:.1f}</span>'
+                    f'<span style="font-size:10px;color:#94A3B8">{_r["pf"]}</span>'
+                    f'<span style="font-size:14px;font-weight:800;'
+                    f'color:{_pc};min-width:55px;text-align:right">'
+                    f'{"+" if _r["pct"]>=0 else ""}{_r["pct"]*100:.1f}%</span>'
+                    f'<span style="font-size:11px;font-weight:700;'
+                    f'color:{_pc};min-width:70px;text-align:right">{_usd_str}</span>'
+                    f'</div>', unsafe_allow_html=True)
+
+            # Botón análisis IA (opcional)
+            if not _modo_dev and _n_alto > 0:
+                if st.button(
+                    f"🔍 Análisis IA: impacto real de {_ev['evento']} en mis posiciones",
+                    key="btn_radar_ia", use_container_width=True, type="secondary"):
+                    with st.spinner(f"Analizando {_ev['evento']} con contexto narrativo..."):
+                        import anthropic as _ant_rm
+                        _cl_rm = _ant_rm.Anthropic(api_key=(
+                            st.secrets.get("ANTHROPIC_API_KEY","")
+                            or st.secrets.get("anthropic",{}).get("api_key","")
+                            or st.secrets.get("gcp_service_account",{}).get("ANTHROPIC_API_KEY","")
+                        ))
+                        _tks_alto = [r["tk"] for r in _radar_rows if r["nivel"]=="ALTO"]
+                        _prompt_rm = (
+                            f"Evento macro: {_ev['evento']} el {_ev['fecha']}. "
+                            f"Consenso: {_ev['consenso']}. Anterior: {_ev['anterior']}.\n"
+                            f"Escenario: {_esc_labels[_esc_act]} — {_esc_desc[_esc_act]}\n\n"
+                            f"Tengo estas posiciones de alto impacto: {', '.join(_tks_alto)}.\n"
+                            f"Para cada una, busca noticias recientes y di:\n"
+                            f"1. ¿Tiene catalizador propio que amortigüe el macro?\n"
+                            f"2. ¿La narrativa del sector está alineada o en contra?\n"
+                            f"3. ¿Recomendarías reducir exposición antes del evento?\n\n"
+                            f"Responde en español, de forma concisa por ticker."
+                        )
+                        _resp_rm = _cl_rm.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=800,
+                            tools=[{"type":"web_search_20250305","name":"web_search"}],
+                            messages=[{"role":"user","content":_prompt_rm}]
+                        )
+                        _txt_rm = " ".join(
+                            b.text for b in _resp_rm.content
+                            if hasattr(b,"text") and b.text
+                        ).strip()
+                        st.session_state["radar_ia_result"] = _txt_rm
+
+                if st.session_state.get("radar_ia_result"):
+                    st.markdown(
+                        f'<div style="background:#F0FDF4;border:1px solid #86EFAC;'
+                        f'border-left:4px solid #16A34A;border-radius:8px;'
+                        f'padding:12px 14px;margin-top:8px;font-size:12px;'
+                        f'color:#1E293B;line-height:1.7">'
+                        f'🤖 <strong>Análisis IA:</strong><br>'
+                        f'{st.session_state["radar_ia_result"].replace(chr(10),"<br>")}'
+                        f'</div>', unsafe_allow_html=True)
+        else:
+            st.info("Sin posiciones activas en MVALLE o Amparito para analizar")
+
+    st.markdown("---")
+
     # ── Leer posiciones reales ───────────────────────────────────────
     _pos_mvalle   = _leer_activas(_SHEET_NAME_MAURI)
+    for _p in _pos_mvalle:   _p["_portfolio"] = "MVALLE"
     _pos_amparito = _leer_activas(_SHEET_NAME_AMPARITO)
-    _pos_reales   = _pos_mvalle + _pos_amparito
+    for _p in _pos_amparito: _p["_portfolio"] = "Amparito"
+    # Deduplicar por ticker — si aparece en ambas, priorizar MVALLE
+    _tks_seen = set()
+    _pos_reales = []
+    for _p in _pos_mvalle + _pos_amparito:
+        _tk_dd = str(_p.get("Ticker","")).upper()
+        if _tk_dd and _tk_dd not in _tks_seen:
+            _tks_seen.add(_tk_dd)
+            _pos_reales.append(_p)
 
     if not _pos_reales:
         st.info("Sin posiciones activas en MVALLE o Amparito")
@@ -18446,7 +19554,7 @@ with tab_noticias:
                 for _p in _pos_reales:
                     _tk = str(_p.get("Ticker","")).upper()
                     try:
-                        _pc = float(_p.get("Precio_Compra",0) or 0)
+                        _pc = _parse_precio(_p.get("Precio_Compra", 0))
                         _tech = _get_technicals_live(_tk)
                         _pa   = float(get_row_for_ticker(_tk,_pc).get("Precio",_pc) or _pc)
                         _pnl  = round((_pa-_pc)/_pc*100,1) if _pc>0 else 0
@@ -18484,10 +19592,65 @@ with tab_noticias:
                         # ALERTA 6: ganancia grande — considerar parcial
                         if _pnl > 20:
                             _alertas.append(("💰", f"Ganancia {_pnl:+.1f}% — ¿toma parcial?", "VERDE"))
+                        # ALERTA 7: subida fuerte hoy — posible catalizador positivo
+                        _c1d_hoy = float(_tech.get("c1d", 0) or 0)
+                        if _c1d_hoy > 5:
+                            _alertas.append(("🚀", f"Subió {_c1d_hoy:+.1f}% hoy — catalizador fuerte · revisar", "VERDE"))
+                        elif _c1d_hoy > 3:
+                            _alertas.append(("📈", f"Subió {_c1d_hoy:+.1f}% hoy — posible noticia positiva", "VERDE"))
+                        # ALERTA 8: cerca de ATH con momentum — señal de continuación
+                        _dist_ath = float(_tech.get("dist_52w", 0) or 0)  # distancia al 52W high
+                        if _c1d_hoy > 3 and _dist_ath > -15 and _pnl > 15:
+                            _alertas.append(("⬆️", f"A {abs(_dist_ath):.0f}% del ATH con momentum · analizar upside", "VERDE"))
+                        # ── C-Score gestión: calcular + comparar con entrada ──                        _cs_actual = None
+                        _cs_entrada = None
+                        _cs_delta   = None
+                        _cs_gestion = "—"
+                        try:
+                            # 1. C-Score actual (desde session_state o calcular)
+                            _cs_cache_key = f"cscore_{_tk}"
+                            if _cs_cache_key not in st.session_state:
+                                _cs_result = _calcular_c_score_free(
+                                    _tk, str(_p.get("Sector","") or _p.get("Area","")),
+                                    float(_p.get("Beta",1.0) or 1.0))
+                                st.session_state[_cs_cache_key] = _cs_result
+                            _cs_actual = st.session_state[_cs_cache_key].get("c_total")
+
+                            # 2. C-Score de entrada (desde el Sheet)
+                            _cs_ent_raw = str(_p.get("C_Score_Entrada","") or "").strip()
+                            if _cs_ent_raw and _cs_ent_raw.isdigit():
+                                _cs_entrada = int(_cs_ent_raw)
+                            elif _cs_actual is not None:
+                                # Primera vez: registrar C-Score actual como baseline
+                                _sheet_n = (_SHEET_NAME_MAURI
+                                    if _p.get("_portfolio") == "MVALLE"
+                                    else _SHEET_NAME_AMPARITO)
+                                _escribir_cscore_entrada(_sheet_n, _tk, _cs_actual)
+                                _cs_entrada = _cs_actual  # misma sesión → delta 0
+
+                            # 3. Delta
+                            if _cs_actual is not None and _cs_entrada is not None:
+                                _cs_delta = _cs_actual - _cs_entrada
+                                if _cs_delta >= 5:
+                                    _cs_gestion = "💪 Tesis reforzada"
+                                elif _cs_delta >= -10:
+                                    _cs_gestion = "🟡 Tesis estable"
+                                elif _cs_delta >= -20:
+                                    _cs_gestion = "⚠️ Tesis debilitada"
+                                else:
+                                    _cs_gestion = "🔴 Catalizador agotado"
+                        except Exception: pass
+
                         _scan_res[_tk] = {
                             "tk": _tk, "pnl": _pnl, "rsi": _rsi, "dd": _dd,
                             "macd": _macd, "fase": _fase, "dias": _dias,
-                            "alertas": _alertas, "portfolio": str(_p.get("_portfolio",""))
+                            "alertas": _alertas, "portfolio": str(_p.get("_portfolio","")),
+                            "c_score":    _cs_actual,
+                            "c_entrada":  _cs_entrada,
+                            "c_delta":    _cs_delta,
+                            "c_gestion":  _cs_gestion,
+                            "c_earn_dias": st.session_state.get(f"cscore_{_tk}", {}).get("earn_dias"),
+                            "c_insider": st.session_state.get(f"cscore_{_tk}", {}).get("insider_flag","NEUTRO"),
                         }
                     except Exception: pass
                 st.session_state[_scan_key] = _scan_res
@@ -18499,6 +19662,11 @@ with tab_noticias:
         _con_alerta = {tk: d for tk,d in _scan_res.items() if d.get("alertas")}
         _sin_alerta = {tk: d for tk,d in _scan_res.items() if not d.get("alertas")}
         _n_alertas  = len(_con_alerta)
+        # Separar alertas ofensivas (VERDE) de defensivas (ROJO/NARANJA)
+        _n_positivas  = sum(1 for d in _con_alerta.values()
+                            if any(a[2]=="VERDE" for a in d["alertas"])
+                            and not any(a[2] in ("ROJO","NARANJA") for a in d["alertas"]))
+        _n_defensivas = _n_alertas - _n_positivas
 
         # ── Header de estado ─────────────────────────────────────────
         if _n_alertas == 0:
@@ -18514,22 +19682,35 @@ with tab_noticias:
                 '<span style="font-size:10px;color:#94A3B8;margin-left:auto">Costo IA: $0.00</span>'
                 '</div>', unsafe_allow_html=True)
         else:
-            _col_sev = "#EF4444" if any(
-                a[2]=="ROJO" for d in _con_alerta.values() for a in d["alertas"]
-            ) else "#D97706"
-            _col_bg  = "#FEF2F2" if _col_sev=="#EF4444" else "#FFFBEB"
-            _col_bd  = "#FECACA" if _col_sev=="#EF4444" else "#FDE68A"
+            # Determinar color según tipo dominante
+            _hay_rojo = any(
+                any(a[2]=="ROJO" for a in d["alertas"])
+                for d in _con_alerta.values()
+            )
+            _hay_solo_verde = _n_positivas > 0 and _n_defensivas == 0
+            if _hay_solo_verde:
+                _col_sev = "#16A34A"; _col_bg = "#F0FDF4"; _col_bd = "#86EFAC"
+                _icono = "📈"; _titulo = f"{_n_positivas} oportunidad{'es' if _n_positivas>1 else ''} detectada{'s' if _n_positivas>1 else ''}"
+            elif _hay_rojo:
+                _col_sev = "#EF4444"; _col_bg = "#FEF2F2"; _col_bd = "#FECACA"
+                _icono = "⚠️"; _titulo = f"{_n_alertas} alerta{'s' if _n_alertas>1 else ''} detectada{'s' if _n_alertas>1 else ''}"
+            else:
+                _col_sev = "#D97706"; _col_bg = "#FFFBEB"; _col_bd = "#FDE68A"
+                _icono = "⚠️"; _titulo = f"{_n_alertas} alerta{'s' if _n_alertas>1 else ''} detectada{'s' if _n_alertas>1 else ''}"
+            _subtitulo = []
+            if _n_positivas > 0:  _subtitulo.append(f"📈 {_n_positivas} positiva{'s' if _n_positivas>1 else ''}")
+            if _n_defensivas > 0: _subtitulo.append(f"⚠️ {_n_defensivas} riesgo{'s' if _n_defensivas>1 else ''}")
             st.markdown(
                 f'<div style="background:{_col_bg};border:1px solid {_col_bd};'
                 f'border-left:4px solid {_col_sev};border-radius:8px;'
                 f'padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px">'
-                f'<span style="font-size:20px">⚠️</span>'
+                f'<span style="font-size:20px">{_icono}</span>'
                 f'<div><span style="font-size:14px;font-weight:700;color:{_col_sev}">'
-                f'{_n_alertas} alerta{"s" if _n_alertas>1 else ""} detectada{"s" if _n_alertas>1 else ""}</span>'
+                f'{_titulo}</span>'
                 f'<span style="font-size:11px;color:#64748B;margin-left:10px">'
-                f'{_n_tot - _n_alertas} posiciones estables</span></div>'
+                f'{" · ".join(_subtitulo)}</span></div>'
                 f'<span style="font-size:10px;color:#94A3B8;margin-left:auto">'
-                f'Análisis IA: ${_n_alertas*0.003:.2f} estimado</span>'
+                f'Análisis IA: ${_n_alertas*0.003:.2f} est.</span>'
                 f'</div>', unsafe_allow_html=True)
 
         # ── SECCIÓN ALERTAS ──────────────────────────────────────────
@@ -18575,10 +19756,14 @@ with tab_noticias:
                 st.session_state.get("noticias_alerta_cache") or
                 _leer_cache_disco("noticias_alerta_cache") or {}
             )
-            # Ordenar: ROJO primero
+            # Ordenar: ROJO primero, luego VERDE (oportunidades), luego resto
             _alertas_sorted = sorted(_con_alerta.items(),
-                key=lambda x: 0 if any(a[2]=="ROJO" for a in x[1]["alertas"])
-                              else 1 if any(a[2]=="NARANJA" for a in x[1]["alertas"]) else 2)
+                key=lambda x: (
+                    0 if any(a[2]=="ROJO" for a in x[1]["alertas"])
+                    else 1 if any(a[2]=="NARANJA" for a in x[1]["alertas"])
+                    else 2 if any(a[2]=="VERDE" and "Subió" in a[1] for a in x[1]["alertas"])
+                    else 3
+                ))
 
             for _tk, _sd in _alertas_sorted:
                 _pnl_s = _sd["pnl"]
@@ -18601,7 +19786,16 @@ with tab_noticias:
                     f'<span style="font-size:13px;font-weight:700;color:{_pnl_c}">{_pnl_s:+.1f}%</span>'
                     f'<span style="font-size:11px;color:#94A3B8">RSI {_sd["rsi"]:.0f} · '
                     f'{"MACD +" if _sd["macd"] else "MACD −"} · {_sd["dias"]}d</span>'
-                    f'<span style="font-size:10px;color:#CBD5E1;margin-left:auto">{_sd["portfolio"]}</span>'
+                    + (
+                        f'<span style="font-size:10px;font-weight:700;'
+                        f'color:{"#16A34A" if (_sd.get("c_delta") or 0)>=0 else "#D97706" if (_sd.get("c_delta") or 0)>=-20 else "#EF4444"};'
+                        f'background:{"#F0FDF4" if (_sd.get("c_delta") or 0)>=0 else "#FFFBEB" if (_sd.get("c_delta") or 0)>=-20 else "#FEF2F2"};'
+                        f'padding:2px 6px;border-radius:4px">'
+                        f'C:{_sd["c_score"]}{"(" + (("+" if _sd["c_delta"]>=0 else "") + str(_sd["c_delta"]) + "pts)") if _sd.get("c_delta") is not None else ""}'
+                        f'</span>'
+                        if _sd.get("c_score") is not None else ""
+                    )
+                    + f'<span style="font-size:10px;color:#CBD5E1;margin-left:auto">{_sd["portfolio"]}</span>'
                     f'</div>'
                     f'<div>{_badges_html}</div>'
                     f'</div>',
@@ -18623,7 +19817,7 @@ with tab_noticias:
                                 with st.spinner(f"Analizando {_tk}..."):
                                     _tech_a = _get_technicals_live(_tk)
                                     try:
-                                        _pc_a = float(_p_one.get("Precio_Compra",0) or 0)
+                                        _pc_a = _parse_precio(_p_one.get("Precio_Compra", 0))
                                         _pa_a = float(get_row_for_ticker(_tk,_pc_a).get("Precio",_pc_a))
                                         _pnl_a = round((_pa_a-_pc_a)/_pc_a*100,1) if _pc_a>0 else 0
                                     except Exception: _pc_a=0; _pnl_a=0
@@ -18646,6 +19840,22 @@ with tab_noticias:
                                 _cache_up[_tk] = _res_a
                                 st.session_state["noticias_alerta_cache"] = _cache_up
                                 _guardar_cache_disco("noticias_alerta_cache", _cache_up)
+                                _an_cache = _res_a  # mostrar inmediatamente sin rerun
+
+                    # Mostrar resultado IA si existe (dentro del card)
+                    if _an_cache and not _modo_dev:
+                        _vd  = _an_cache.get("veredicto","—")
+                        _raz = _an_cache.get("razon_corta","")
+                        _acc = _an_cache.get("accion_trader","")
+                        _vc2 = {"MANTENER":"#16A34A","REVISAR STOP":"#D97706",
+                                "SALIR":"#EF4444","SALIR PARCIAL":"#F97316"}.get(_vd,"#64748B")
+                        st.markdown(
+                            f'<div style="background:#F8FAFC;border-left:3px solid {_vc2};'
+                            f'padding:8px 12px;font-size:11px;color:#334155;margin-top:4px">'
+                            f'<strong style="color:{_vc2}">{_vd}</strong>'
+                            f'{"  · "+_raz if _raz else ""}'
+                            f'{"<br><em>"+_acc+"</em>" if _acc else ""}'
+                            f'</div>', unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
         # ── SECCIÓN ESTABLES — resumen compacto sin IA ───────────────
@@ -18656,6 +19866,9 @@ with tab_noticias:
                                         key=lambda x: -x[1]["pnl"]):
                     _pc = "#16A34A" if _sd["pnl"]>=0 else "#EF4444"
                     _mac_ico = "📈" if _sd["macd"] else "📉"
+                    _cs_not  = _sd.get("c_score")
+                    _cs_str  = (f' · C:{_cs_not}{"🔥" if _cs_not>=80 else "🟢" if _cs_not>=65 else "🟡" if _cs_not>=45 else "🔴"}'
+                                if _cs_not is not None else "")
                     st.markdown(
                         f'<div style="display:flex;align-items:center;gap:12px;'
                         f'padding:6px 4px;border-bottom:1px solid #F1F5F9">'
@@ -18664,6 +19877,7 @@ with tab_noticias:
                         f'<span style="font-size:11px;color:#64748B">RSI {_sd["rsi"]:.0f}</span>'
                         f'<span style="font-size:11px">{_mac_ico}</span>'
                         f'<span style="font-size:10px;color:#94A3B8">{_sd["fase"][:8]} · {_sd["dias"]}d</span>'
+                        f'<span style="font-size:10px;color:#7C3AED;font-weight:600">{_cs_str}</span>'
                         f'<span style="font-size:9px;color:#CBD5E1;margin-left:auto">{_sd["portfolio"]}</span>'
                         f'</div>', unsafe_allow_html=True)
 
