@@ -16703,12 +16703,30 @@ with tab_score:
                 "C3/C5 (analistas/deals) no son reconstruibles retroactivamente."
                 "</div>", unsafe_allow_html=True)
 
+            _bt_rango = st.radio(
+                "Rango de posiciones cerradas a incluir:",
+                ["Todas", "Últimos 30 días", "Últimos 60 días", "Últimos 90 días"],
+                index=0, horizontal=True, key="bt_rango_fechas")
+
             if st.button("▶️ Ejecutar Backtest C-Score", key="btn_backtest_cscore",
                           use_container_width=True, type="secondary"):
-                with st.spinner("Leyendo Trades_Reales y calculando C-Score histórico..."):
-                    _df_trades = leer_posiciones_sheets(_SHEET_NAME_TRADES)
+                with st.spinner("Leyendo posiciones cerradas y calculando C-Score histórico..."):
+                    # Posiciones cerradas viven en Posiciones_Greko (Fecha_Salida llena)
+                    # Trades_Reales como fuente adicional/fallback
+                    _df_greko_bt  = leer_posiciones_sheets(_SHEET_NAME_GREKO)
+                    _df_trades_bt = leer_posiciones_sheets(_SHEET_NAME_TRADES)
+                    _frames_bt = []
+                    if _df_greko_bt is not None and not _df_greko_bt.empty:
+                        _frames_bt.append(_df_greko_bt)
+                    if _df_trades_bt is not None and not _df_trades_bt.empty:
+                        _frames_bt.append(_df_trades_bt)
+                    if not _frames_bt:
+                        st.warning("No se pudo leer GrekoTrader_Posiciones_Greko ni Trades_Reales (o están vacíos).")
+                        _df_trades = None
+                    else:
+                        _df_trades = pd.concat(_frames_bt, ignore_index=True)
                     if _df_trades is None or _df_trades.empty:
-                        st.warning("No se pudo leer GrekoTrader_Trades_Reales o está vacío.")
+                        pass
                     else:
                         _bt_rows = []
                         _df_t = _df_trades.copy()
@@ -16731,6 +16749,17 @@ with tab_score:
                                 _fecha_bt = _fecha_bt.date()
                             except Exception:
                                 continue
+                            # Filtro por rango de fecha de SALIDA
+                            if _bt_rango != "Todas":
+                                import datetime as _dt_btf
+                                _dias_filtro = {"Últimos 30 días":30,"Últimos 60 días":60,"Últimos 90 días":90}[_bt_rango]
+                                try:
+                                    _fecha_salida_dt = pd.to_datetime(_fs_bt, errors="coerce", dayfirst=True)
+                                    if pd.isna(_fecha_salida_dt): continue
+                                    _dias_desde_salida = (_dt_btf.date.today() - _fecha_salida_dt.date()).days
+                                    if _dias_desde_salida > _dias_filtro: continue
+                                except Exception:
+                                    continue
                             _sector_bt = str(_row_t.get("Area","") or "")
                             _bt_rows.append({
                                 "Ticker": _tk_bt, "Fecha_Entrada": _fecha_bt,
@@ -18643,13 +18672,12 @@ with tab_noticias:
     # ── Selector de Sheet ───────────────────────────────────
     _sn_not = st.radio(
         "Portfolio a analizar:",
-        ["MVALLE", "Greko", "Mauri", "Amparito"],
+        ["Mauri", "Greko", "Amparito"],
         horizontal=True, key="radio_noticias_sheet")
 
     _sheet_not = {
-        "MVALLE":   _SHEET_NAME_MAURI,
-        "Greko":    _SHEET_NAME_GREKO,
         "Mauri":    _SHEET_NAME_MAURI,
+        "Greko":    _SHEET_NAME_GREKO,
         "Amparito": _SHEET_NAME_AMPARITO,
     }.get(_sn_not, _SHEET_NAME_GREKO)
 
@@ -18900,14 +18928,28 @@ with tab_noticias:
             "confianza":"BAJA","radar_sympathy":[]}
         try:
             import anthropic as _ant_not
-            _cl = _ant_not.Anthropic(api_key=(st.secrets.get("ANTHROPIC_API_KEY","") or st.secrets.get("anthropic",{}).get("api_key","") or st.secrets.get("gcp_service_account",{}).get("ANTHROPIC_API_KEY","")))
-            _r = _cl.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=700,
-                system=_sys,
-                tools=[{"type":"web_search_20250305","name":"web_search"}],
-                messages=[{"role":"user","content":_msg}]
-            )
+            _cl = _ant_not.Anthropic(api_key=(st.secrets.get("ANTHROPIC_API_KEY","") or st.secrets.get("anthropic",{}).get("api_key","") or st.secrets.get("gcp_service_account",{}).get("ANTHROPIC_API_KEY","")), timeout=45.0)
+            # Retry con backoff si rate limit (429) — hasta 3 intentos
+            import time as _time_retry
+            _r = None
+            for _intento in range(3):
+                try:
+                    _r = _cl.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=700,
+                        system=_sys,
+                        tools=[{"type":"web_search_20250305","name":"web_search"}],
+                        messages=[{"role":"user","content":_msg}]
+                    )
+                    break
+                except Exception as _ex_retry:
+                    if "429" in str(_ex_retry) or "rate_limit" in str(_ex_retry).lower():
+                        if _intento < 2:
+                            _time_retry.sleep(3 * (_intento + 1))  # 3s, 6s
+                            continue
+                    raise
+            if _r is None:
+                return _fallback
             _raw = " ".join(b.text for b in _r.content if hasattr(b,"text") and b.text)
             _raw = _raw.replace("```json","").replace("```","").strip()
             _s = _raw.find("{"); _e = _raw.rfind("}") + 1
@@ -19011,7 +19053,6 @@ with tab_noticias:
         _lock    = threading.Lock()
         _prog    = st.progress(0, text=f"Analizando {sheet_label} · 0/{_total}...")
         _done    = [0]
-
         def _procesar_una(p):
             _tk = str(p.get("Ticker","")).upper()
             try:
@@ -19043,20 +19084,21 @@ with tab_noticias:
             )
             with _lock:
                 _done[0] += 1
-                _n = _done[0]
-            try:
-                _prog.progress(_n/_total,
-                    text=f"🔍 {sheet_label} · {_tk} · {_n}/{_total}")
-            except Exception: pass
             return _tk, _r
 
-        MAX_W = min(4, max(1, _total))
+        # v19.3: max_workers=2 (antes 4) — evita 429 rate_limit con web_search
+        MAX_W = min(2, max(1, _total))
         with ThreadPoolExecutor(max_workers=MAX_W) as executor:
-            futures = [executor.submit(_procesar_una, p) for p in _pos]
+            futures = {executor.submit(_procesar_una, p): p for p in _pos}
             for future in as_completed(futures):
                 try:
                     _tk, _r = future.result()
                     _res[_tk] = _r
+                except Exception: pass
+                # Actualizar progreso desde el hilo PRINCIPAL (evita ScriptRunContext warning)
+                try:
+                    _n = _done[0]
+                    _prog.progress(_n/_total, text=f"🔍 {sheet_label} · {_n}/{_total}")
                 except Exception: pass
 
         _prog.empty()
