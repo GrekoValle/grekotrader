@@ -19770,7 +19770,9 @@ with tab_score:
                 f'<div style="margin-top:16px;font-size:13px;font-weight:800;color:{TXT}">💰 Candidatos para MVALLE</div>'
                 f'<div style="font-size:10px;color:{TXT_MUT};margin-bottom:8px">'
                 f'Score ≥15 + veredicto Entrar/Parcial · '
-                f'{len(_top_nbis)} NBIS 🔵 + {len(_top_mom)} Momentum 🟡</div>',
+                f'<span style="color:#1D4ED8;font-weight:700">{len(_top_nbis)} NBIS Rebote 🔵</span>'
+                f' + <span style="color:#D97706;font-weight:700">{len(_top_mom)} Momentum 🟡</span> — '
+                f'el origen de cada candidato está marcado en su tarjeta</div>',
                 unsafe_allow_html=True)
 
             # ── Sección NBIS (azul) ─────────────────────────────────
@@ -19783,8 +19785,8 @@ with tab_score:
                     unsafe_allow_html=True)
                 for _ii, _rv in enumerate(_top_nbis[:4]):
                     _rh_rv_p   = _gtu_get_rh(float(_rv.get("RSI",0) or 0),
-                                             abs(float(_rv.get("N3",0) or 0)),
-                                             float(_rv.get("N4",0) or 0))
+                                             abs(float(_rv.get("DD",0) or 0)),
+                                             float(_rv.get("Prob_real",0) or 0))
                     _rh_wr_rv  = _rh_rv_p.get("rh_wr",0)
                     _rh_p50_rv = _rh_rv_p.get("rh_p50",0)
                     _re_rv     = _rv.get("RE",{})
@@ -19792,16 +19794,20 @@ with tab_score:
                     _rec_rv    = str(_rv.get("Rec",""))
                     _rec_color = "#16A34A" if _rec_rv.startswith("✅") else "#F97316"
                     _sc_c      = "#16A34A" if _rv["TOTAL"]>=15 else "#D97706"
+                    _prob_rv   = _rv.get("Prob_Compra_Greko", 0)
                     _ca, _cb, _cc = st.columns([3,1,1])
                     with _ca:
                         st.markdown(
-                            f'<div style="padding:7px 12px;background:#EFF6FF;'
+                            f'<div style="padding:7px 12px;background:#EFF6FF;"'
                             f'border:1px solid #BFDBFE;border-top:none;border-radius:0">'
+                            f'<span style="font-size:9px;background:#1D4ED8;color:white;'
+                            f'padding:1px 5px;border-radius:3px;font-weight:700">'
+                            f'🔄 NBIS Rebote</span> '
                             f'<strong style="color:#1D4ED8">{_rv["Ticker"]}</strong> '
                             f'<span style="font-size:10px;color:{TXT_MUT}">Fase:{_rv.get("Fase","-")} · RSI:{float(_rv.get("RSI",0) or 0):.0f}</span>'
                             f'<br><span style="font-size:9px;color:#64748B">'
                             f'WR {int(_rh_wr_rv)}% · P50:{_rh_p50_rv:+.0f}% · RE:{_re_sc_rv:.0f} · '
-                            f'Rev:{_rv.get("RevYoY","N/D")} · {_rv.get("Analistas",0)}anal.</span>'
+                            f'Prob:{_prob_rv}% · Rev:{_rv.get("RevYoY","N/D")} · {_rv.get("Analistas",0)}anal.</span>'
                             f'</div>', unsafe_allow_html=True)
                     with _cb:
                         st.markdown(
@@ -19815,7 +19821,7 @@ with tab_score:
                         if st.button("✅ → MVALLE", key=f"mv_nbis_{_rv['Ticker']}_{_ii}",
                                      width='stretch', type="primary"):
                             st.session_state[f"_prefill_mvalle_{_rv['Ticker']}"] = _rv
-                            st.success(f"✅ {_rv['Ticker']} (NBIS) marcado → MVALLE")
+                            st.success(f"✅ {_rv['Ticker']} (NBIS Rebote) marcado → MVALLE")
 
             # ── Sección Momentum (amarillo) ────────────────────────
             if _top_mom:
@@ -19827,8 +19833,8 @@ with tab_score:
                     unsafe_allow_html=True)
                 for _jj, _rv in enumerate(_top_mom[:4]):
                     _rh_rv_p   = _gtu_get_rh(float(_rv.get("RSI",0) or 0),
-                                             abs(float(_rv.get("N3",0) or 0)),
-                                             float(_rv.get("N4",0) or 0))
+                                             abs(float(_rv.get("DD",0) or 0)),
+                                             float(_rv.get("Prob_real",0) or 0))
                     _rh_wr_rv  = _rh_rv_p.get("rh_wr",0)
                     _rh_p50_rv = _rh_rv_p.get("rh_p50",0)
                     _re_rv     = _rv.get("RE",{})
@@ -19836,16 +19842,20 @@ with tab_score:
                     _rec_rv    = str(_rv.get("Rec",""))
                     _rec_color = "#16A34A" if _rec_rv.startswith("✅") else "#F97316"
                     _sc_c      = "#16A34A" if _rv["TOTAL"]>=15 else "#D97706"
+                    _prob_rv   = _rv.get("Prob_Compra_Greko", 0)
                     _ca, _cb, _cc = st.columns([3,1,1])
                     with _ca:
                         st.markdown(
                             f'<div style="padding:7px 12px;background:#FFFBEB;'
                             f'border:1px solid #FDE68A;border-top:none;border-radius:0">'
+                            f'<span style="font-size:9px;background:#D97706;color:white;'
+                            f'padding:1px 5px;border-radius:3px;font-weight:700">'
+                            f'⚡ Momentum</span> '
                             f'<strong style="color:#D97706">{_rv["Ticker"]}</strong> '
                             f'<span style="font-size:10px;color:{TXT_MUT}">Fase:{_rv.get("Fase","-")} · RSI:{float(_rv.get("RSI",0) or 0):.0f}</span>'
                             f'<br><span style="font-size:9px;color:#64748B">'
                             f'WR {int(_rh_wr_rv)}% · P50:{_rh_p50_rv:+.0f}% · RE:{_re_sc_rv:.0f} · '
-                            f'Rev:{_rv.get("RevYoY","N/D")} · {_rv.get("Analistas",0)}anal.</span>'
+                            f'Prob:{_prob_rv}% · Rev:{_rv.get("RevYoY","N/D")} · {_rv.get("Analistas",0)}anal.</span>'
                             f'</div>', unsafe_allow_html=True)
                     with _cb:
                         st.markdown(
