@@ -18506,7 +18506,84 @@ with tab_score:
                         _urg=0; _urg_l="Urgencia N/D"
                     _alerta_str = " · ".join(_alertas) if _alertas else "—"
 
-                    # SPY N6
+                    # ── v19.3 HARD BLOCKS NBIS REBOTE ──────────────────────
+                    # 5 reglas binarias derivadas del análisis de 104 posiciones:
+                    # las categorías que explican la mayoría del "50% rojo".
+                    # Solo aplican cuando _tipo_s == "NBIS" (se evalúan aquí,
+                    # antes del cálculo del Score, para que el bloqueo sea
+                    # temprano y el motivo quede en _alertas).
+                    if _tipo_s == "NBIS":
+
+                        # HARD BLOCK 1 — RSI < 48 (demasiado temprano)
+                        # Dataset validado: WR 32% cuando RSI < 52 al entrar.
+                        # Umbral 48 = margen de seguridad — por debajo es
+                        # "caída libre sin confirmación de suelo".
+                        if _rsi_ac > 0 and _rsi_ac < 48:
+                            _alertas.append("🚫 NBIS-B1: RSI <48 — demasiado temprano (WR 32%)")
+                            _bloq = True
+
+                        # HARD BLOCK 2 — Beta > 2.0 SIN catalizador earn próximo
+                        # Losers avg Beta=2.28, Winners avg Beta=0.94.
+                        # Beta>2.0 solo se permite si hay earnings en 3-15d
+                        # (WR~100% con earn próximo compensa el riesgo de Beta).
+                        _tiene_earn_proximo = False
+                        try:
+                            import datetime as _dt_hb
+                            _hoy_hb = _dt_hb.date.today()
+                            _et_hb = _f.get("earn_ts_raw", None)
+                            _ed_hb = None
+                            if _et_hb:
+                                try: _ed_hb = _dt_hb.datetime.fromtimestamp(int(_et_hb)).date()
+                                except Exception: pass
+                            if not _ed_hb and _cat not in ("-","","nan"):
+                                try: _ed_hb = _dt_hb.date.fromisoformat(_cat[:10])
+                                except Exception: pass
+                            if _ed_hb:
+                                _dias_hb = (_ed_hb - _hoy_hb).days
+                                _tiene_earn_proximo = 3 <= _dias_hb <= 15
+                        except Exception: pass
+                        if _beta_f > 2.0 and not _tiene_earn_proximo:
+                            _alertas.append(f"🚫 NBIS-B2: Beta {_beta_f:.1f} >2.0 sin earn 3-15d (losers avg 2.28)")
+                            _bloq = True
+
+                        # HARD BLOCK 3 — Sector adverso 2026 + RSI < 55
+                        # Sectores SaaS/Telecom/Consumer/Luxury validados como
+                        # adversos en 2026 (narrativa macro desfavorable).
+                        # Con RSI < 55, el rebote aún no tiene confirmación →
+                        # combinación de sector débil + señal prematura = rojo.
+                        _SECTORES_ADVERSOS_2026 = [
+                            "saas","telecom","wireless","consumer","retail",
+                            "luxury","estee","verizon","at&t","consumer disc"
+                        ]
+                        _area_lower = _area.lower()
+                        _sector_adverso = any(s in _area_lower for s in _SECTORES_ADVERSOS_2026)
+                        if _sector_adverso and _rsi_ac > 0 and _rsi_ac < 55:
+                            _alertas.append(f"🚫 NBIS-B3: Sector adverso 2026 ({_area[:15]}) + RSI {_rsi_ac:.0f}<55")
+                            _bloq = True
+
+                        # HARD BLOCK 4 — Insider Selling confirmado
+                        # Si C6 detectó ventas de insiders durante la caída,
+                        # es señal directa de que "los que saben" no confían
+                        # en el rebote. Bloquea independientemente del Score.
+                        _insider_nbis = st.session_state.get(f"cscore_{_tk}", {}).get("insider_flag","NEUTRO")
+                        if _insider_nbis in ("VENTA_MASIVA", "VENTA"):
+                            _alertas.append(f"🚫 NBIS-B4: Insider selling ({_insider_nbis}) — management no confía en rebote")
+                            _bloq = True
+
+                        # HARD BLOCK 5 — Biotech clínica SIN earn próximo
+                        # Biotech pre-revenue sin catalizador próximo = apuesta
+                        # binaria a un evento incierto. Dataset: 100% pérdida
+                        # en biotech clínica sin catalizador (validado en sesión).
+                        _BIOTECH_KEYWORDS = ["biotech","pharma","clinical","biopharma","therapeutics","biosciences"]
+                        _es_biotech_clinica = any(b in _area_lower for b in _BIOTECH_KEYWORDS)
+                        if _es_biotech_clinica and not _tiene_earn_proximo:
+                            _alertas.append("🚫 NBIS-B5: Biotech clínica sin catalizador earn próximo (histórico: pérdida)")
+                            _bloq = True
+
+                        # Actualizar _alerta_str con los nuevos bloqueadores
+                        _alerta_str = " · ".join(_alertas) if _alertas else "—"
+
+
                     if 0<_spy<=60:  _c_spy=2; _spy_l=f"SPY {_spy:.0f} ✅"
                     elif _spy<=68:  _c_spy=1; _spy_l=f"SPY {_spy:.0f} ⚠️"
                     elif _spy>68:   _c_spy=-2;_spy_l=f"SPY {_spy:.0f} 🚫"
