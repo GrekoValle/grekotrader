@@ -20156,7 +20156,11 @@ with tab_score:
                             if cs is not None else
                             '<div style="text-align:center;font-size:10px;color:#CBD5E1">—</div>'
                         ))(_rm.get("C_Score"))
-                        + f'<div style="font-size:10px;font-weight:700;color:{_rm["Rc"]}">{_rm["Rec"]}</div>'
+                        # v19.3 fix bug: "Veredicto" en la columna del grid se elimina
+                        # — el veredicto completo (_vm + razón) ya aparece en el bloque
+                        # dedicado DEBAJO del RE badge. Tenerlo en ambos lugares causaba
+                        # que se viera duplicado (arriba en el grid + abajo post-RE).
+                        + f'<div style="font-size:9px;color:{TXT_MUT};font-style:italic">→ ver abajo</div>'
                         f'</div>', unsafe_allow_html=True)
                     # Rango Histórico + Fundamentales + RE + Veredicto
                     _rev_disp_m = _rev_rm if _rev_rm not in ("","None","nan") else "N/D"
@@ -20444,8 +20448,14 @@ with tab_score:
                     re_val=_re_r.get("re"), re_nivel=_re_r.get("nivel"),
                     prob_compra=_prob_r)
                 return _v.startswith(("✅","⚡","🔥"))
-            # Sin C-Score aún → fallback a Rec clásico
-            return str(r.get("Rec","")).startswith(("✅","⚡"))
+            # Sin C-Score: fallback SOLO si TOTAL≥15 Y Rec técnico ✅/⚡
+            # v19.3 fix (b): antes el fallback no verificaba TOTAL≥15 por separado
+            # → tickers con TOTAL=14 y Rec="✅" (rec viejo) pasaban a candidatos
+            # aunque el cuadro superior los excluía (que sí verifica TOTAL≥15)
+            # Ahora ambos usan el mismo criterio de umbral.
+            return (r["TOTAL"] >= 15
+                    and str(r.get("Rec","")).startswith(("✅","⚡"))
+                    and not r.get("Bloqueado", False))
 
         _top_nbis = sorted(
             [r for r in _nbis_rows if _es_candidato(r)],
@@ -20571,13 +20581,15 @@ with tab_score:
                 # Construir filas para el Excel
                 _rows_dl = []
                 for _rv in _top_nbis:
-                    # v19.3: Rango Histórico con datos REALES (RSI/DD%/Prob%)
-                    # — antes usaba N3/N4 (puntos 0-3 del Score), no %
                     _rh_p = _gtu_get_rh(float(_rv.get("RSI",0) or 0),
                                         abs(float(_rv.get("DD",0) or 0)),
                                         float(_rv.get("Prob_real",0) or 0))
                     _re_v = _rv.get("RE", {}) or {}
-                    _compra_v = _rv.get("Compra_Greko", {}) or {}
+                    # fix (a): C_Score y Compra_Greko desde session_state (dato fresco)
+                    # el row dict puede tener C_Score=None si se calculó post-escaneo
+                    _cs_ss_dl  = st.session_state.get(f"cscore_{_rv['Ticker']}", {}) or {}
+                    _c_score_dl = _cs_ss_dl.get("c_total") if _cs_ss_dl.get("c_total") is not None else _rv.get("C_Score")
+                    _compra_v   = (_cs_ss_dl if _cs_ss_dl.get("prob_compra_greko") else _rv.get("Compra_Greko", {})) or {}
                     # Fundamentales — misma lógica que el badge en pantalla
                     _rev_num_dl, _up_num_dl = 0, 0
                     try: _rev_num_dl = float(str(_rv.get("RevYoY","0")).replace("%","").replace("+","").replace("N/D","0"))
@@ -20608,7 +20620,7 @@ with tab_score:
                         "P50_%":          _rh_p.get("rh_p50",0),
                         "P75_%":          _rh_p.get("rh_p75",0),
                         "N_Casos":        _rh_p.get("rh_n",0),
-                        "C_Score":        _rv.get("C_Score") if _rv.get("C_Score") is not None else "—",
+                        "C_Score":        _c_score_dl if _c_score_dl is not None else "—",
                         "Prob_Compra_Greko": _compra_v.get("prob_compra_greko", 0),
                         "Clasificacion_Compra": _compra_v.get("clasificacion_compra","-"),
                         "Fundamentales":  _fund_dl,
@@ -20629,12 +20641,14 @@ with tab_score:
                         "Notas":          "",
                     })
                 for _rv in _top_mom:
-                    # v19.3: Rango Histórico con datos REALES (RSI/DD%/Prob%)
                     _rh_p = _gtu_get_rh(float(_rv.get("RSI",0) or 0),
                                         abs(float(_rv.get("DD",0) or 0)),
                                         float(_rv.get("Prob_real",0) or 0))
                     _re_v = _rv.get("RE", {}) or {}
-                    _compra_v = _rv.get("Compra_Greko", {}) or {}
+                    # fix (a): ídem NBIS — C_Score y Compra_Greko frescos desde session_state
+                    _cs_ss_dl  = st.session_state.get(f"cscore_{_rv['Ticker']}", {}) or {}
+                    _c_score_dl = _cs_ss_dl.get("c_total") if _cs_ss_dl.get("c_total") is not None else _rv.get("C_Score")
+                    _compra_v   = (_cs_ss_dl if _cs_ss_dl.get("prob_compra_greko") else _rv.get("Compra_Greko", {})) or {}
                     _rev_num_dl, _up_num_dl = 0, 0
                     try: _rev_num_dl = float(str(_rv.get("RevYoY","0")).replace("%","").replace("+","").replace("N/D","0"))
                     except: pass
@@ -20662,7 +20676,7 @@ with tab_score:
                         "P50_%":          _rh_p.get("rh_p50",0),
                         "P75_%":          _rh_p.get("rh_p75",0),
                         "N_Casos":        _rh_p.get("rh_n",0),
-                        "C_Score":        _rv.get("C_Score") if _rv.get("C_Score") is not None else "—",
+                        "C_Score":        _c_score_dl if _c_score_dl is not None else "—",
                         "Prob_Compra_Greko": _compra_v.get("prob_compra_greko", 0),
                         "Clasificacion_Compra": _compra_v.get("clasificacion_compra","-"),
                         "Fundamentales":  _fund_dl,
