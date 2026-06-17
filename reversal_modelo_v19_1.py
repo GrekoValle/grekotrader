@@ -5703,7 +5703,13 @@ def scan_detectadas(rsi_min: float = 35, rsi_max: float = 60,
                     "Prob_NBIS":     prob,
                     "Etapa_v12":     etapa["label"],
                     "Decision":      "SEGUIR",
-                    "Fase":          "M1",
+                    # v19.3 fix b: antes "Fase" era SIEMPRE "M1" hardcodeado en este
+                    # row — causaba que tickers de Tab Watchlist se grabaran como M1
+                    # en el Sheet aunque fueran Momentum (RSI>65) o M2 (RSI 45-65 + días).
+                    # Ahora se calcula desde RSI y prob como la lógica de scan_tab.
+                    "Fase": "Momentum" if rsi > 65 else (
+                            "M2" if (45 <= rsi <= 65 and prob >= 40) else (
+                            "M3" if (rsi >= 35 and prob >= 55) else "M1")),
                     "Area":          _area_d1,        # v16 fix: área real
                     "Motivo":        f"Corrección {dd}% · RSI {rsi} · Prob {prob}%",
                     "Lectura":       etapa["accion"],
@@ -8292,6 +8298,19 @@ def _parse_precio(val) -> float:
     except Exception:
         return 0.0
 
+def _safe_float(val, default=0.0) -> float:
+    """v19.3: Convierte val a float descartando NaN/inf/None — usa default en su lugar.
+    Centraliza todos los guards de NaN que antes estaban dispersos (Tab Swing
+    'SPY nan', Tab Posiciones 'P&L nan', Noticias IA 'NBIS nan entrada 129.90').
+    """
+    try:
+        f = float(val)
+        if f != f or f == float("inf") or f == float("-inf"):
+            return default
+        return f
+    except Exception:
+        return default
+
 def _normalizar_precios_df(df: "pd.DataFrame") -> "pd.DataFrame":
     """v19: Normaliza columnas numéricas de posiciones — acepta coma o punto decimal"""
     for col in ["Precio_Compra", "Cantidad", "Precio_Salida", "Score",
@@ -8577,7 +8596,9 @@ def escribir_trade_sheets(
             _d2 = _s2.diff()
             _g2 = _d2.clip(lower=0).rolling(14).mean()
             _l2 = (-_d2.clip(upper=0)).rolling(14).mean()
-            spy_rsi = round(float(100 - 100/(1 + _g2.iloc[-1]/(_l2.iloc[-1]+1e-9))), 1)
+            spy_rsi = round(_safe_float(100 - 100/(1 + _g2.iloc[-1]/(_l2.iloc[-1]+1e-9))), 1)
+            if spy_rsi == 0.0 and _g2.iloc[-1] != _g2.iloc[-1]:  # NaN propagó → 0 falso
+                spy_rsi = ""
             # Actualizar caché con el valor fresco
             st.session_state.setdefault("mercado_data", {}).setdefault("spy", {})["rsi"] = spy_rsi
     except Exception:
@@ -9469,7 +9490,8 @@ def render_boton_registro(
                         ticker=ticker, precio_compra=float(precio),
                         fase=fase, score=score, prob_nbis=prob_nbis,
                         area=_area_final, tipo="Accion",
-                        fuente={"tab2":"Swing Activo","tab3":"Entrar Hoy","tab5":"Mi Watchlist"}.get(key_prefix, key_prefix),
+                        # v19.3 fix a: unificar fuente
+                        fuente="Watchlist" if key_prefix == "tab5" else {"tab2":"Swing Activo","tab3":"Entrar Hoy"}.get(key_prefix, key_prefix),
                         arrastradas=arrastradas,
                         opinion=opinion, cantidad=float(_qty),
                         notas=_notas, rsi_ticker=float(rsi_ticker) if rsi_ticker else 0,
@@ -10238,7 +10260,8 @@ def get_spy_filtro() -> dict:
         delta = s.diff()
         gain  = delta.clip(lower=0).rolling(min(14,len(close))).mean()
         loss  = (-delta.clip(upper=0)).rolling(min(14,len(close))).mean()
-        spy_rsi = round(float(100 - 100/(1 + gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
+        spy_rsi = round(_safe_float(100 - 100/(1 + gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
+        if spy_rsi <= 0: spy_rsi = 50  # fallback neutral si NaN
 
         # v19: DD mínimo adaptativo según fase del mercado
         # SPY RSI > 60 → mercado alcista → correciones van -10-15%, no -20%
@@ -11073,7 +11096,8 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
                             ticker=_rr_tk, precio_compra=_rr_precio,
                             fase=str(_rr.get("Fase", _rr.get("Etapa_v12", _rr_fase))), score=_rr_score, prob_nbis=_rr_prob,
                             area=_rr_area, tipo="Accion",
-                            fuente={"tab2":"Swing Activo","tab3":"Entrar Hoy","tab5":"Mi Watchlist"}.get(tab_key, tab_key),
+                            # v19.3 fix a: "Mi Watchlist" y "Watchlist" unificados
+                            fuente="Watchlist" if tab_key == "tab5" else {"tab2":"Swing Activo","tab3":"Entrar Hoy"}.get(tab_key, tab_key),
                             arrastradas=_rr_arr, opinion=_rr_op,
                             cantidad=float(_reg_cant), notas=_reg_nota,
                             rsi_ticker=_rsi_sw,
@@ -11814,7 +11838,7 @@ def _banner_mercado_macro(spy_rsi: float = 0) -> None:
                 _d_bm = _s_bm.diff()
                 _g_bm = _d_bm.clip(lower=0).rolling(14).mean()
                 _l_bm = (-_d_bm.clip(upper=0)).rolling(14).mean()
-                spy_rsi = round(float(100-100/(1+_g_bm.iloc[-1]/(_l_bm.iloc[-1]+1e-9))),1)
+                spy_rsi = round(_safe_float(100-100/(1+_g_bm.iloc[-1]/(_l_bm.iloc[-1]+1e-9)), 50),1)
         except Exception:
             return
 
@@ -15185,7 +15209,8 @@ También puedes descargar la plantilla de abajo y completarla.
 
             r = get_row_for_ticker(tk, pc)
             source = r.get("_source","universo")
-            pa  = r["Precio"]
+            pa  = _safe_float(r["Precio"], default=pc)  # fallback a pc si NaN
+            if pa <= 0: pa = pc  # nunca mostrar 0 ni negativo
             # v19.3 fix b+c: qty efectiva = Cantidad_Activa si >0, sino
             # Cantidad — IDÉNTICO criterio que render_resumen_sector,
             # aplicado también a Invertido/Valor actual (antes usaban
@@ -15193,6 +15218,7 @@ También puedes descargar la plantilla de abajo y completarla.
             _qty_real   = _qty_act_f if _qty_act_f > 0 else qty
             inv = pc*_qty_real; act=pa*_qty_real
             pnl_pct     = (pa - pc) / pc * 100 if pc > 0 else 0
+            pnl_pct     = _safe_float(pnl_pct, 0.0)  # guard NaN
             ganancia_x_accion = pa - pc  # diferencia por acción
             pnl_usd     = ganancia_x_accion * _qty_real  # total $ ganado/perdido
             total_inv+=inv; total_act+=act; total_pnl+=pnl_usd; n_ok+=1
@@ -16984,42 +17010,85 @@ with tab_score:
         elif c_score >= 25: return "#FFF7ED","#C2410C","🟠","DÉBIL"
         else:               return "#FEF2F2","#DC2626","🔴","SIN CATALIZADOR"
 
-    def _veredicto_cruzado(score_tecnico, c_score, wr, re_val=None, re_nivel=None):
-        """Veredicto que cruza Score técnico + C-Score + Riesgo Extensión (RE).
+    def _veredicto_cruzado(score_tecnico, c_score, wr, re_val=None, re_nivel=None,
+                           prob_compra=None):
+        """Veredicto que cruza Score técnico + C-Score + RE + Prob_Compra_Greko.
 
-        v19.3 fix: antes este veredicto ignoraba RE — un ticker con
-        Score y C-Score altos podía mostrar "✅ ENTRAR" aunque RE
-        marcara "🚫 NO_ENTRAR" (extensión muy alta), generando
-        contradicción visible con Prob_Compra_Greko (que SÍ usa RE
-        para sus caps) y permitiendo que tickers con RE alto pasaran
-        _es_candidato() (Candidatos para MVALLE / REBOTE NBIS).
+        v19.3 fix 2: antes Prob_Compra_Greko nunca influía en el Veredicto —
+        Score=20 + C-Score=63 daba "⚡ PARCIAL" (señal de dinero real) aunque
+        Prob=51 dijera "No_Comprar_Todavia" y RE=73 estuviera casi en zona
+        bloqueada. SEPN es el caso exacto: Score 20/20 + RE 73 + N10=0 +
+        Prob 51 → "⚡ PARCIAL" visible = contradicción directa con los demás outputs.
+
+        Ahora:
+        1. RE umbral duro baja de 75 a 70 para Momentum (PARCIAL→PARCIAL ya
+           estaba; agregamos que RE 70-74 también bloquea si Prob<55)
+        2. Prob_Compra_Greko <50 degrada cualquier ENTRAR/PARCIAL →
+           "⏸️ ESPERAR (Prob {X}%)" — coherencia entre los 3 sistemas
+        3. Sin catalizador (c_score<50) + RE alto + Prob<55 → "⏸️ ESPERAR CAT"
+           en vez de "⚡ PARCIAL" que implica acción de dinero real
         """
         if wr < 50:
             return "🚫 NO ENTRAR","#EF4444","#FEF2F2","WR histórico bajo"
 
-        # ── RE muy elevado bloquea el veredicto, sea cual sea el Score/C-Score ──
+        # ── RE muy elevado bloquea el veredicto ──────────────────────────
         if re_nivel == "NO_ENTRAR" or (re_val is not None and re_val >= 75):
             _re_txt = f" (RE={re_val:.0f})" if re_val is not None else ""
-            return "🚫 RE EXTENDIDO","#EF4444","#FEF2F2",f"Riesgo de Extensión muy elevado{_re_txt} — señal sobre-extendida"
+            return ("🚫 RE EXTENDIDO","#EF4444","#FEF2F2",
+                    f"Riesgo de Extensión muy elevado{_re_txt} — señal sobre-extendida")
 
-        # ── RE moderado degrada un veredicto que sería ENTRAR/PLENO ──
-        _re_alto = (re_nivel == "PARCIAL") or (re_val is not None and re_val >= 65)
-        _re_sufijo = f" · RE={re_val:.0f} alto" if _re_alto and re_val is not None else ""
+        # ── Prob_Compra_Greko <50 bloquea acción de dinero real ──────────
+        # Si el sistema de probabilidad dice "No_Comprar_Todavia", el
+        # Veredicto no puede decir "⚡ PARCIAL" (que implica entrada real).
+        _prob_baja = prob_compra is not None and prob_compra < 50
+        _prob_lim  = prob_compra is not None and 50 <= prob_compra < 55
 
+        # ── RE moderado ───────────────────────────────────────────────────
+        _re_alto  = (re_nivel == "PARCIAL") or (re_val is not None and re_val >= 65)
+        _re_lim   = re_val is not None and re_val >= 70  # zona límite más estricta
+        _re_sufijo = f" · RE={re_val:.0f}" if _re_alto and re_val is not None else ""
+
+        # ── Veredicto final ───────────────────────────────────────────────
         if score_tecnico >= 15 and c_score >= 80:
+            if _re_alto and (_prob_baja or _prob_lim):
+                return ("⏸️ ESPERAR","#C2410C","#FFF7ED",
+                        f"Score+CScore altos pero Prob {prob_compra}% baja{_re_sufijo}")
             if _re_alto:
-                return "⚡ PARCIAL","#D97706","#FFFBEB",f"Score + catalizador excepcional, pero extendido{_re_sufijo}"
+                return ("⚡ PARCIAL","#D97706","#FFFBEB",
+                        f"Score + catalizador excepcional, pero extendido{_re_sufijo}")
+            if _prob_baja:
+                return ("⏸️ ESPERAR","#C2410C","#FFF7ED",
+                        f"Score+CScore altos pero Prob_Compra {prob_compra}% baja")
             return "🔥 ENTRAR PLENO","#15803D","#F0FDF4","Score + catalizador excepcional"
+
         elif score_tecnico >= 15 and c_score >= 65:
+            if _prob_baja or (_re_lim and _prob_lim):
+                return ("⏸️ ESPERAR","#C2410C","#FFF7ED",
+                        f"Técnica+catalizador ok, pero Prob_Compra {prob_compra}%{_re_sufijo}")
             if _re_alto:
-                return "⚡ PARCIAL","#D97706","#FFFBEB",f"Señal técnica + catalizador sólido, pero extendido{_re_sufijo}"
+                return ("⚡ PARCIAL","#D97706","#FFFBEB",
+                        f"Señal técnica + catalizador sólido, pero extendido{_re_sufijo}")
             return "✅ ENTRAR","#16A34A","#F0FDF4","Señal técnica + catalizador sólido"
+
         elif score_tecnico >= 15 and c_score >= 45:
-            return "⚡ PARCIAL","#D97706","#FFFBEB",f"Técnica ok · catalizador moderado{_re_sufijo}"
+            # SEPN cae aquí: Score 20, C-Score 63, RE 73, Prob 51
+            # ANTES: "⚡ PARCIAL" (señal de dinero real) — INCORRECTO
+            # AHORA: si Prob<55 o RE≥70 → "⏸️ ESPERAR CAT"
+            if _prob_baja or (_re_lim and c_score < 65):
+                return ("⏸️ ESPERAR CAT","#C2410C","#FFF7ED",
+                        f"Técnica ok · catalizador moderado · "
+                        f"Prob {prob_compra}% insuficiente{_re_sufijo} — watchlist, no entrada real")
+            return ("⚡ PARCIAL","#D97706","#FFFBEB",
+                    f"Técnica ok · catalizador moderado{_re_sufijo}")
+
         elif score_tecnico >= 15 and c_score < 45:
-            return "⏸️ ESPERAR CAT","#C2410C","#FFF7ED",f"Técnica lista · falta catalizador{_re_sufijo}"
+            return ("⏸️ ESPERAR CAT","#C2410C","#FFF7ED",
+                    f"Técnica lista · falta catalizador{_re_sufijo}")
+
         elif score_tecnico >= 12 and c_score >= 65:
-            return "🟡 MONITOREAR","#D97706","#FFFBEB",f"Catalizador fuerte · técnica en desarrollo{_re_sufijo}"
+            return ("🟡 MONITOREAR","#D97706","#FFFBEB",
+                    f"Catalizador fuerte · técnica en desarrollo{_re_sufijo}")
+
         else:
             return "⬇️ BAJA PRIO","#94A3B8","#F8FAFC","Score y catalizador insuficientes"
 
@@ -17909,45 +17978,67 @@ with tab_score:
                         for _, _row_t in _df_t.iterrows():
                             _tk_bt = str(_row_t.get("Ticker","")).strip().upper()
                             _fs_bt = str(_row_t.get("Fecha_Salida","")).strip()
-                            _fe_bt = str(_row_t.get("Fecha_Señal","") or _row_t.get("Fecha_Entrada","")).strip()
+
+                            # Fix 1: múltiples nombres de columna para Fecha_Entrada
+                            _fe_bt = ""
+                            for _col_fe in ["Fecha_Compra","Fecha_Entrada","Fecha_Señal",
+                                            "Fecha_Inicio","Fecha_Apertura","Fecha"]:
+                                _v_fe = str(_row_t.get(_col_fe,"") or "").strip()
+                                if _v_fe and _v_fe not in ("-","nan","None",""):
+                                    _fe_bt = _v_fe; break
+
                             if not _tk_bt or not _fs_bt or _fs_bt in ("","-","nan","None"):
                                 continue
-                            # v19.3: Resultado_Pct SIEMPRE calculado desde
-                            # Precio_Compra/Precio_Entrada vs Precio_Salida —
-                            # la columna "Resultado_Pct" del Sheet es manual,
-                            # a menudo vacía o desactualizada, y generaba
-                            # ceros/inconsistencias. Se ignora por completo.
+
+                            # Fix 2: parsear fechas DD-MM-YYYY o DD/MM/YYYY
+                            def _parse_fecha_bt(s):
+                                s = str(s).strip()
+                                if not s or s in ("-","nan","None",""): return None
+                                for _fmt in ["%d-%m-%Y","%d/%m/%Y","%Y-%m-%d",
+                                             "%d-%m-%y","%d/%m/%y","%m/%d/%Y"]:
+                                    try:
+                                        return pd.to_datetime(s, format=_fmt).date()
+                                    except Exception: pass
+                                try:
+                                    _r = pd.to_datetime(s, errors="coerce", dayfirst=True)
+                                    return None if pd.isna(_r) else _r.date()
+                                except Exception: return None
+
+                            # Fix 3: decimales con "," ya manejados por _parse_precio
                             _pc_bt = _pick_precio_bt(_row_t, "Precio_Compra", "Precio_Entrada")
                             _ps_bt = _pick_precio_bt(_row_t, "Precio_Salida")
                             _res_bt = None
                             if _pc_bt > 0 and _ps_bt > 0:
                                 _res_bt = round((_ps_bt - _pc_bt) / _pc_bt * 100, 2)
                             if _res_bt is None:
-                                continue  # sin Precio_Compra/Entrada y Precio_Salida válidos
-                            if not _fe_bt or _fe_bt in ("","-","nan","None"):
                                 continue
-                            try:
-                                _fecha_bt = pd.to_datetime(_fe_bt, errors="coerce", dayfirst=True)
-                                if pd.isna(_fecha_bt): continue
-                                _fecha_bt = _fecha_bt.date()
-                            except Exception:
+
+                            if not _fe_bt:
                                 continue
+                            _fecha_bt = _parse_fecha_bt(_fe_bt)
+                            if _fecha_bt is None:
+                                continue
+
                             # Filtro por rango de fecha de SALIDA
                             if _bt_rango != "Todas":
                                 import datetime as _dt_btf
                                 _dias_filtro = {"Últimos 30 días":30,"Últimos 60 días":60,"Últimos 90 días":90}[_bt_rango]
                                 try:
-                                    _fecha_salida_dt = pd.to_datetime(_fs_bt, errors="coerce", dayfirst=True)
-                                    if pd.isna(_fecha_salida_dt): continue
-                                    _dias_desde_salida = (_dt_btf.date.today() - _fecha_salida_dt.date()).days
+                                    _fecha_salida_dt = _parse_fecha_bt(_fs_bt)
+                                    if _fecha_salida_dt is None: continue
+                                    _dias_desde_salida = (_dt_btf.date.today() - _fecha_salida_dt).days
                                     if _dias_desde_salida > _dias_filtro: continue
                                 except Exception:
                                     continue
+
                             _sector_bt = str(_row_t.get("Area","") or "")
                             _bt_rows.append({
                                 "Ticker": _tk_bt, "Fecha_Entrada": _fecha_bt,
                                 "Sector": _sector_bt, "Resultado_Pct": _res_bt,
                                 "Fase": str(_row_t.get("Fase","")),
+                                "Fecha_Salida_str": _fs_bt,
+                                "Precio_Compra": _pc_bt,
+                                "Precio_Salida": _ps_bt,
                             })
 
                         if not _bt_rows:
@@ -18028,8 +18119,62 @@ with tab_score:
                     _cols_show = ["Ticker","Fecha_Entrada","Fase","Resultado_Pct",
                                    "C_Score","Bucket","Earn_dias","Vol_ratio",
                                    "C1","C2","C4","C5","C6","C7","C8"]
-                    _df_show = _df_bt_ok[_cols_show].sort_values("C_Score", ascending=False)
+                    _df_show = _df_bt_ok[[c for c in _cols_show if c in _df_bt_ok.columns]].sort_values("C_Score", ascending=False)
                     st.dataframe(_df_show, width='stretch', hide_index=True)
+
+                    # Fix 4 — Exportar Backtest a Excel para análisis externo
+                    try:
+                        import io as _io_bt, openpyxl as _ox_bt
+                        from openpyxl.styles import PatternFill as _PF_bt, Font as _Fn_bt, Alignment as _Al_bt
+
+                        # DataFrame completo con todos los campos
+                        _df_export_bt = _df_bt_ok.copy()
+                        # Añadir Precio_Compra/Precio_Salida si existen
+                        for _cx in ["Precio_Compra","Precio_Salida","Fecha_Salida_str"]:
+                            if _cx in _df_export_bt.columns:
+                                pass  # ya están
+                        _df_export_bt["Fecha_Entrada"] = _df_export_bt["Fecha_Entrada"].astype(str)
+                        _df_export_bt = _df_export_bt.sort_values("C_Score", ascending=False)
+
+                        _buf_bt = _io_bt.BytesIO()
+                        with pd.ExcelWriter(_buf_bt, engine="openpyxl") as _wr_bt:
+                            _df_export_bt.to_excel(_wr_bt, index=False, sheet_name="Backtest_CScore")
+                            _ws_bt = _wr_bt.sheets["Backtest_CScore"]
+                            # Header styling
+                            _hdr_fill = _PF_bt(fill_type="solid", fgColor="1D4ED8")
+                            for _cell in _ws_bt[1]:
+                                _cell.fill = _hdr_fill
+                                _cell.font = _Fn_bt(color="FFFFFF", bold=True, size=9)
+                                _cell.alignment = _Al_bt(horizontal="center", wrap_text=True)
+                            # Color rows por Ganador
+                            _gan_fill = _PF_bt(fill_type="solid", fgColor="DCFCE7")
+                            _per_fill = _PF_bt(fill_type="solid", fgColor="FEE2E2")
+                            _cols_df = list(_df_export_bt.columns)
+                            _gan_idx = _cols_df.index("Ganador") if "Ganador" in _cols_df else None
+                            for _row_idx in range(2, _ws_bt.max_row + 1):
+                                _es_gan = False
+                                if _gan_idx is not None:
+                                    _v = _ws_bt.cell(row=_row_idx, column=_gan_idx+1).value
+                                    _es_gan = bool(_v)
+                                for _cell in _ws_bt[_row_idx]:
+                                    _cell.fill = _gan_fill if _es_gan else _per_fill
+                                    _cell.font = _Fn_bt(size=9)
+                            # Anchos de columna
+                            for _col_cells in _ws_bt.columns:
+                                _max_w = min(max(len(str(c.value or "")) for c in _col_cells), 20)
+                                _ws_bt.column_dimensions[_col_cells[0].column_letter].width = max(_max_w, 8)
+
+                        _buf_bt.seek(0)
+                        import datetime as _dt_btn
+                        _fn_bt = f"Backtest_CScore_{_dt_btn.date.today().strftime('%Y%m%d')}.xlsx"
+                        st.download_button(
+                            f"⬇️ Descargar Backtest Excel ({len(_df_bt_ok)} posiciones)",
+                            data=_buf_bt.getvalue(), file_name=_fn_bt,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="dl_backtest_excel", type="primary")
+                        st.caption("🟢 Ganadores · 🔴 Perdedores — para analizar correlación C-Score vs Resultado")
+                    except Exception as _ex_dl_bt:
+                        st.caption(f"Export Excel no disponible: {str(_ex_dl_bt)[:60]}")
 
                     _n_err = len(_df_bt) - len(_df_bt_ok)
                     if _n_err > 0:
@@ -18316,8 +18461,15 @@ with tab_score:
                                 _tm_sc   = float(_inf_sc.get("targetMeanPrice",0) or 0)
                                 _pa_sc   = float(_inf_sc.get("currentPrice",
                                            _inf_sc.get("regularMarketPrice",0)) or 0)
-                                _rv_sc   = float(_inf_sc.get("revenueGrowth",0) or 0)
-                                _et_sc   = _inf_sc.get("earningsTimestamp")
+                                # v19.3 fix: revenueGrowth en yfinance puede ser None
+                                # o solo reflejar 1 trimestre para large caps.
+                                # Fallback chain: revenueGrowth → earningsGrowth → 0
+                                _rv_sc_raw = (_inf_sc.get("revenueGrowth")
+                                              or _inf_sc.get("earningsGrowth")
+                                              or 0)
+                                _rv_sc   = float(_rv_sc_raw or 0)
+                                _et_sc   = (_inf_sc.get("earningsTimestamp")
+                                            or _inf_sc.get("mostRecentQuarter"))
                                 _ehoy_sc = False
                                 if _et_sc:
                                     try:
@@ -18325,8 +18477,219 @@ with tab_score:
                                                     .fromtimestamp(int(_et_sc)).date()
                                                     == _dt_sc_info.date.today())
                                     except Exception: pass
+                                # v19.3 fix 2: C2 retroactivo — earnings beat en
+                                # últimos 30 días (no solo earn próximos).
+                                # HPE tuvo +46% EPS beat el 01.Jun → hace 14 días →
+                                # el modelo decía "sin catalizador" porque C2 solo
+                                # miraba HACIA ADELANTE (earn en 3-15d). Ahora también
+                                # captura el "post-earnings momentum" reciente.
+                                _earn_beat_reciente = False
+                                _earn_dias_pasados = None
+                                try:
+                                    _ep_sc = _inf_sc.get("earningsTimestamp") or _inf_sc.get("mostRecentQuarter")
+                                    if _ep_sc:
+                                        _earn_d_past = _dt_sc_info.datetime.fromtimestamp(int(_ep_sc)).date()
+                                        _earn_dias_pasados = (_dt_sc_info.date.today() - _earn_d_past).days
+                                        _eps_surp = float(_inf_sc.get("earningsSurprise",0) or 0)
+                                        # Earn beat (surprise>0) en últimos 30 días = catalizador reciente
+                                        if 0 < _earn_dias_pasados <= 30 and _eps_surp > 0.05:
+                                            _earn_beat_reciente = True
+                                except Exception: pass
                                 _up_sc    = round((_tm_sc-_pa_sc)/_pa_sc*100,1) if _tm_sc>0 and _pa_sc>0 else 0
                                 _beta_sc  = float(_inf_sc.get("beta", 1.0) or 1.0)
+                                # v19.3 Fix 3+: detector multi-catalizador en noticias yfinance
+                                # Cubre: índices, contratos gov/empresa, upgrades analistas,
+                                # FDA/regulatorio, partnerships, earnings próximos de terceros.
+                                # Causa: DELL $1.44B Air Force (hace 3d) + NBIS NDX inclusion
+                                # ambos mostraban "Sin catalizador" con el scanner original.
+                                _index_event_dias  = None
+                                _index_event_label = ""
+                                _contrato_label    = ""
+                                _contrato_monto    = ""
+                                _upgrade_label     = ""
+                                _fda_label         = ""
+                                _partner_label     = ""
+                                _cat_tipo_extra    = ""   # para C5 adicional
+
+                                _CAT_KW = {
+                                    # Índices — catalizador mecánico (forced buying)
+                                    "INDICE": [
+                                        "nasdaq-100","nasdaq 100","ndx","s&p 500","s&p500",
+                                        "russell 2000","index inclusion","added to","joins the",
+                                        "joining the","rebalance","rebalancing","included in",
+                                        "index addition","index membership"
+                                    ],
+                                    # Contratos gobierno/empresa (DELL Air Force, HPE DOD, etc.)
+                                    "CONTRATO": [
+                                        "contract award","contract win","billion contract",
+                                        "million contract","awarded","task order","blanket purchase",
+                                        "government contract","dod contract","air force","navy contract",
+                                        "army contract","pentagon","federal contract","bpa","idiq",
+                                        "$1","$2","$3","$4","$5","$10","$15","$20","billion award",
+                                        "firm-fixed-price","license agreement"
+                                    ],
+                                    # Upgrades / Price target alzas
+                                    "UPGRADE": [
+                                        "upgrades","raises price target","increases price target",
+                                        "price target to","initiates coverage","reiterates buy",
+                                        "outperform","strong buy","overweight initiated",
+                                        "analyst upgrade","buy rating","target raised",
+                                        "pt raised","pt to $","target to $"
+                                    ],
+                                    # FDA / Regulatorio (biotech/pharma)
+                                    "FDA": [
+                                        "fda approval","fda approved","fda clears","fda grants",
+                                        "breakthrough therapy","fast track designation","nda accepted",
+                                        "bla accepted","pdufa","advisory committee","adcom",
+                                        "approval granted","regulatory approval","ema approval"
+                                    ],
+                                    # Partnerships / Colaboraciones
+                                    "PARTNERSHIP": [
+                                        "partnership","strategic alliance","collaboration",
+                                        "joint venture","licensing agreement","distribution agreement",
+                                        "co-development","supply agreement","preferred partner",
+                                        "signed agreement","memorandum of understanding","mou"
+                                    ],
+                                }
+                                try:
+                                    import yfinance as _yf_idx
+                                    import re as _re_idx
+                                    _news_idx = _yf_idx.Ticker(_tk_sc).news or []
+                                    _hoy_idx  = _dt_sc_info.date.today()
+                                    for _news_item in _news_idx[:25]:
+                                        _title_idx = str(_news_item.get("title","") or "").lower()
+                                        _summ_idx  = str(_news_item.get("summary","") or "").lower()
+                                        _full_idx  = _title_idx + " " + _summ_idx
+                                        try:
+                                            _pub_ts   = int(_news_item.get("providerPublishTime",0))
+                                            _pub_date = _dt_sc_info.datetime.fromtimestamp(_pub_ts).date()
+                                            _dias_pub = (_hoy_idx - _pub_date).days
+                                        except Exception:
+                                            _dias_pub = 99
+                                        if _dias_pub > 15:   # solo últimos 15 días
+                                            continue
+                                        # ── Detectar tipo de catalizador ──────────────
+                                        for _cat_tipo, _kws in _CAT_KW.items():
+                                            if not any(k in _full_idx for k in _kws):
+                                                continue
+                                            if _cat_tipo == "INDICE" and not _index_event_label:
+                                                _lbl = "NDX" if "nasdaq" in _full_idx else \
+                                                       "S&P500" if "s&p" in _full_idx else \
+                                                       "RUT" if "russell" in _full_idx else "Índice"
+                                                # Extraer días hasta el evento
+                                                _ev_d = None
+                                                _month_map = {"june":6,"jul":7,"july":7,
+                                                              "aug":8,"august":8,"sep":9,"september":9,
+                                                              "oct":10,"october":10}
+                                                for _mn, _mn_num in _month_map.items():
+                                                    for _d_str in _re_idx.findall(rf'{_mn}\s+(\d{{1,2}})', _full_idx):
+                                                        try:
+                                                            _ev_date = _dt_sc_info.date(_hoy_idx.year, _mn_num, int(_d_str))
+                                                            _candidate = (_ev_date - _hoy_idx).days
+                                                            if 0 <= _candidate <= 30:
+                                                                _ev_d = _candidate; break
+                                                        except Exception: pass
+                                                    if _ev_d is not None: break
+                                                _index_event_dias  = _ev_d if _ev_d is not None else max(0, 7 - _dias_pub)
+                                                _index_event_label = _lbl
+                                            elif _cat_tipo == "CONTRATO" and not _contrato_label:
+                                                # Extraer monto si aparece "$ X billion/million"
+                                                _monto_m = _re_idx.search(r'\$\s*([\d,.]+)\s*(billion|million|b\b|m\b)', _full_idx)
+                                                _monto_str = ""
+                                                if _monto_m:
+                                                    _val = _monto_m.group(1).replace(",","")
+                                                    _unit = "B" if _monto_m.group(2).startswith("b") else "M"
+                                                    _monto_str = f"${_val}{_unit}"
+                                                # Detectar quién contrató
+                                                _quien = "Gobierno" if any(g in _full_idx for g in ["air force","navy","army","pentagon","dod","federal","government"]) else "Empresa"
+                                                _contrato_label = f"Contrato {_quien}"
+                                                _contrato_monto = _monto_str
+                                                _cat_tipo_extra = "Contrato_Gobierno" if _quien=="Gobierno" else "Contrato_Empresa"
+                                            elif _cat_tipo == "UPGRADE" and not _upgrade_label:
+                                                # Extraer firma y PT
+                                                _pt_m = _re_idx.search(r'(?:to|target to)\s*\$\s*([\d,]+)', _full_idx)
+                                                _pt_str = f"PT ${_pt_m.group(1)}" if _pt_m else ""
+                                                _upgrade_label = f"Upgrade analista {_pt_str}".strip()
+                                            elif _cat_tipo == "FDA" and not _fda_label:
+                                                # v19.3: separar FDA RETROSPECTIVO (ya aprobado)
+                                                # vs FDA PROSPECTIVO (decisión pendiente)
+                                                # Son dos catalizadores COMPLETAMENTE distintos:
+                                                # Retrospectivo = ya priceado, C5 positivo
+                                                # Prospectivo   = riesgo binario, N7 urgencia
+                                                _fda_es_futuro = any(x in _full_idx for x in [
+                                                    "pdufa","advisory committee","adcom",
+                                                    "upcoming","expected to","anticipated",
+                                                    "decision expected","readout expected",
+                                                    "data readout","phase 3 results expected",
+                                                    "fda decision","regulatory decision",
+                                                    "under review","pending approval",
+                                                    "nda filed","bla filed","nda submitted",
+                                                    "fda review ongoing","seeking approval"
+                                                ])
+                                                _fda_es_pasado = any(x in _full_idx for x in [
+                                                    "fda approved","fda clears","fda grants",
+                                                    "approval granted","approved by fda",
+                                                    "received approval","obtained approval",
+                                                    "mhra approved","ema approved","approved in",
+                                                    "clearance granted","510k cleared"
+                                                ])
+                                                # Extraer fecha del evento FDA si aparece
+                                                _fda_ev_dias = None
+                                                _month_map_fda = {"jan":1,"january":1,
+                                                    "feb":2,"february":2,"mar":3,"march":3,
+                                                    "apr":4,"april":4,"may":5,"june":6,"jun":6,
+                                                    "jul":7,"july":7,"aug":8,"august":8,
+                                                    "sep":9,"september":9,"oct":10,"october":10,
+                                                    "nov":11,"november":11,"dec":12,"december":12}
+                                                for _mn_f, _mn_num_f in _month_map_fda.items():
+                                                    for _d_str_f in _re_idx.findall(
+                                                            rf'{_mn_f}\s+(\d{{1,2}})', _full_idx):
+                                                        try:
+                                                            _fda_ev_date = _dt_sc_info.date(
+                                                                _hoy_idx.year, _mn_num_f, int(_d_str_f))
+                                                            _fda_cand = (_fda_ev_date - _hoy_idx).days
+                                                            if 0 <= _fda_cand <= 90:
+                                                                _fda_ev_dias = _fda_cand; break
+                                                        except Exception: pass
+                                                    if _fda_ev_dias is not None: break
+                                                if _fda_es_pasado and not _fda_es_futuro:
+                                                    # Aprobación YA OCURRIDA → catalizador consumado
+                                                    # Positivo para C5 pero no genera urgencia N7
+                                                    _fda_label = "Aprobación FDA ✅ (ya consumada)"
+                                                elif _fda_es_futuro or any(x in _full_idx for x in ["pdufa","adcom"]):
+                                                    # Decisión PENDIENTE → binario, puede ser urgente
+                                                    _tipo_fda_fut = "PDUFA" if "pdufa" in _full_idx else \
+                                                                    "AdCom" if any(x in _full_idx for x in ["adcom","advisory"]) else \
+                                                                    "Readout" if "readout" in _full_idx else \
+                                                                    "FDA Decision"
+                                                    _fda_dias_str = f" en {_fda_ev_dias}d" if _fda_ev_dias is not None else " (fecha pendiente)"
+                                                    _fda_label = f"{_tipo_fda_fut} pendiente{_fda_dias_str} ⚠️"
+                                                    # Guardar días para N7 urgencia
+                                                    _fund_sc.setdefault(_tk_sc, {})
+                                                    _fda_ev_dias_global = _fda_ev_dias  # para N7 más abajo
+                                                else:
+                                                    # No queda claro si es pasado o futuro
+                                                    _fda_label = "Evento regulatorio"
+                                            elif _cat_tipo == "PARTNERSHIP" and not _partner_label:
+                                                _partner_label = "MoU/Acuerdo" if "mou" in _full_idx or "memorandum" in _full_idx else \
+                                                                 "Partnership estratégico"
+                                except Exception:
+                                    pass
+
+                                # Consolidar catalizadores detectados para N7 y display
+                                _catalyzers_found = []
+                                if _index_event_label:
+                                    _catalyzers_found.append(("INDICE", _index_event_label, _index_event_dias))
+                                if _contrato_label:
+                                    _lbl = f"{_contrato_label} {_contrato_monto}".strip()
+                                    _catalyzers_found.append(("CONTRATO", _lbl, 0))
+                                if _upgrade_label:
+                                    _catalyzers_found.append(("UPGRADE", _upgrade_label, 0))
+                                if _fda_label:
+                                    _catalyzers_found.append(("FDA", _fda_label, 0))
+                                if _partner_label:
+                                    _catalyzers_found.append(("PARTNER", _partner_label, 0))
+
                                 _info_ok  = True
                                 _fund_sc[_tk_sc] = {
                                     "n_analistas": _n_an, "target_mean": _tm_sc,
@@ -18339,6 +18702,19 @@ with tab_score:
                                     "rec_mean":  _rec_mean,
                                     "rec_key":   _rec_key,
                                     "beta":      _beta_sc,
+                                    "earn_beat_reciente": _earn_beat_reciente,
+                                    "earn_dias_pasados":  _earn_dias_pasados,
+                                    "index_event_dias":   _index_event_dias,
+                                    "index_event_label":  _index_event_label,
+                                    "catalyzers_found":   _catalyzers_found,
+                                    "contrato_label":     _contrato_label,
+                                    "contrato_monto":     _contrato_monto,
+                                    "upgrade_label":      _upgrade_label,
+                                    "fda_label":          _fda_label,
+                                    "fda_prospectivo":    "pendiente" in _fda_label if _fda_label else False,
+                                    "fda_ev_dias":        _fda_ev_dias if '_fda_ev_dias' in vars() else None,
+                                    "partner_label":      _partner_label,
+                                    "cat_tipo_extra":     _cat_tipo_extra,
                                 }
                             except Exception:
                                 _fund_sc[_tk_sc] = {
@@ -18438,7 +18814,65 @@ with tab_score:
                     # Post-earn BEAT 0-10d:+3 · 11-20d:+2 · 21-30d:+1 · >30d:0
                     # Earn HOY/≤2d: BLOQUEAR · 3-5d:-2 · 6-10d:+1
                     # Noticia fresca ≤3d: +2 · 4-7d: +1
+                    # v19.3 NUEVO: earn BEAT retroactivo 0-30d:
+                    #   0-10d:+3 · 11-20d:+2 · 21-30d:+1
                     _urg=0; _urg_l="Sin catalizador"
+                    # v19.3 Fix 2: earn beat reciente como catalizador retroactivo
+                    _earn_beat_rec = _f.get("earn_beat_reciente", False)
+                    _earn_dias_pas = _f.get("earn_dias_pasados", None)
+                    if _earn_beat_rec and _earn_dias_pas is not None:
+                        if _earn_dias_pas <= 10:
+                            _urg = 3; _urg_l = f"Post-earn BEAT {_earn_dias_pas}d 🟢"
+                        elif _earn_dias_pas <= 20:
+                            _urg = 2; _urg_l = f"Post-earn BEAT {_earn_dias_pas}d 🟡"
+                        elif _earn_dias_pas <= 30:
+                            _urg = 1; _urg_l = f"Post-earn BEAT {_earn_dias_pas}d"
+
+                    # v19.3 Fix 3+: catalizadores detectados (índice + contrato + upgrade + FDA + partnership)
+                    _idx_dias = _f.get("index_event_dias")
+                    _idx_lbl  = _f.get("index_event_label", "Índice")
+                    if _idx_dias is not None and 0 <= _idx_dias <= 30:
+                        _idx_urg = 3 if _idx_dias <= 7 else 2 if _idx_dias <= 14 else 1
+                        if _idx_urg > _urg:
+                            _urg = _idx_urg
+                            _urg_l = f"Inclusión {_idx_lbl} en {_idx_dias}d 📈"
+
+                    # Contrato gobierno/empresa (reciente = urgencia alta)
+                    _cont_lbl = _f.get("contrato_label","")
+                    _cont_mon = _f.get("contrato_monto","")
+                    if _cont_lbl and _urg < 3:
+                        _cont_full = f"{_cont_lbl} {_cont_mon}".strip()
+                        _urg = max(_urg, 2); _urg_l = f"{_cont_full} 📋"
+
+                    # Upgrade de analista (moderado — puede repetirse)
+                    _upg_lbl = _f.get("upgrade_label","")
+                    if _upg_lbl and _urg < 2:
+                        _urg = max(_urg, 1); _urg_l = f"{_upg_lbl} 📊"
+
+                    # FDA/Regulatorio — PROSPECTIVO (decisión pendiente) vs RETROSPECTIVO
+                    # Solo el PROSPECTIVO genera urgencia N7; el retrospectivo
+                    # (aprobación ya ocurrida) es catalizador consumado → C5, no N7.
+                    _fda_lbl = _f.get("fda_label","")
+                    _fda_prosp = _f.get("fda_prospectivo", False)
+                    _fda_dias = _f.get("fda_ev_dias")
+                    if _fda_lbl and _fda_prosp:
+                        # PDUFA/AdCom/Readout pendiente → urgencia máxima si tiene fecha
+                        if _fda_dias is not None and 0 <= _fda_dias <= 30:
+                            _fda_urg = 3 if _fda_dias <= 7 else 2 if _fda_dias <= 14 else 1
+                        else:
+                            _fda_urg = 2  # sin fecha exacta pero sabemos que viene
+                        if _fda_urg > _urg:
+                            _urg = _fda_urg
+                            _urg_l = f"{_fda_lbl} 💊"
+                    elif _fda_lbl and not _fda_prosp:
+                        # Aprobación ya consumada → no urgencia N7, es historia
+                        if _urg == 0:
+                            _urg = 1; _urg_l = f"{_fda_lbl}"  # mención suave
+
+                    # Partnership/MoU (moderado)
+                    _part_lbl = _f.get("partner_label","")
+                    if _part_lbl and _urg < 2:
+                        _urg = max(_urg, 1); _urg_l = f"{_part_lbl} 🤝"
                     try:
                         import datetime as _dtsc_n7
                         _hoy_n7 = _dtsc_n7.date.today()
@@ -18570,18 +19004,79 @@ with tab_score:
                             _alertas.append(f"🚫 NBIS-B4: Insider selling ({_insider_nbis}) — management no confía en rebote")
                             _bloq = True
 
-                        # HARD BLOCK 5 — Biotech clínica SIN earn próximo
-                        # Biotech pre-revenue sin catalizador próximo = apuesta
-                        # binaria a un evento incierto. Dataset: 100% pérdida
-                        # en biotech clínica sin catalizador (validado en sesión).
-                        _BIOTECH_KEYWORDS = ["biotech","pharma","clinical","biopharma","therapeutics","biosciences"]
+                        # HARD BLOCK 5 — Biotech CLÍNICA PRE-REVENUE sin earn próximo
+                        # v19.3 ORIGINAL: bloqueaba TODA biotech sin earn próximo.
+                        # v19.3 FIX (caso KRYS): B5 solo aplica a biotech clínica
+                        # SIN PRODUCTO APROBADO / SIN INGRESOS COMERCIALES REALES.
+                        # KRYS ($116M/trim, 95% margen, FDA+EU+UK aprobado) quedaba
+                        # bloqueada junto a una biotech clínica pre-revenue → INCORRECTO.
+                        #
+                        # REGLA CALIBRADA:
+                        # Aplicar B5 SOLO si revenue_yoy < 15% (sin crecimiento
+                        # de ingresos comerciales = empresa mayormente clínica/especulativa)
+                        # Si revenue_yoy ≥ 15% → biotech COMERCIAL con ingresos reales
+                        # → no bloquear (el riesgo binario ya no aplica)
+                        _BIOTECH_KEYWORDS = ["biotech","pharma","clinical","biopharma",
+                                             "therapeutics","biosciences"]
                         _es_biotech_clinica = any(b in _area_lower for b in _BIOTECH_KEYWORDS)
                         if _es_biotech_clinica and not _tiene_earn_proximo:
-                            _alertas.append("🚫 NBIS-B5: Biotech clínica sin catalizador earn próximo (histórico: pérdida)")
-                            _bloq = True
+                            # Verificar si tiene revenue comercial real (proxy: rev_yoy)
+                            _rev_biotech_yoy = 0
+                            try:
+                                _rv_b5 = _f.get("revenue_yoy", None)
+                                if _rv_b5 is not None:
+                                    _rev_biotech_yoy = float(str(_rv_b5).replace("%","").replace("+","") or 0)
+                            except Exception:
+                                pass
+                            if _rev_biotech_yoy >= 15:
+                                # Biotech COMERCIAL con ingresos reales crecientes
+                                # (ej. KRYS: +32% YoY, $116M/trim, FDA aprobado)
+                                # → B5 no aplica, pero agregar aviso informativo
+                                _alertas.append(
+                                    f"ℹ️ Biotech comercial · Rev +{_rev_biotech_yoy:.0f}% YoY "
+                                    f"(no aplica B5 clínica) · sin earn próximo ({55}d)")
+                            else:
+                                # Biotech CLÍNICA o sin revenue significativo
+                                # → bloquear (regla original validada)
+                                _alertas.append(
+                                    f"🚫 NBIS-B5: Biotech clínica sin revenue real "
+                                    f"(Rev {_rev_biotech_yoy:+.0f}% YoY) + sin earn próximo "
+                                    f"(histórico: pérdida)")
+                                _bloq = True
 
                         # Actualizar _alerta_str con los nuevos bloqueadores
                         _alerta_str = " · ".join(_alertas) if _alertas else "—"
+
+                        # HARD BLOCK 6 — PDUFA/AdCom próximo en biotech PRE-REVENUE
+                        # Caso KRYS: biotech COMERCIAL con PDUFA → aviso tamaño reducido
+                        # Caso FCEL-tipo: biotech clínica pre-revenue con PDUFA → BLOQUEAR
+                        _fda_prosp_b6 = _f.get("fda_prospectivo", False)
+                        _fda_dias_b6  = _f.get("fda_ev_dias")
+                        _rev_yoy_b6 = 0
+                        try:
+                            _rv_b6 = _f.get("revenue_yoy", None)
+                            if _rv_b6 is not None:
+                                _rev_yoy_b6 = float(str(_rv_b6).replace("%","").replace("+","") or 0)
+                        except Exception: pass
+                        _es_biotech_b6 = any(b in _area_lower for b in ["biotech","pharma",
+                                         "clinical","biopharma","therapeutics","biosciences"])
+                        if _es_biotech_b6 and _fda_prosp_b6:
+                            _dias_str_b6 = f" en {_fda_dias_b6}d" if _fda_dias_b6 is not None else ""
+                            if _rev_yoy_b6 < 15:
+                                # Biotech clínica pre-revenue → BLOQUEAR
+                                # Stop -7% no puede proteger un gap de -60-80%
+                                _alertas.append(
+                                    f"🚫 NBIS-B6: PDUFA/AdCom pendiente{_dias_str_b6} · "
+                                    f"biotech sin revenue real (Rev {_rev_yoy_b6:+.0f}% YoY) · "
+                                    f"evento binario · stop -7% NO protege → -60-80% posible")
+                                _bloq = True
+                            else:
+                                # Biotech comercial → aviso tamaño reducido, sin bloqueo
+                                _alertas.append(
+                                    f"⚠️ NBIS-B6 TAMAÑO REDUCIDO: PDUFA/AdCom{_dias_str_b6} · "
+                                    f"empresa tiene revenue ({_rev_yoy_b6:+.0f}% YoY) · "
+                                    f"posición máx 30% del tamaño estándar")
+                            _alerta_str = " · ".join(_alertas) if _alertas else "—"
 
 
                     if 0<_spy<=60:  _c_spy=2; _spy_l=f"SPY {_spy:.0f} ✅"
@@ -18723,6 +19218,18 @@ with tab_score:
                             "RE":_re_result,
                             "Prob_Compra_Greko": _buy_data_n.get("prob_compra_greko", 0),
                             "Compra_Greko": _buy_data_n,
+                            # v19.3 — catalizadores pendientes para "⏸️ ESPERAR CAT"
+                            "_earn_dias_fwd":  _dias_earn if ('_dias_earn' in vars() and isinstance(_dias_earn, int) and 0 < _dias_earn <= 90) else None,
+                            "_earn_date_str":  str(_earn_date_n7) if ('_earn_date_n7' in vars() and _earn_date_n7) else None,
+                            "_index_dias":     _f.get("index_event_dias"),
+                            "_index_label":    _f.get("index_event_label","Índice"),
+                            "_contrato_label": _f.get("contrato_label",""),
+                            "_contrato_monto": _f.get("contrato_monto",""),
+                            "_upgrade_label":  _f.get("upgrade_label",""),
+                            "_fda_label":      _f.get("fda_label",""),
+                            "_fda_prospectivo": _f.get("fda_prospectivo", False),
+                            "_fda_ev_dias":    _f.get("fda_ev_dias"),
+                            "_partner_label":  _f.get("partner_label",""),
                         })
                     else:
                         # Momentum
@@ -18836,6 +19343,18 @@ with tab_score:
                             "_wr_pre":_wr_pre_m,
                             "Prob_Compra_Greko": _buy_data_m.get("prob_compra_greko", 0),
                             "Compra_Greko": _buy_data_m,
+                            # v19.3 — catalizadores pendientes para "⏸️ ESPERAR CAT"
+                            "_earn_dias_fwd":  _dias_earn if ('_dias_earn' in vars() and isinstance(_dias_earn, int) and 0 < _dias_earn <= 90) else None,
+                            "_earn_date_str":  str(_earn_date_n7) if ('_earn_date_n7' in vars() and _earn_date_n7) else None,
+                            "_index_dias":     _f.get("index_event_dias"),
+                            "_index_label":    _f.get("index_event_label","Índice"),
+                            "_contrato_label": _f.get("contrato_label",""),
+                            "_contrato_monto": _f.get("contrato_monto",""),
+                            "_upgrade_label":  _f.get("upgrade_label",""),
+                            "_fda_label":      _f.get("fda_label",""),
+                            "_fda_prospectivo": _f.get("fda_prospectivo", False),
+                            "_fda_ev_dias":    _f.get("fda_ev_dias"),
+                            "_partner_label":  _f.get("partner_label",""),
                         })
 
             _nbis_rows_new.sort(key=lambda x: x["TOTAL"], reverse=True)
@@ -18955,6 +19474,24 @@ with tab_score:
             if _cands_cs:
                 _cs_pending = [r for r in _cands_cs
                                if f"cscore_{r['Ticker']}" not in st.session_state]
+                # v19.3 fix: detectar tickers con C-Score fallido (ok=False, c_total=0)
+                # y mostrar mensaje claro con botón de reintento en vez de
+                # "Calculando C-Score..." indefinidamente.
+                _cs_failed = [r for r in _cands_cs
+                              if f"cscore_{r['Ticker']}" in st.session_state
+                              and not st.session_state.get(f"cscore_{r['Ticker']}", {}).get("ok", True)
+                              and st.session_state.get(f"cscore_{r['Ticker']}", {}).get("c_total", 1) == 0]
+                if _cs_failed:
+                    _fail_tks = ", ".join(r["Ticker"] for r in _cs_failed[:6])
+                    st.caption(
+                        f"⚠️ C-Score no disponible para: **{_fail_tks}** — "
+                        f"yfinance no retornó datos (ticker sin cobertura o problema temporal). "
+                        f"El bloque de estos tickets puede deberse a datos incompletos, no a señal real.")
+                    if st.button("🔄 Recalcular C-Score (tickers fallidos)",
+                                 key="btn_retry_cscore_nbis", type="secondary"):
+                        for _rf in _cs_failed:
+                            st.session_state.pop(f"cscore_{_rf['Ticker']}", None)
+                        st.rerun()
                 if _cs_pending:
                     with st.spinner(f"🔬 Calculando C-Score para {len(_cs_pending)} candidatos..."):
                         from concurrent.futures import ThreadPoolExecutor as _TpE_cs
@@ -18973,12 +19510,21 @@ with tab_score:
                         with _TpE_cs(max_workers=4) as _ex_cs:
                             _cs_results = list(_ex_cs.map(_calc_cs, _cs_pending))
                     # Escribir resultados en session_state desde el hilo principal
+                    _cs_changed = False
                     for _tk_cs, _cs_res in _cs_results:
-                        st.session_state[f"cscore_{_tk_cs}"] = _cs_res
+                        if st.session_state.get(f"cscore_{_tk_cs}") != _cs_res:
+                            st.session_state[f"cscore_{_tk_cs}"] = _cs_res
+                            _cs_changed = True
                     # Actualizar C_Score en los rows para que aparezca en tabla
                     for _r in _nbis_rows + _mom_rows:
                         _r["C_Score"] = st.session_state.get(
                             f"cscore_{_r['Ticker']}", {}).get("c_total")
+                    # v19.3 fix: forzar refresco de la página para que el C-Score
+                    # calculado en el hilo se refleje en las cards inmediatamente.
+                    # Sin esto, session_state escrito desde ThreadPoolExecutor puede
+                    # no persistir al render siguiente → cards quedan en "Calculando..."
+                    if _cs_changed:
+                        st.rerun()
             # Agrupar por sector
             # Agrupar por sector preservando orden por score (mejor primero)
             _nbis_sectores = {}
@@ -19194,12 +19740,26 @@ with tab_score:
                     )
                     _grid_cols = "1fr 1fr 1fr 1fr"
                 else:
-                    _cs_box = (
-                        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:5px 8px;'
-                        f'display:flex;align-items:center;justify-content:center">'
-                        f'<div style="font-size:10px;color:#94A3B8">🔬 Calculando C-Score...</div>'
-                        f'</div>'
-                    )
+                    # C-Score no calculado aún o falló — distinguir los dos casos
+                    _cs_err = _cs_data.get("error","") if _cs_data else ""
+                    _cs_ok  = _cs_data.get("ok", None) if _cs_data else None
+                    if _cs_data and _cs_ok is False:
+                        # Calculado pero falló → mostrar motivo
+                        _cs_box = (
+                            f'<div style="background:#FEF9C3;border:1px solid #FDE047;border-radius:6px;padding:5px 8px;">'
+                            f'<div style="font-size:8px;color:#854D0E;font-weight:700">⚠️ C-Score sin datos</div>'
+                            f'<div style="font-size:9px;color:#78350F">yfinance sin cobertura</div>'
+                            f'<div style="font-size:8px;color:#92400E">{_cs_err[:35] if _cs_err else "Error datos"}</div>'
+                            f'</div>'
+                        )
+                    else:
+                        # Aún no calculado → spinner normal
+                        _cs_box = (
+                            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:5px 8px;'
+                            f'display:flex;align-items:center;justify-content:center">'
+                            f'<div style="font-size:10px;color:#94A3B8">🔬 Calculando C-Score...</div>'
+                            f'</div>'
+                        )
                     _grid_cols = "1fr 1fr 1fr 1fr"
 
                 _buy_box = _render_prob_compra_box(_rn.get("Compra_Greko", {}))
@@ -19279,7 +19839,8 @@ with tab_score:
                 if _cs_val is not None:
                     _vered, _vc, _vbg, _vreason = _veredicto_cruzado(
                         _rn["TOTAL"], _cs_val, _wr_card,
-                        re_val=_re_rn.get("re"), re_nivel=_re_rn.get("nivel"))
+                        re_val=_re_rn.get("re"), re_nivel=_re_rn.get("nivel"),
+                        prob_compra=_buy_data_n.get("prob_compra_greko"))
                 else:
                     # Sin C-Score aún → usar veredicto técnico clásico
                     _vered = _rn.get("Rec", "⚪ Esperar")
@@ -19296,7 +19857,55 @@ with tab_score:
                     f'<span style="font-size:12px;font-weight:900;color:{_vc}">{_vered}</span>'
                     f'<span style="font-size:10px;color:{_vc}90;margin-left:8px">{_vreason}</span>'
                     f'</div>', unsafe_allow_html=True)
-                # ── 🔍 Análisis IA — solo si veredicto es ENTRAR/PARCIAL ──
+
+                # ── v19.3 ESPERAR CAT — mostrar QUÉ catalizador esperar ──
+                if "ESPERAR" in _vered:
+                    _cat_lines = []
+                    _ed_fwd = _rn.get("_earn_dias_fwd"); _ed_str = _rn.get("_earn_date_str")
+                    if _ed_fwd and 0 < _ed_fwd <= 90:
+                        _cat_lines.append(f"{'🔥' if _ed_fwd<=15 else '📅'} Earnings en <strong>{_ed_fwd} días</strong>{' ('+_ed_str+')' if _ed_str else ''}{'— WR ~100% si hay beat' if _ed_fwd<=15 else ''}")
+                    _idx_d = _rn.get("_index_dias"); _idx_l = _rn.get("_index_label","Índice")
+                    if _idx_d is not None and 0<=_idx_d<=30:
+                        _cat_lines.append(f"📈 Inclusión <strong>{_idx_l}</strong> en <strong>{_idx_d} días</strong> — forced buying mecánico")
+                    if _rn.get("_contrato_label"):
+                        _cat_lines.append(f"📋 Contrato reciente: <strong>{_rn['_contrato_label']} {_rn.get('_contrato_monto','')}</strong>".strip())
+                    if _rn.get("_upgrade_label"):
+                        _cat_lines.append(f"📊 {_rn['_upgrade_label']}")
+                    if _rn.get("_fda_label"):
+                        _fda_prosp_disp = _rn.get("_fda_prospectivo", "pendiente" in str(_rn.get("_fda_label","")))
+                        _fda_disp_icon = "💊⚠️" if _fda_prosp_disp else "💊✅"
+                        _fda_disp_tip  = "decisión binaria pendiente · posición reducida" if _fda_prosp_disp else "ya aprobado · consumado"
+                        _cat_lines.append(f"{_fda_disp_icon} {_rn['_fda_label']} — {_fda_disp_tip}")
+                    if _rn.get("_partner_label"):
+                        _cat_lines.append(f"🤝 {_rn['_partner_label']} — confirmar si genera revenue real")
+                    _cat_cscore = _cs_data.get("tipo_catalizador","")
+                    if _cat_cscore and _cat_cscore not in ("Sin_Catalizador","Técnico_Puro",""):
+                        _cat_lines.append(f"🎯 C-Score detectó: <strong>{_cat_cscore.replace('_',' ')}</strong>")
+                    if not _cat_lines:
+                        _rsi_t = 55 if _rsi_ac < 50 else 65
+                        _cat_lines.append(f"👁️ Observar: RSI >{_rsi_t} con MACD+ (hoy RSI {_rsi_ac:.0f})")
+                        _cat_lines.append("📰 O: contrato, upgrade, FDA, guidance en próximos 5-10 días")
+                    st.markdown(
+                        '<div style="margin:-4px 0 6px 0;padding:6px 10px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:0 0 6px 6px;font-size:10px">'
+                        +'<div style="font-weight:700;color:#C2410C;margin-bottom:3px">⏱️ ¿Qué esperar antes de entrar?</div>'
+                        +"".join(f'<div style="color:#7C3AED;margin-top:2px">{l}</div>' for l in _cat_lines)
+                        +'</div>', unsafe_allow_html=True)
+
+                elif "BAJA PRIO" in _vered and _rn["TOTAL"] >= 13:
+                    _casi_cats = [c for c in [
+                        f"📅 Earnings en {_rn.get('_earn_dias_fwd')}d{(' ('+_rn.get('_earn_date_str','')+')') if _rn.get('_earn_date_str') else ''}" if _rn.get("_earn_dias_fwd") and 0<_rn["_earn_dias_fwd"]<=60 else None,
+                        f"📈 Inclusión {_rn.get('_index_label','Índice')} en {_rn.get('_index_dias')}d" if _rn.get("_index_dias") is not None and 0<=_rn["_index_dias"]<=21 else None,
+                        f"📋 {_rn.get('_contrato_label','')} {_rn.get('_contrato_monto','')}".strip() if _rn.get("_contrato_label") else None,
+                        f"📊 {_rn.get('_upgrade_label')}" if _rn.get("_upgrade_label") else None,
+                        f"💊 {_rn.get('_fda_label')}" if _rn.get("_fda_label") else None,
+                    ] if c]
+                    st.markdown(
+                        f'<div style="margin:-4px 0 6px 0;padding:5px 10px;background:#FEF9C3;border:1px solid #FDE047;border-radius:0 0 6px 6px;font-size:10px">'
+                        +f'<span style="font-weight:700;color:#854D0E">⚠️ CASI — Score {_rn["TOTAL"]}/20 (falta 1pt para umbral)</span>'
+                        +(f'<div style="color:#78350F;margin-top:2px">Catalizadores: {" · ".join(_casi_cats)}</div>' if _casi_cats else
+                          '<div style="color:#78350F;margin-top:2px">Sin catalizador — monitorear RSI y MACD</div>')
+                        +'</div>', unsafe_allow_html=True)
+
                 _n10_key  = f"n10_scmvalle_nbis_{_rn['Ticker']}_{_ii}"
                 _n10_res  = st.session_state.get(f"n10_nbis_{_rn['Ticker']}", None)
                 _prob_res = st.session_state.get(f"prob_nbis_{_rn['Ticker']}", None)
@@ -19660,7 +20269,8 @@ with tab_score:
                     if _cs_val_m is not None:
                         _vm, _vmc, _vmbg, _vmr = _veredicto_cruzado(
                             _rm_score, _cs_val_m, _rh_rm_wr,
-                            re_val=_re_rm.get("re"), re_nivel=_re_rm.get("nivel"))
+                            re_val=_re_rm.get("re"), re_nivel=_re_rm.get("nivel"),
+                            prob_compra=_buy_data_m.get("prob_compra_greko"))
                     else:
                         _vm  = _rm.get("Rec", "⚪ Esperar")
                         _vmc = _rm.get("Rc",  "#64748B")
@@ -19827,10 +20437,12 @@ with tab_score:
             _wr_r = r.get("_wr_pre", 50)
             _cs_r = st.session_state.get(f"cscore_{r['Ticker']}", {}).get("c_total")
             _re_r = r.get("RE", {}) or {}
+            _prob_r = st.session_state.get(f"cscore_{r['Ticker']}", {}).get("prob_compra_greko")
             if _cs_r is not None:
                 _v, _, _, _ = _veredicto_cruzado(
                     r["TOTAL"], _cs_r, _wr_r,
-                    re_val=_re_r.get("re"), re_nivel=_re_r.get("nivel"))
+                    re_val=_re_r.get("re"), re_nivel=_re_r.get("nivel"),
+                    prob_compra=_prob_r)
                 return _v.startswith(("✅","⚡","🔥"))
             # Sin C-Score aún → fallback a Rec clásico
             return str(r.get("Rec","")).startswith(("✅","⚡"))
@@ -19981,7 +20593,8 @@ with tab_score:
                     # que se muestra en pantalla, recomputado para el export
                     _vered_dl, _, _, _vreason_dl = _veredicto_cruzado(
                         _rv["TOTAL"], _rv.get("C_Score"), _rh_p.get("rh_wr",50),
-                        re_val=_re_v.get("re"), re_nivel=_re_v.get("nivel"))
+                        re_val=_re_v.get("re"), re_nivel=_re_v.get("nivel"),
+                        prob_compra=_compra_v.get("prob_compra_greko"))
                     _rows_dl.append({
                         "Fecha":          _hoy_dl,
                         "Ticker":         _rv["Ticker"],
@@ -20034,7 +20647,8 @@ with tab_score:
                     else:                                    _fund_dl="📊 Sin datos"
                     _vered_dl, _, _, _vreason_dl = _veredicto_cruzado(
                         _rv["TOTAL"], _rv.get("C_Score"), _rh_p.get("rh_wr",50),
-                        re_val=_re_v.get("re"), re_nivel=_re_v.get("nivel"))
+                        re_val=_re_v.get("re"), re_nivel=_re_v.get("nivel"),
+                        prob_compra=_compra_v.get("prob_compra_greko"))
                     _rows_dl.append({
                         "Fecha":          _hoy_dl,
                         "Ticker":         _rv["Ticker"],
@@ -20408,10 +21022,64 @@ with tab_noticias:
             "veredicto":"MANTENER","accion_concreta":"Revisar manualmente",
             "confianza":"BAJA","radar_sympathy":[]}
 
-        # ── Circuit breaker: si ya sabemos que no hay créditos, no llamar ──
+        # ── Circuit breaker: si ya sabemos que no hay créditos → matemático ──
         if not _api_creditos_disponibles():
-            _fallback["noticia_principal"] = "Sin créditos API — análisis desactivado"
-            return _fallback
+            # v19.3: en vez de devolver "Sin créditos API — análisis desactivado",
+            # construir un análisis 100% matemático con fetch_noticias_ticker()
+            # ($0, ya disponible) que sea útil aunque sin web_search.
+            try:
+                _nots_mat = fetch_noticias_ticker(tk)
+                _an_mat   = _analizar_noticias_matematico(tk, _nots_mat, sector=sector, area=sector)
+                _news_score_mat = _an_mat.get("news_score", 0)
+                _tipo_cat_mat   = _an_mat.get("tipo_catalizador","Sin_Catalizador").replace("_"," ")
+                _dir_mat        = _an_mat.get("direccion_news","Neutral")
+                _blocker_mat    = _an_mat.get("blocker","Sin_Bloqueador").replace("_"," ")
+                _cts_mat        = _an_mat.get("cts", 50)
+                _nm_mat         = _an_mat.get("nm", 50)
+
+                # Decidir acción basado en datos matemáticos
+                if pnl_pct <= -8:
+                    _accion_mat = "⚠️ Evaluar stop-loss"
+                elif pnl_pct >= 15 and _news_score_mat < -10:
+                    _accion_mat = "🔶 Considerar reducción parcial"
+                elif _blocker_mat not in ("Sin Bloqueador",""):
+                    _accion_mat = f"🚫 Blocker activo: {_blocker_mat}"
+                elif _dir_mat == "Alcista" and pnl_pct > 0:
+                    _accion_mat = "✅ Mantener — narrativa positiva"
+                elif _dir_mat == "Bajista":
+                    _accion_mat = "⚠️ Revisar — señales bajistas en noticias"
+                else:
+                    _accion_mat = "⏸️ Mantener y monitorear"
+
+                # Top noticias recientes
+                _nots_texto = "; ".join([
+                    str(n.get("titulo", n.get("title", "")))[:60]
+                    for n in (_nots_mat or [])[:3]
+                    if n.get("titulo") or n.get("title")
+                ]) or "Sin noticias recientes detectadas"
+
+                _fallback["noticia_principal"] = (
+                    f"🧮 ANÁLISIS MATEMÁTICO (sin API, $0)\n"
+                    f"Catalizador: {_tipo_cat_mat} · Dirección: {_dir_mat}\n"
+                    f"Sentiment score: {_news_score_mat:+d}/100 · CTS: {_cts_mat} · NM: {_nm_mat}\n"
+                    f"Noticias recientes: {_nots_texto}\n"
+                    f"PnL actual: {pnl_pct:+.1f}% | Fase: {fase}\n"
+                    f"→ Acción sugerida: {_accion_mat}"
+                )
+                if _blocker_mat not in ("Sin Bloqueador",""):
+                    _fallback["alertas_detectadas"] = [f"🚫 {_blocker_mat}"]
+                _fallback["confianza"] = "MEDIA"
+                _fallback["accion_modelo"] = _accion_mat
+                _fallback["_modo"] = "matematico"
+                return _fallback
+            except Exception as _ex_mat:
+                _fallback["noticia_principal"] = (
+                    "🧮 Sin créditos API · análisis matemático tampoco disponible\n"
+                    f"({str(_ex_mat)[:80]})\n"
+                    f"PnL actual: {pnl_pct:+.1f}% | Fase: {fase}\n"
+                    "→ Revisar manualmente en broker"
+                )
+                return _fallback
 
         try:
             import anthropic as _ant_not
@@ -20454,7 +21122,18 @@ with tab_noticias:
         except Exception as _ex:
             if _es_error_sin_creditos(_ex):
                 _marcar_sin_creditos(_ex)
-                _fallback["noticia_principal"] = "Sin créditos API — análisis desactivado"
+                # v19.3: re-entrar al fallback matemático en vez de mensaje vacío
+                try:
+                    _nots_mat2 = fetch_noticias_ticker(tk)
+                    _an_mat2   = _analizar_noticias_matematico(tk, _nots_mat2, sector=sector, area=sector)
+                    _fallback["noticia_principal"] = (
+                        f"🧮 ANÁLISIS MATEMÁTICO (créditos API agotados, $0)\n"
+                        f"Catalizador: {_an_mat2.get('tipo_catalizador','—').replace('_',' ')} · "
+                        f"Dirección: {_an_mat2.get('direccion_news','Neutral')}\n"
+                        f"PnL actual: {pnl_pct:+.1f}% | Fase: {fase}")
+                    _fallback["_modo"] = "matematico"
+                except Exception:
+                    _fallback["noticia_principal"] = "🔴 Créditos API agotados — recargar en anthropic.com/billing"
             else:
                 _fallback["noticia_principal"] = f"Error: {str(_ex)[:60]}"
             return _fallback
@@ -20701,15 +21380,15 @@ with tab_noticias:
             _tk = str(_p.get("Ticker","")).upper()
             try:
                 _pc = _parse_precio(_p.get("Precio_Compra", 0))
-                _pa = float(get_row_for_ticker(_tk,_pc)["Precio"])
-                _pnls[_tk] = round((_pa-_pc)/_pc*100,1) if _pc>0 else 0
+                _pa = _safe_float(get_row_for_ticker(_tk,_pc)["Precio"], default=_pc)
+                _pnls[_tk] = round((_pa-_pc)/_pc*100,1) if _pc>0 and _pa>0 else 0
             except Exception: _pnls[_tk]=0
         _pos_sorted = sorted(posiciones,
             key=lambda p: _prioridad_pos(p, _pnls.get(str(p.get("Ticker","")).upper(),0)))
         for _p2 in _pos_sorted:
             _tk2   = str(_p2.get("Ticker","")).upper()
-            _pnl2  = _pnls.get(_tk2, 0)
-            _pc2   = _parse_precio(_p2.get("Precio_Compra", 0))
+            _pnl2  = _safe_float(_pnls.get(_tk2, 0), 0.0)
+            _pc2   = _safe_float(_parse_precio(_p2.get("Precio_Compra", 0)), 0.0)
             _an    = resultados.get(_tk2)
             _fase2 = str(_p2.get("Fase","—"))
             _pnl_col = "#16A34A" if _pnl2>=0 else "#EF4444"
