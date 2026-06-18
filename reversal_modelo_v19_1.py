@@ -12086,6 +12086,25 @@ with tab1:
                         if _na_m >= 10:       _score_m += 10
                         elif _na_m >= 5:      _score_m += 5
 
+                        # v19.3: earnings proximity — extraer earningsTimestamp
+                        # de yfinance.info (ya descargado arriba, $0 marginal)
+                        # y calcular días restantes para badge y hard block.
+                        _earn_ts_m = (_info_m.get("earningsTimestamp")
+                                      or _info_m.get("earningsTimestampStart"))
+                        _earn_dias_m = None
+                        try:
+                            if _earn_ts_m:
+                                import datetime as _dt_earn_m
+                                _earn_date_m = _dt_earn_m.datetime.fromtimestamp(
+                                    int(_earn_ts_m)).date()
+                                _earn_dias_m = (_earn_date_m - _dt_earn_m.date.today()).days
+                        except Exception:
+                            pass
+
+                        # Hard Block: earn ≤2d → NO entrar (igual que scan_tab Regla 3)
+                        # La volatilidad del evento supera cualquier señal técnica
+                        _earn_bloq_m = _earn_dias_m is not None and 0 <= _earn_dias_m <= 2
+
                         # v19.2: score mínimo 35 (antes 50)
                         if _score_m < 35:
                             continue
@@ -12125,6 +12144,8 @@ with tab1:
                             "Dist_ATH":    f"{_dist_ath_m:.1f}%",
                             "Score_Mom":   _score_m,
                             "Señal":       "⚡ MOMENTUM",
+                            "earn_dias":   _earn_dias_m,
+                            "earn_bloq":   _earn_bloq_m,
                             "Tamaño":      "20-30%",
                             "Stop":        f"${round(_pa_m*0.95,2):.2f} (-5%)",
                             "T1":          f"${round(_pa_m*1.15,2):.2f} (+15%)",
@@ -12175,7 +12196,37 @@ with tab1:
             pass
 
         for _idx_m, _mr in enumerate(_mom_data[:15]):
+            # v19.3: Hard Block earn≤2d — no mostrar la card si earn mañana/hoy/ayer
+            if _mr.get("earn_bloq"):
+                _ed_m = _mr.get("earn_dias",0)
+                st.markdown(
+                    f'<div style="background:#FEF2F2;border:1px solid #FCA5A5;border-radius:6px;'
+                    f'padding:6px 12px;margin-bottom:4px;font-size:10px">'
+                    f'🚨 <strong>{_mr["Ticker"]}</strong> — Earnings en <strong>{_ed_m} día(s)</strong> · '
+                    f'RSI {_mr["RSI"]} · NO entrar (volatilidad del evento supera señal técnica)'
+                    f'</div>', unsafe_allow_html=True)
+                continue  # saltar el card completo — no es momento de entrar
+
             _rsi_c   = "#DC2626" if _mr["RSI"] > 80 else "#D97706" if _mr["RSI"] > 70 else "#16A34A"
+
+            # v19.3: badge de earnings próximos para mostrar en la card
+            _ed_m = _mr.get("earn_dias")
+            if _ed_m is not None and 0 <= _ed_m <= 2:
+                _earn_badge_m = ""  # bloqueado arriba — nunca llega aquí
+            elif _ed_m is not None and 3 <= _ed_m <= 7:
+                _earn_badge_m = (f'<span style="background:#FFFBEB;color:#D97706;border-radius:4px;'
+                                 f'padding:1px 6px;font-size:9px;font-weight:700;margin-left:4px">'
+                                 f'⚠️ Earn en {_ed_m}d · parcial</span>')
+            elif _ed_m is not None and 8 <= _ed_m <= 15:
+                _earn_badge_m = (f'<span style="background:#F0FDF4;color:#16A34A;border-radius:4px;'
+                                 f'padding:1px 6px;font-size:9px;font-weight:700;margin-left:4px">'
+                                 f'🎯 Earn en {_ed_m}d · catalizador</span>')
+            elif _ed_m is not None and 16 <= _ed_m <= 30:
+                _earn_badge_m = (f'<span style="background:#EFF6FF;color:#2563EB;border-radius:4px;'
+                                 f'padding:1px 6px;font-size:9px;margin-left:4px">'
+                                 f'📅 Earn en {_ed_m}d</span>')
+            else:
+                _earn_badge_m = ""
             # v19.2: Calcular recomendación de registro
             _rec_mom = badge_recomendacion_momentum(
                 score=_mr.get("Score_Mom",0), rsi=_mr.get("RSI",0),
@@ -12196,6 +12247,7 @@ with tab1:
                 f'{badge_castigada(float(_mr.get("RSI",0) or 0), float(str(_mr.get("Dist_ATH","0")).replace("%","").replace("+","") or 0))}'+
                 f'    <span style="background:#FEF9C3;color:#D97706;border-radius:4px;'+
                 f'    padding:1px 6px;font-size:9px;font-weight:700;margin-left:6px">⚡ MOMENTUM</span>'+
+                _earn_badge_m +\
                 f'    <span style="background:#F1F5F9;color:#64748B;border-radius:4px;'+
                 f'    padding:1px 6px;font-size:9px;margin-left:4px">'+
                 f'    🎯 {_mr["Tamaño"]}</span>'+
