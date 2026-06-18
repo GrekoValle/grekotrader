@@ -19526,6 +19526,20 @@ with tab_score:
             if _cands_cs:
                 _cs_pending = [r for r in _cands_cs
                                if f"cscore_{r['Ticker']}" not in st.session_state]
+                # v19.3 fix: escape anti-bucle — si un ticker lleva 2+ renders
+                # sin key en session_state, forzar "sin datos" para desbloquear la card
+                _cs_intentos = st.session_state.setdefault("_cs_intentos_nbis", {})
+                for _r_esc in list(_cs_pending):
+                    _tk_esc = _r_esc["Ticker"]
+                    _cs_intentos[_tk_esc] = _cs_intentos.get(_tk_esc, 0) + 1
+                    if _cs_intentos[_tk_esc] >= 3:
+                        st.session_state[f"cscore_{_tk_esc}"] = {
+                            "c_total": 0, "ok": False,
+                            "error": "Sin datos yfinance después de 3 intentos"
+                        }
+                # Recalcular tras el escape
+                _cs_pending = [r for r in _cands_cs
+                               if f"cscore_{r['Ticker']}" not in st.session_state]
                 # v19.3 fix: detectar tickers con C-Score fallido (ok=False, c_total=0)
                 # y mostrar mensaje claro con botón de reintento en vez de
                 # "Calculando C-Score..." indefinidamente.
@@ -19547,36 +19561,33 @@ with tab_score:
                 if _cs_pending:
                     with st.spinner(f"🔬 Calculando C-Score para {len(_cs_pending)} candidatos..."):
                         from concurrent.futures import ThreadPoolExecutor as _TpE_cs
-                        # Leer noticias_cache en el hilo PRINCIPAL (st.session_state
-                        # no es seguro de leer desde hilos secundarios)
                         _noticias_cache_snap = dict(st.session_state.get("noticias_cache", {}))
                         def _calc_cs(row):
-                            # NO escribir session_state aquí (thread sin ScriptRunContext)
                             try:
                                 _cs = _calcular_c_score_free(
                                     row["Ticker"], row.get("Sector",""), row.get("Beta",1.0),
                                     noticias_cache=_noticias_cache_snap)
                             except Exception as _ex_cs2:
                                 _cs = {"c_total": 0, "ok": False, "error": str(_ex_cs2)[:60]}
+                            # v19.3 fix: garantizar que c_total es siempre un número
+                            # (nunca None) para que la detección ok=False+c_total=0 funcione
+                            if _cs.get("c_total") is None:
+                                _cs["c_total"] = 0
                             return row["Ticker"], _cs
                         with _TpE_cs(max_workers=4) as _ex_cs:
                             _cs_results = list(_ex_cs.map(_calc_cs, _cs_pending))
                     # Escribir resultados en session_state desde el hilo principal
-                    _cs_changed = False
                     for _tk_cs, _cs_res in _cs_results:
-                        if st.session_state.get(f"cscore_{_tk_cs}") != _cs_res:
-                            st.session_state[f"cscore_{_tk_cs}"] = _cs_res
-                            _cs_changed = True
-                    # Actualizar C_Score en los rows para que aparezca en tabla
+                        st.session_state[f"cscore_{_tk_cs}"] = _cs_res
+                    # Actualizar C_Score en los rows
                     for _r in _nbis_rows + _mom_rows:
                         _r["C_Score"] = st.session_state.get(
                             f"cscore_{_r['Ticker']}", {}).get("c_total")
-                    # v19.3 fix: forzar refresco de la página para que el C-Score
-                    # calculado en el hilo se refleje en las cards inmediatamente.
-                    # Sin esto, session_state escrito desde ThreadPoolExecutor puede
-                    # no persistir al render siguiente → cards quedan en "Calculando..."
-                    if _cs_changed:
-                        st.rerun()
+                    # v19.3 fix: SIEMPRE rerun después de calcular — antes solo
+                    # rerrunaba si _cs_changed=True, pero si todos los tickers
+                    # retornaban c_total=0 (fallo silencioso) _cs_changed=False
+                    # y la card quedaba pegada en "🔬 Calculando C-Score..."
+                    st.rerun()
             # Agrupar por sector
             # Agrupar por sector preservando orden por score (mejor primero)
             _nbis_sectores = {}
