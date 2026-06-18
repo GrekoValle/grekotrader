@@ -19524,22 +19524,29 @@ with tab_score:
             # Calcular C-Score en background para candidatos Score≥12 (NBIS + Momentum)
             _cands_cs = [r for r in _nbis_rows + _mom_rows if r["TOTAL"] >= 12]
             if _cands_cs:
+                # v19.3 fix definitivo: separar "nunca calculado" de "calculado con fallo"
+                # El bucle infinito ocurría porque:
+                # 1. st.rerun() incondicional → nuevo render → _cs_pending vacío → sin rerun ← OK
+                # 2. Pero contador de intentos se incrementaba en cada render aunque el ticker
+                #    ya tuviera su key → eventualmente marcaba tickers OK como fallidos
+                # NUEVA LÓGICA: el contador solo incrementa tickers que NO tienen key todavía
                 _cs_pending = [r for r in _cands_cs
                                if f"cscore_{r['Ticker']}" not in st.session_state]
-                # v19.3 fix: escape anti-bucle — si un ticker lleva 2+ renders
-                # sin key en session_state, forzar "sin datos" para desbloquear la card
-                _cs_intentos = st.session_state.setdefault("_cs_intentos_nbis", {})
-                for _r_esc in list(_cs_pending):
-                    _tk_esc = _r_esc["Ticker"]
-                    _cs_intentos[_tk_esc] = _cs_intentos.get(_tk_esc, 0) + 1
-                    if _cs_intentos[_tk_esc] >= 3:
-                        st.session_state[f"cscore_{_tk_esc}"] = {
-                            "c_total": 0, "ok": False,
-                            "error": "Sin datos yfinance después de 3 intentos"
-                        }
-                # Recalcular tras el escape
-                _cs_pending = [r for r in _cands_cs
-                               if f"cscore_{r['Ticker']}" not in st.session_state]
+                # Escape anti-stuck: marcar como fallido tras 2 intentos REALES de cálculo
+                # (no incrementar en renders donde ya tienen key)
+                if _cs_pending:
+                    _cs_intentos = st.session_state.setdefault("_cs_intentos_nbis", {})
+                    for _r_esc in list(_cs_pending):
+                        _tk_esc = _r_esc["Ticker"]
+                        _cs_intentos[_tk_esc] = _cs_intentos.get(_tk_esc, 0) + 1
+                        if _cs_intentos[_tk_esc] >= 3:
+                            st.session_state[f"cscore_{_tk_esc}"] = {
+                                "c_total": 0, "ok": False,
+                                "error": "Sin datos yfinance después de 3 intentos"
+                            }
+                    # Recalcular pendientes tras el escape
+                    _cs_pending = [r for r in _cands_cs
+                                   if f"cscore_{r['Ticker']}" not in st.session_state]
                 # v19.3 fix: detectar tickers con C-Score fallido (ok=False, c_total=0)
                 # y mostrar mensaje claro con botón de reintento en vez de
                 # "Calculando C-Score..." indefinidamente.
@@ -19577,17 +19584,23 @@ with tab_score:
                         with _TpE_cs(max_workers=4) as _ex_cs:
                             _cs_results = list(_ex_cs.map(_calc_cs, _cs_pending))
                     # Escribir resultados en session_state desde el hilo principal
+                    _cs_changed = False
                     for _tk_cs, _cs_res in _cs_results:
-                        st.session_state[f"cscore_{_tk_cs}"] = _cs_res
+                        if st.session_state.get(f"cscore_{_tk_cs}") != _cs_res:
+                            st.session_state[f"cscore_{_tk_cs}"] = _cs_res
+                            _cs_changed = True
                     # Actualizar C_Score en los rows
                     for _r in _nbis_rows + _mom_rows:
                         _r["C_Score"] = st.session_state.get(
                             f"cscore_{_r['Ticker']}", {}).get("c_total")
-                    # v19.3 fix: SIEMPRE rerun después de calcular — antes solo
-                    # rerrunaba si _cs_changed=True, pero si todos los tickers
-                    # retornaban c_total=0 (fallo silencioso) _cs_changed=False
-                    # y la card quedaba pegada en "🔬 Calculando C-Score..."
-                    st.rerun()
+                    # v19.3 fix: rerun solo si hubo cambios reales.
+                    # El rerun incondicional causaba el diálogo "Clear caches"
+                    # en el browser porque Streamlit detectaba un bucle de reruns.
+                    # El escape de 3 intentos (arriba) garantiza que los tickers
+                    # stuck eventualmente obtienen una key → salen de _cs_pending
+                    # → no hay rerun infinito.
+                    if _cs_changed:
+                        st.rerun()
             # Agrupar por sector
             # Agrupar por sector preservando orden por score (mejor primero)
             _nbis_sectores = {}
