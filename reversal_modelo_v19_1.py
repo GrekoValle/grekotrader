@@ -1008,164 +1008,113 @@ except Exception:
 # ─────────────────────────────────────────────────────────────
 #  INDICADORES DE MERCADO - automáticos para el header
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=900, show_spinner=False)  # cache 15 min
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_indicators() -> dict:
     """
-    Descarga indicadores clave de mercado para el header.
-    Todos relevantes para el modelo de rebote técnico NBIS.
+    v19.2: UNA sola llamada yf.download batch para todos los indicadores.
+    Antes: 25+ llamadas individuales → rate limit y lentitud.
+    Ahora: 1 batch → ~5 segundos máximo.
     """
     result = {}
     try:
-        import yfinance as yf
+        import yfinance as _yf_mkt
+        import numpy as _np_mkt
+        import pandas as _pd_mkt
+
+        # Todos los tickers en una sola llamada batch
+        _tks_mkt = ["^GSPC", "^IXIC", "^VIX", "SPY",
+                    "XLK", "XLV", "XLF", "XLY", "XLI"]
+        _raw_mkt = _yf_mkt.download(
+            " ".join(_tks_mkt), period="3mo",
+            auto_adjust=True, progress=False, threads=True)
+        _cl_mkt = _raw_mkt.get("Close", _raw_mkt)
+
+        def _get_close(tk):
+            try:
+                if hasattr(_cl_mkt, "columns") and tk in _cl_mkt.columns:
+                    return _cl_mkt[tk].dropna()
+                return _cl_mkt.dropna()
+            except Exception:
+                return _pd_mkt.Series(dtype=float)
 
         # S&P 500
         try:
-            spx = yf.Ticker("^GSPC").history(period="5d")
-            if not spx.empty:
-                _spx_c = spx["Close"].dropna()
-                if len(_spx_c) >= 1:
-                    spx_now  = float(_spx_c.iloc[-1])
-                    spx_prev = float(_spx_c.iloc[-2]) if len(_spx_c) >= 2 else spx_now
-                    if spx_now == spx_now and spx_now > 0:  # NaN check
-                        result["spx"] = {"val": spx_now, "chg": (spx_now-spx_prev)/spx_prev*100}
+            _s = _get_close("^GSPC")
+            if len(_s) >= 2:
+                _v = float(_s.iloc[-1]); _p = float(_s.iloc[-2])
+                result["spx"] = {"val": _v, "chg": (_v-_p)/_p*100}
         except Exception: pass
 
         # Nasdaq
         try:
-            ndx = yf.Ticker("^IXIC").history(period="5d")
-            if not ndx.empty:
-                _ndx_c = ndx["Close"].dropna()
-                if len(_ndx_c) >= 1:
-                    ndx_now  = float(_ndx_c.iloc[-1])
-                    ndx_prev = float(_ndx_c.iloc[-2]) if len(_ndx_c) >= 2 else ndx_now
-                    if ndx_now == ndx_now and ndx_now > 0:  # NaN check
-                        result["ndx"] = {"val": ndx_now, "chg": (ndx_now-ndx_prev)/ndx_prev*100}
+            _s = _get_close("^IXIC")
+            if len(_s) >= 2:
+                _v = float(_s.iloc[-1]); _p = float(_s.iloc[-2])
+                result["ndx"] = {"val": _v, "chg": (_v-_p)/_p*100}
         except Exception: pass
 
-        # Fear & Greed aproximado via VIX (^PCALL no disponible en Yahoo)
+        # VIX
         try:
-            # Usar VIX como proxy de Fear & Greed
-            vix_fg = yf.Ticker("^VIX").history(period="2d")
-            if not vix_fg.empty:
-                vix_val = float(vix_fg["Close"].iloc[-1])
-                if vix_val >= 35:
-                    fg_label = "MIEDO EXTREMO 🟢"; fg_score = 15; fg_color = "G"
-                elif vix_val >= 25:
-                    fg_label = "MIEDO 🟡"; fg_score = 30; fg_color = "A"
-                elif vix_val >= 18:
-                    fg_label = "NEUTRAL ⚪"; fg_score = 50; fg_color = "TXT_MUT"
-                elif vix_val >= 13:
-                    fg_label = "CODICIA 🟡"; fg_score = 70; fg_color = "A"
-                else:
-                    fg_label = "CODICIA EXTREMA 🔴"; fg_score = 85; fg_color = "R"
-                result["pcr"] = {"val": round(vix_val,1), "label": fg_label,
-                                 "score": fg_score, "color_key": fg_color}
-        except Exception:
-            pass
+            _s = _get_close("^VIX")
+            if len(_s) >= 1:
+                vix_val = float(_s.iloc[-1])
+                if vix_val >= 35: fg_label="MIEDO EXTREMO 🟢"; fg_score=15
+                elif vix_val >= 25: fg_label="MIEDO 🟡"; fg_score=30
+                elif vix_val >= 18: fg_label="NEUTRAL ⚪"; fg_score=50
+                elif vix_val >= 13: fg_label="CODICIA 🟡"; fg_score=70
+                else: fg_label="CODICIA EXTREMA 🔴"; fg_score=85
+                result["vix"] = {"val": vix_val}
+                result["fear_greed"] = {"label": fg_label, "score": fg_score}
+        except Exception: pass
 
-        # SPY completo: RSI + EMA50 + EMA200 + MACD tendencia + cambio 20d
+        # SPY RSI
         try:
-            spy = yf.Ticker("SPY").history(period="1y")
-            if not spy.empty:
-                s = spy["Close"].dropna()  # eliminar NaN (pre/after-hours, días sin datos)
-                if len(s) >= 21:
-                    _pa_spy   = float(s.iloc[-1])
-                    _p20_spy  = float(s.iloc[-20]) if len(s)>=20 else _pa_spy
-                    _chg20    = round((_pa_spy-_p20_spy)/_p20_spy*100, 1)
-                # RSI
-                delta = s.diff()
-                gain  = delta.clip(lower=0).rolling(14).mean()
-                loss  = (-delta.clip(upper=0)).rolling(14).mean()
-                rsi_spy = round(float(100-100/(1+gain.iloc[-1]/(loss.iloc[-1]+1e-9))), 1)
-                # EMA50 y EMA200
-                ema50_spy  = float(s.ewm(span=50,  adjust=False).mean().iloc[-1])
-                ema200_spy = float(s.ewm(span=200, adjust=False).mean().iloc[-1])
-                # MACD tendencia (12/26) y señal (9)
-                ema12 = s.ewm(span=12, adjust=False).mean()
-                ema26 = s.ewm(span=26, adjust=False).mean()
-                macd_line   = ema12 - ema26
-                macd_signal = macd_line.ewm(span=9, adjust=False).mean()
-                macd_now    = float(macd_line.iloc[-1])
-                macd_sig    = float(macd_signal.iloc[-1])
-                macd_prev   = float(macd_line.iloc[-2]) if len(macd_line)>=2 else macd_now
-                macd_cruce  = "positivo" if macd_now > macd_sig else "negativo"
-                macd_dir    = "subiendo" if macd_now > macd_prev else "bajando"
-                # VIX tendencia (necesita descarga separada de 5d)
+            _s = _get_close("SPY")
+            if len(_s) >= 15:
+                _d = _pd_mkt.Series(_s.values).diff()
+                _g = _d.clip(lower=0).rolling(14).mean()
+                _l = (-_d.clip(upper=0)).rolling(14).mean()
+                _rsi = round(float(100-100/(1+_g.iloc[-1]/(_l.iloc[-1]+1e-9))),1)
+                _pico = float(_s.iloc[-60:].max()) if len(_s)>=60 else float(_s.max())
+                _dd   = round((float(_s.iloc[-1])-_pico)/_pico*100,1)
+                _ema50 = float(_pd_mkt.Series(_s.values).ewm(span=50).mean().iloc[-1])
+                _precio_spy = round(float(_s.iloc[-1]),2)
+                _ema_status = "bajo EMA50" if _precio_spy < _ema50 else "sobre EMA50"
                 result["spy"] = {
-                    "rsi":       rsi_spy,
-                    "precio":    round(_pa_spy, 2),
-                    "chg_20d":   _chg20,
-                    "sobre_ema50":  _pa_spy > ema50_spy,
-                    "sobre_ema200": _pa_spy > ema200_spy,
-                    "dist_ema200":  round((_pa_spy - ema200_spy)/ema200_spy*100, 1),
-                    "macd_cruce":   macd_cruce,
-                    "macd_dir":     macd_dir,
-                    "ema_status": "SPY sobre EMA200" if _pa_spy > ema200_spy else "SPY BAJO EMA200",
+                    "rsi": _rsi, "dd": _dd, "precio": _precio_spy,
+                    "ema_status": _ema_status, "ema50": round(_ema50,2)
                 }
         except Exception: pass
 
-        # VIX tendencia (7d)
-        try:
-            vix_hist = yf.Ticker("^VIX").history(period="1mo")
-            if not vix_hist.empty and len(vix_hist) >= 7:
-                _vix_now  = float(vix_hist["Close"].iloc[-1])
-                _vix_7d   = float(vix_hist["Close"].iloc[-7])
-                _vix_chg  = round(_vix_now - _vix_7d, 1)
-                result["vix_trend"] = {"valor": round(_vix_now,1), "chg_7d": _vix_chg,
-                                       "subiendo": _vix_chg > 2}
-        except Exception: pass
-
-        # Sector más débil - buscar el que tiene más acciones en corrección
-        sectores = {
-            "Energía":   ["XOM","CVX","OXY","DVN","COP"],
-            "Tech":      ["MSFT","GOOGL","META","NVDA","AMD"],
-            "Salud":     ["PFE","MRNA","ABBV","MRK","GILD"],
-            "Finanzas":  ["JPM","BAC","GS","MS","C"],
-            "Consumo":   ["NKE","CROX","SBUX","MCD","TGT"],
-            "Industrial":["BA","GE","HON","CAT","DE"],
+        # Sectores simplificados desde ETFs
+        _etf_sector = {
+            "Tech": "XLK", "Salud": "XLV",
+            "Finanzas": "XLF", "Consumo": "XLY", "Industrial": "XLI"
         }
         sector_scores = {}
-        for sector, tickers in sectores.items():
-            en_correccion = 0
-            for tk in tickers:
-                try:
-                    import time as _tm_scan
-                    _tm_scan.sleep(0.08)  # anti rate-limit
-                    h = yf.Ticker(tk).history(period="3mo")
-                    if h.empty: continue
-                    c2 = h["Close"].values
-                    precio = float(c2[-1]); pico = float(c2.max())
-                    dd = (precio-pico)/pico*100
-                    s2 = __import__("pandas").Series(c2)
-                    d2 = s2.diff()
-                    g2 = d2.clip(lower=0).rolling(14).mean()
-                    l2 = (-d2.clip(upper=0)).rolling(14).mean()
-                    rsi2 = float(100-100/(1+g2.iloc[-1]/(l2.iloc[-1]+1e-9)))
-                    if rsi2 < 50 and dd < -10:
-                        en_correccion += 1
-                except Exception: continue
-            sector_scores[sector] = en_correccion
-
+        for _sec, _etf in _etf_sector.items():
+            try:
+                _s = _get_close(_etf)
+                if len(_s) >= 20:
+                    _d = _pd_mkt.Series(_s.values).diff()
+                    _g = _d.clip(lower=0).rolling(14).mean()
+                    _l = (-_d.clip(upper=0)).rolling(14).mean()
+                    _rsi = float(100-100/(1+_g.iloc[-1]/(_l.iloc[-1]+1e-9)))
+                    _pico = float(_s.iloc[-60:].max()) if len(_s)>=60 else float(_s.max())
+                    _dd   = (float(_s.iloc[-1])-_pico)/_pico*100
+                    sector_scores[_sec] = 1 if (_rsi < 50 and _dd < -10) else 0
+            except Exception: pass
         if sector_scores:
-            mejor_sector = max(sector_scores, key=sector_scores.get)
+            mejor = max(sector_scores, key=sector_scores.get)
             result["sectores"] = {
-                "mejor_oportunidad": mejor_sector,
-                "acciones_en_correccion": sector_scores[mejor_sector],
+                "mejor_oportunidad": mejor,
+                "acciones_en_correccion": sector_scores[mejor],
                 "scores": sector_scores,
             }
 
     except Exception: pass
     return result
 
-
-# ─────────────────────────────────────────────────────────────
-#  UNIVERSO A ESCANEAR - S&P500 + Nasdaq + Sectores
-# ─────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────
-#  PRE/POST MARKET - datos en tiempo real por ticker
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)  # cache 5 min
 def fetch_pre_post(ticker: str) -> dict:
     """
     Obtiene Pre-Market y Post-Market de yfinance.
@@ -11436,16 +11385,20 @@ import datetime as _dt_mkt_hdr
 if "mkt_cache" not in st.session_state:
     st.session_state["mkt_cache"] = {}
     st.session_state["mkt_cache_ts"] = 0
-# Recargar si caché tiene más de 15 minutos o está vacío
 _mkt_now = _dt_mkt_hdr.datetime.now().timestamp()
 _mkt_stale = (_mkt_now - st.session_state.get("mkt_cache_ts", 0)) > 900
 mkt = st.session_state.get("mkt_cache", {})
 if not mkt or _mkt_stale:
-    with st.spinner("Cargando indicadores de mercado..."):
-        mkt = fetch_market_indicators()
-        if mkt:  # solo guardar si retornó datos
+    # v19.2 fix: sin st.spinner — no bloquear la app si yfinance está lento
+    # Si falla, mkt queda vacío → muestra "-" pero la app sigue funcionando
+    try:
+        _mkt_nuevo = fetch_market_indicators()
+        if _mkt_nuevo:
+            mkt = _mkt_nuevo
             st.session_state["mkt_cache"]    = mkt
             st.session_state["mkt_cache_ts"] = _mkt_now
+    except Exception:
+        pass
 
 # ── Fila 1: S&P500  - Nasdaq  - SPY RSI  - Sector  - Señal ───────
 col_spx, col_ndx, col_spy, col_sector, col_signal = st.columns(5)
@@ -22557,6 +22510,30 @@ with tab_noticias_v2:
     else:
         _fmt = "nuevo (AQ.)" if _v2_key.startswith("AQ") else "clásico (AIzaSy)"
         st.caption(f"🔑 Key detectada formato **{_fmt}** · {_v2_key[:8]}...")
+
+        # Test rápido de conectividad con Gemini
+        if st.button("🧪 Test Gemini (diagnóstico)", key="btn_v2_test",
+                     type="secondary", use_container_width=False):
+            with st.spinner("Probando conexión con Gemini..."):
+                _test_resp = _llamar_gemini(
+                    system_prompt="Responde solo JSON.",
+                    user_prompt='{"test": true} → responde {"ok": true}',
+                    max_tokens=50, con_search=False, api_key=_v2_key)
+            if _test_resp:
+                st.success(f"✅ Gemini responde correctamente: {_test_resp[:100]}")
+            else:
+                st.error("❌ Gemini no respondió — revisar key o SDK instalado")
+                # Mostrar qué SDK se intentó usar
+                _es_nueva = _v2_key.startswith("AQ")
+                st.code(f"""
+SDK intentado: {'google-genai (nuevo)' if _es_nueva else 'google-generativeai (clásico)'}
+Key formato: {_fmt}
+Modelo: {'gemini-2.0-flash' if _es_nueva else 'gemini-1.5-flash'}
+
+Si el error persiste, verifica en requirements.txt:
+{'google-genai>=1.0.0' if _es_nueva else 'google-generativeai>=0.8.0'}
+                """)
+        st.divider()
 
         _v2_pos_m = _v2_leer_activas(_SHEET_NAME_MAURI)
         for _p in _v2_pos_m: _p["_portfolio"] = "Mauri"
