@@ -11802,14 +11802,15 @@ def detectar_regimen(spy_data: dict, vix_val: float, vix_trend: dict = None) -> 
         }
 
 
-tab1,tab2,tab3,tab4,tab5,tab_posiciones,tab8,tab_score,tab_noticias,tab9=st.tabs([
+tab1,tab2,tab3,tab4,tab5,tab_posiciones,tab8,tab_score,tab_noticias,tab9,tab_noticias_v2=st.tabs([
     "⚡ Momentum","⚡ Swing Activo","🔥 Entrar hoy",
     "🔗 Sympathy","🔎 Mi Watchlist",
-    "💼 Posiciones",                  # v19.1: Tab unificado (Greko/MVALLE/Amparito)
+    "💼 Posiciones",
     "💰 Estrategia ETF",
-    "🎯 Score MVALLE",                # v19.1: Ranking de candidatos para dinero real
-    "📰 Noticias IA",                 # v19.3: Análisis de trader por posición activa
+    "🎯 Score MVALLE",
+    "📰 Noticias IA",
     "📊 Backtesting",
+    "📰 Noticias IA v2",              # v20: Gemini + Cadena de Valor
 ])
 
 # v19.1: Alias para compatibilidad con código que referencia tab_greko/tab6/tab7
@@ -16733,13 +16734,30 @@ with tab_score:
         try:
             import yfinance as _yf_cs
             _tk_obj = _yf_cs.Ticker(ticker)
-            _info   = _tk_obj.info or {}
+            # v19.4 fix Streamlit Cloud: .info falla en IPs de datacenter (Yahoo bloquea)
+            # Usamos fast_info (endpoint liviano) + .info como fallback silencioso.
+            # C1/C2 usan get_earnings_single() que ya está cacheada 1h — sin red extra.
+            try:
+                _info = _tk_obj.info or {}
+            except Exception:
+                _info = {}
+            # Si _info vino vacío (Cloud block), intentar fast_info para precio al menos
+            if not _info:
+                try:
+                    _fi = _tk_obj.fast_info
+                    _info = {
+                        "currentPrice": getattr(_fi, "last_price", 0),
+                        "beta": getattr(_fi, "three_month_average_volume", None),
+                    }
+                except Exception:
+                    _info = {}
             _hist   = _tk_obj.history(period="30d")["Close"].dropna()
             _vol_h  = _tk_obj.history(period="30d")["Volume"].dropna()
 
-            # ── C1: Earning timing (0-25pts) ──────────────────────────
+            # ── C1: Earning timing — desde get_earnings_single (cache 1h) ──
             _c1, _earn_dias = 0, None
             try:
+                # Primero intentar desde _info si vino con datos
                 _et = _info.get("earningsTimestamp") or _info.get("earningsTimestampStart")
                 if _et:
                     _earn_date = _dt_cs.date.fromtimestamp(int(_et))
@@ -16756,6 +16774,21 @@ with tab_score:
                         _last_earn = _dt_cs.date.fromtimestamp(int(_et_last))
                         _dias_post = (_dt_cs.date.today() - _last_earn).days
                         if _dias_post <= 10: _c1 = 12
+                # Fallback: get_earnings_single si _info vino vacío (Cloud block)
+                if _c1 == 0 and _earn_dias is None:
+                    try:
+                        import re as _re_cs_earn
+                        _es_str = get_earnings_single(ticker)
+                        if _es_str and _es_str not in ("-","N/D",""):
+                            _m_cs = _re_cs_earn.search(r'(\d{4}-\d{2}-\d{2})', _es_str)
+                            if _m_cs:
+                                _ed_cs = _dt_cs.date.fromisoformat(_m_cs.group(1))
+                                _earn_dias = (_ed_cs - _dt_cs.date.today()).days
+                                if 0 <= _earn_dias <= 2:   _c1 = 0
+                                elif _earn_dias <= 7:       _c1 = 25
+                                elif _earn_dias <= 15:      _c1 = 18
+                                elif _earn_dias <= 30:      _c1 = 8
+                    except Exception: pass
             except Exception: pass
 
             # ── C2: Calidad último earn — EPS surprise (0-20pts) ──────
@@ -18365,12 +18398,12 @@ with tab_score:
             f'</div>', unsafe_allow_html=True)
 
     if "_score_rows_base" not in st.session_state:
-        # ── Contador AQUÍ — dentro del bloque de cálculo, antes del spinner ──
-        # Streamlit necesita que st.empty() y el spinner compartan el mismo
-        # contexto de renderizado para que los updates sean visibles en tiempo real
-        _cnt_sc = st.empty()
-        # ── Mostrar progreso con spinner + empty (patrón Momentum) ──
+        # ── Mostrar progreso con spinner + empty ──────────────────────
+        # IMPORTANTE: _cnt_sc debe crearse DENTRO del with st.spinner()
+        # para que los updates sean visibles en tiempo real.
+        # Mismo patrón que tab Momentum (tab1) que sí muestra el contador.
         with st.spinner("📡 Calculando Score MVALLE..."):
+            _cnt_sc = st.empty()
             _cnt_sc.info("📋 1 de 3: Leyendo posiciones Greko + MVALLE...")
             import time as _tsc2
             import datetime as _dtsc_main
@@ -18487,10 +18520,41 @@ with tab_score:
                     try:
                         import yfinance as _yf_sc_info
                         import datetime as _dt_sc_info
+                        from concurrent.futures import ThreadPoolExecutor as _TPE_sc, as_completed as _AC_sc
+
+                        # v19.2 FIX PERFORMANCE: yf.info + yf.news en PARALELO
+                        # Antes: secuencial 3-30s/ticker = 30 min con 10 tickers
+                        # Ahora: 4 workers en paralelo = ~4x más rápido
+                        # La lógica de cálculo debajo NO cambia — solo cambia
+                        # cómo se obtiene _inf_sc y _news_idx por cada ticker.
+                        def _fetch_info_news(tk):
+                            try:
+                                _obj = _yf_sc_info.Ticker(tk)
+                                return tk, _obj.info or {}, _obj.news or []
+                            except Exception:
+                                return tk, {}, []
+
+                        _prefetch = {}
+                        _done_pre = [0]
+                        with _TPE_sc(max_workers=4) as _ex_sc:
+                            _futs_sc = {_ex_sc.submit(_fetch_info_news, tk): tk
+                                        for tk in _tks_sc}
+                            for _fut_sc in _AC_sc(_futs_sc):
+                                _done_pre[0] += 1
+                                try:
+                                    _tk_r, _inf_r, _nws_r = _fut_sc.result()
+                                    _prefetch[_tk_r] = (_inf_r, _nws_r)
+                                except Exception:
+                                    _tk_r = _futs_sc[_fut_sc]
+                                    _prefetch[_tk_r] = ({}, [])
+                                _cnt_sc.info(
+                                    f"⬇️ {_tk_r} descargado — "
+                                    f"{_done_pre[0]}/{len(_tks_sc)}")
+
                         for _i_sc, _tk_sc in enumerate(_tks_sc):
                             _cnt_sc.info(f"⚡ {_i_sc+1} de {len(_tks_sc)}: {_tk_sc}")
+                            _inf_sc, _news_idx_pre = _prefetch.get(_tk_sc, ({}, []))
                             try:
-                                _inf_sc  = _yf_sc_info.Ticker(_tk_sc).info or {}
                                 _n_an    = int(_inf_sc.get("numberOfAnalystOpinions",0) or 0)
                                 _rec_mean = float(_inf_sc.get("recommendationMean",3.0) or 3.0)
                                 _rec_key  = str(_inf_sc.get("recommendationKey","-") or "-").lower()
@@ -18604,9 +18668,10 @@ with tab_score:
                                     ],
                                 }
                                 try:
-                                    import yfinance as _yf_idx
                                     import re as _re_idx
-                                    _news_idx = _yf_idx.Ticker(_tk_sc).news or []
+                                    # v19.2: reusar noticias ya descargadas en el
+                                    # prefetch paralelo — sin llamada de red extra
+                                    _news_idx = _news_idx_pre or []
                                     _hoy_idx  = _dt_sc_info.date.today()
                                     for _news_item in _news_idx[:25]:
                                         _title_idx = str(_news_item.get("title","") or "").lower()
@@ -19529,42 +19594,13 @@ with tab_score:
                 # 1. st.rerun() incondicional → nuevo render → _cs_pending vacío → sin rerun ← OK
                 # 2. Pero contador de intentos se incrementaba en cada render aunque el ticker
                 #    ya tuviera su key → eventualmente marcaba tickers OK como fallidos
-                # NUEVA LÓGICA: el contador solo incrementa tickers que NO tienen key todavía
+                # v19.4 fix: eliminar escape anti-stuck que incrementaba
+                # _cs_intentos en cada rerun (no solo al calcular) causando
+                # que todos los tickers quedaran marcados fallidos antes de
+                # que _calcular_c_score_free terminara. Simplificado: calcular
+                # directamente sin contador de intentos.
                 _cs_pending = [r for r in _cands_cs
                                if f"cscore_{r['Ticker']}" not in st.session_state]
-                # Escape anti-stuck: marcar como fallido tras 2 intentos REALES de cálculo
-                # (no incrementar en renders donde ya tienen key)
-                if _cs_pending:
-                    _cs_intentos = st.session_state.setdefault("_cs_intentos_nbis", {})
-                    for _r_esc in list(_cs_pending):
-                        _tk_esc = _r_esc["Ticker"]
-                        _cs_intentos[_tk_esc] = _cs_intentos.get(_tk_esc, 0) + 1
-                        if _cs_intentos[_tk_esc] >= 3:
-                            st.session_state[f"cscore_{_tk_esc}"] = {
-                                "c_total": 0, "ok": False,
-                                "error": "Sin datos yfinance después de 3 intentos"
-                            }
-                    # Recalcular pendientes tras el escape
-                    _cs_pending = [r for r in _cands_cs
-                                   if f"cscore_{r['Ticker']}" not in st.session_state]
-                # v19.3 fix: detectar tickers con C-Score fallido (ok=False, c_total=0)
-                # y mostrar mensaje claro con botón de reintento en vez de
-                # "Calculando C-Score..." indefinidamente.
-                _cs_failed = [r for r in _cands_cs
-                              if f"cscore_{r['Ticker']}" in st.session_state
-                              and not st.session_state.get(f"cscore_{r['Ticker']}", {}).get("ok", True)
-                              and st.session_state.get(f"cscore_{r['Ticker']}", {}).get("c_total", 1) == 0]
-                if _cs_failed:
-                    _fail_tks = ", ".join(r["Ticker"] for r in _cs_failed[:6])
-                    st.caption(
-                        f"⚠️ C-Score no disponible para: **{_fail_tks}** — "
-                        f"yfinance no retornó datos (ticker sin cobertura o problema temporal). "
-                        f"El bloque de estos tickets puede deberse a datos incompletos, no a señal real.")
-                    if st.button("🔄 Recalcular C-Score (tickers fallidos)",
-                                 key="btn_retry_cscore_nbis", type="secondary"):
-                        for _rf in _cs_failed:
-                            st.session_state.pop(f"cscore_{_rf['Ticker']}", None)
-                        st.rerun()
                 if _cs_pending:
                     with st.spinner(f"🔬 Calculando C-Score para {len(_cs_pending)} candidatos..."):
                         from concurrent.futures import ThreadPoolExecutor as _TpE_cs
@@ -19576,29 +19612,19 @@ with tab_score:
                                     noticias_cache=_noticias_cache_snap)
                             except Exception as _ex_cs2:
                                 _cs = {"c_total": 0, "ok": False, "error": str(_ex_cs2)[:60]}
-                            # v19.3 fix: garantizar que c_total es siempre un número
-                            # (nunca None) para que la detección ok=False+c_total=0 funcione
                             if _cs.get("c_total") is None:
                                 _cs["c_total"] = 0
                             return row["Ticker"], _cs
                         with _TpE_cs(max_workers=4) as _ex_cs:
                             _cs_results = list(_ex_cs.map(_calc_cs, _cs_pending))
-                    # Escribir resultados en session_state desde el hilo principal
                     _cs_changed = False
                     for _tk_cs, _cs_res in _cs_results:
                         if st.session_state.get(f"cscore_{_tk_cs}") != _cs_res:
                             st.session_state[f"cscore_{_tk_cs}"] = _cs_res
                             _cs_changed = True
-                    # Actualizar C_Score en los rows
                     for _r in _nbis_rows + _mom_rows:
                         _r["C_Score"] = st.session_state.get(
                             f"cscore_{_r['Ticker']}", {}).get("c_total")
-                    # v19.3 fix: rerun solo si hubo cambios reales.
-                    # El rerun incondicional causaba el diálogo "Clear caches"
-                    # en el browser porque Streamlit detectaba un bucle de reruns.
-                    # El escape de 3 intentos (arriba) garantiza que los tickers
-                    # stuck eventualmente obtienen una key → salen de _cs_pending
-                    # → no hay rerun infinito.
                     if _cs_changed:
                         st.rerun()
             # Agrupar por sector
@@ -22367,3 +22393,415 @@ st.markdown(
     f'Powered by yfinance + Streamlit</span>'
     f'</div>',
     unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════════
+# v20 — NOTICIAS IA v2
+# Motor: Google Gemini Flash (gratuito, 1M tokens/día)
+# Botón A: análisis tesis/riesgo/dilución por posición MVALLE+Amparito
+# Botón B: cadena de valor entre posiciones (se habilita tras Botón A)
+# Prompts: exactos del documento GrekoTrader_Prompts_NoticiasIA
+# ════════════════════════════════════════════════════════════════
+
+def _gemini_key() -> str:
+    """Lee GEMINI_API_KEY desde secrets — thread-safe (sin st.*)."""
+    try:
+        return (st.secrets.get("GEMINI_API_KEY", "")
+                or st.secrets.get("gemini", {}).get("api_key", ""))
+    except Exception:
+        return ""
+
+
+def _llamar_gemini(system_prompt: str, user_prompt: str,
+                   max_tokens: int = 800, con_search: bool = False,
+                   api_key: str = "") -> str:
+    """
+    Wrapper central Gemini Flash — reemplaza anthropic.messages.create().
+    Retorna texto plano o "" si falla. Reintentos en 429.
+    """
+    import time as _tg
+    _key = api_key or _gemini_key()
+    if not _key:
+        return ""
+    try:
+        import google.generativeai as _genai
+        _genai.configure(api_key=_key)
+        _gen_cfg = {
+            "max_output_tokens": max_tokens,
+            "temperature": 0.1,
+        }
+        _tools = ["google_search_retrieval"] if con_search else None
+        _model = _genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=system_prompt,
+            tools=_tools,
+            generation_config=_gen_cfg,
+        )
+        for _intento in range(3):
+            try:
+                _resp = _model.generate_content(user_prompt)
+                return _resp.text or ""
+            except Exception as _ex:
+                if "429" in str(_ex) or "quota" in str(_ex).lower():
+                    if _intento < 2:
+                        _tg.sleep(4 * (_intento + 1))
+                        continue
+                raise
+    except Exception:
+        return ""
+    return ""
+
+
+# ── Prompts exactos del documento ────────────────────────────────
+
+_PROMPT_A_SYS = """Actúa como analista institucional de mercado, trader sectorial y analista de riesgo para GrekoTrader.
+No reemplazas N10. No hagas análisis técnico nuevo. Usa los datos técnicos entregados solo como contexto.
+No inventes información. Si falta un dato, usa "No_Disponible". No entregues recomendación financiera definitiva.
+Devuelve SOLO JSON válido como array. No uses markdown."""
+
+_PROMPT_A_USER = """Fecha análisis: {fecha}
+Ventana noticias recientes: últimos 30 días
+Ventana earnings pasado: últimos 90 días
+Ventana earnings futuro: próximos 90 días
+
+Posiciones reales:
+{posiciones_json}
+
+Para cada ticker evalúa tesis, catalizadores, earnings, dilución, riesgos y cadena de valor.
+
+Reglas duras:
+- Dilución confirmada bloquea Aumentar_Parcial.
+- Earnings 0-2 días bloquea Aumentar_Parcial.
+- Si ATM activo, decision_operativa máximo = Mantener.
+- Riesgo total >=75 exige Revisar_Manual o Reducir.
+- Tesis rota exige Reducir o Salir.
+
+Formato exacto — array JSON, un objeto por ticker:
+[{{
+  "ticker": "XXXX",
+  "portfolio": "Mauri|Amparito",
+  "estado_tesis": "Fortalecida|Vigente|En_Observacion|Debilitandose|Rota",
+  "decision_operativa": "Mantener|No_Aumentar|Aumentar_Parcial|Reducir|Salir|Revisar_Manual",
+  "urgencia": "Alta|Media|Baja",
+  "tipo_catalizador": "Contrato|Earnings|Guidance|FDA|Regulatorio|Macro|Producto|Dilucion|Sectorial|Sin_Catalizador",
+  "catalizador_principal": "texto corto",
+  "earnings_proximo_90d": {{"fecha": "YYYY-MM-DD|No_Disponible", "riesgo": "Alto|Medio|Bajo|No_Disponible", "dato_critico_a_mirar": "texto corto"}},
+  "dilucion": {{"estado": "Sin_Dilucion|Riesgo_Dilucion|Dilucion_Confirmada|No_Disponible", "tipo": "Offering|ATM|S-3|424B5|No_Disponible", "detalle": "texto corto"}},
+  "blocker": "NINGUNO|DILUCION|EARN_PROXIMO|FDA_RISK|TESIS_ROTA|SECTOR_ADVERSO",
+  "conclusion_trader": "máximo 2 líneas",
+  "riesgo_total": 0,
+  "chain_event": {{"activa_cadena": false, "cadena_afectada": "Defense|AI_Datacenter|Space|Biotech|No_Disponible", "direccion_evento": "Positivo|Negativo|Mixto|Neutral", "materialidad_evento": 0, "mecanismo_impacto": "texto corto"}},
+  "p_alza_5d": 0,
+  "p_alza_10d": 0,
+  "confianza": "ALTA|MEDIA|BAJA"
+}}]"""
+
+_PROMPT_B_SYS = """Actúa como analista de cadenas de valor y trader sectorial para GrekoTrader.
+No busques noticias nuevas. Usa solo los datos entregados. No inventes relaciones.
+Devuelve SOLO JSON válido como array. No uses markdown."""
+
+_PROMPT_B_USER = """Fecha análisis: {fecha}
+
+Eventos detectados por Noticias IA (Botón A):
+{chain_events_json}
+
+Posiciones reales Mauri + Amparito:
+{posiciones_json}
+
+Para cada evento identifica tickers afectados, prioriza posiciones reales primero.
+Clasifica impacto, calcula sesgo de precio y determina acción sugerida.
+
+Formato exacto:
+[{{
+  "ticker_origen": "XXXX",
+  "evento_origen": "texto corto",
+  "cadena_afectada": "AI_Datacenter|Defense|Space|Biotech|Other",
+  "ticker_afectado": "YYYY",
+  "portfolio": "Mauri|Amparito|No_Posicion",
+  "relacion": "Peer_Directo|Proveedor_Critico|Beneficiario_Indirecto|Perjudicado_Indirecto|No_Disponible",
+  "impacto": "Directo_Positivo|Indirecto_Positivo|Neutral|Indirecto_Negativo|Directo_Negativo",
+  "impacto_score": 0,
+  "sesgo_precio": "Alcista|Alcista_Debil|Neutral|Bajista_Debil|Bajista",
+  "urgencia": "Alta|Media|Baja",
+  "requiere_revision_manual": false,
+  "accion_sugerida": "Revisar_Posicion|Vigilar|Watchlist_Prioritaria|Sin_Accion",
+  "razon": "máximo 2 líneas"
+}}]"""
+
+
+def _v2_leer_activas(sheet_name: str) -> list:
+    """Lee posiciones activas de un Sheet — sin st.* para thread safety."""
+    _df = leer_posiciones_sheets(sheet_name)
+    if _df is None or (hasattr(_df, "empty") and _df.empty):
+        return []
+    _rows = _df.to_dict("records") if hasattr(_df, "to_dict") else []
+    return [r for r in _rows if not r.get("Fecha_Salida") and r.get("Ticker")]
+
+
+# ── TAB Noticias IA v2 ───────────────────────────────────────────
+
+with tab_noticias_v2:
+    import json as _json_v2
+    import datetime as _dt_v2
+    import time as _time_v2
+
+    st.markdown(
+        f'<div class="sec-header" style="background:#F0F9FF;border-color:#BAE6FD">'
+        f'<span style="font-size:20px">📰</span>'
+        f'<div><span style="font-size:16px;font-weight:700;color:#0369A1">'
+        f'Noticias IA v2 — Tesis + Cadena de Valor</span>'
+        f'<span style="font-size:12px;color:{TXT_MUT};margin-left:10px">'
+        f'Gemini Flash · Google Search · Solo MVALLE + Amparito</span>'
+        f'</div></div>', unsafe_allow_html=True)
+
+    # Verificar API key
+    _v2_key = _gemini_key()
+    if not _v2_key:
+        st.warning(
+            "⚠️ **GEMINI_API_KEY no configurada** — agrega la key en Streamlit Cloud → "
+            "Settings → Secrets: `GEMINI_API_KEY = \"tu-key-de-aistudio.google.com\"`")
+        st.info("La key es gratuita en **aistudio.google.com** → Get API key")
+        st.stop()
+
+    # Leer posiciones MVALLE + Amparito
+    _v2_pos_m = _v2_leer_activas(_SHEET_NAME_MAURI)
+    for _p in _v2_pos_m: _p["_portfolio"] = "Mauri"
+    _v2_pos_a = _v2_leer_activas(_SHEET_NAME_AMPARITO)
+    for _p in _v2_pos_a: _p["_portfolio"] = "Amparito"
+
+    _v2_pos = []
+    _v2_tks_vistos = set()
+    for _p in _v2_pos_m + _v2_pos_a:
+        _tk = str(_p.get("Ticker", "")).upper()
+        if _tk and _tk not in _v2_tks_vistos:
+            _v2_tks_vistos.add(_tk)
+            _v2_pos.append(_p)
+
+    if not _v2_pos:
+        st.info("Sin posiciones activas en MVALLE o Amparito.")
+    else:
+        _v2_n = len(_v2_pos)
+        st.caption(
+            f"📊 **{_v2_n} posiciones** activas · "
+            f"MVALLE: {len(_v2_pos_m)} · Amparito: {len(_v2_pos_a)} · "
+            f"Solo dinero real — Greko (paper) excluido")
+
+        # ── BOTÓN A ──────────────────────────────────────────────
+        st.markdown("### 🔍 Botón A — Tesis, Riesgo y Dilución")
+
+        _A_CACHE   = "noticias_v2_A"
+        _A_TS      = "noticias_v2_A_ts"
+        _a_age     = _time_v2.time() - st.session_state.get(_A_TS, 0)
+        _a_valido  = _A_CACHE in st.session_state and _a_age < 3600
+
+        _col_a1, _col_a2 = st.columns([3, 1])
+        with _col_a1:
+            if _a_valido:
+                st.caption(f"📋 Cache válido — hace {int(_a_age//60)} min · "
+                           f"{len(st.session_state[_A_CACHE])} tickers analizados")
+        with _col_a2:
+            _btn_a = st.button("🔍 Analizar (A)", key="btn_v2_a",
+                               type="primary", use_container_width=True)
+
+        if _btn_a:
+            _fecha_an = _dt_v2.date.today().isoformat()
+            _resultados_a = {}
+            _cnt_a = st.empty()
+            _prog_a = st.progress(0)
+
+            from concurrent.futures import ThreadPoolExecutor as _TPE_A, as_completed as _AC_A
+
+            # Preparar posiciones simples para el prompt
+            def _pos_simple(p):
+                _pc = _parse_precio(p.get("Precio_Compra", 0))
+                # Reusar precio del cache de Tab Posiciones si existe
+                _pa = _pc
+                for _ck in ["_pos_cache_MVALLE 💰", "_pos_cache_Amparito", "_pos_cache_Greko"]:
+                    _cache_p = st.session_state.get(_ck, {})
+                    if str(p.get("Ticker","")).upper() in _cache_p:
+                        try:
+                            _pa = float(_cache_p[str(p.get("Ticker","")).upper()].get("Precio", _pc) or _pc)
+                        except Exception: pass
+                        break
+                _pnl = round((_pa - _pc) / _pc * 100, 1) if _pc > 0 else 0
+                return {
+                    "ticker":    str(p.get("Ticker","")).upper(),
+                    "portfolio": p.get("_portfolio",""),
+                    "precio_compra": _pc,
+                    "precio_actual": _pa,
+                    "pnl_pct":   _pnl,
+                    "fase":      str(p.get("Fase", "-")),
+                }
+
+            def _analizar_uno(p):
+                """Una llamada Gemini por ticker — corre en paralelo."""
+                _pos_j = _json_v2.dumps([_pos_simple(p)], ensure_ascii=False)
+                _user  = _PROMPT_A_USER.format(
+                    fecha=_fecha_an, posiciones_json=_pos_j)
+                _raw = _llamar_gemini(
+                    system_prompt=_PROMPT_A_SYS,
+                    user_prompt=_user,
+                    max_tokens=1200,
+                    con_search=True,
+                    api_key=_v2_key,
+                )
+                if not _raw:
+                    return str(p.get("Ticker","")).upper(), {}
+                _raw = _raw.replace("```json","").replace("```","").strip()
+                _s = _raw.find("["); _e = _raw.rfind("]") + 1
+                if _s >= 0 and _e > _s:
+                    try:
+                        _arr = _json_v2.loads(_raw[_s:_e])
+                        if isinstance(_arr, list) and _arr:
+                            return str(p.get("Ticker","")).upper(), _arr[0]
+                    except Exception: pass
+                return str(p.get("Ticker","")).upper(), {}
+
+            _done_a = [0]
+            with _TPE_A(max_workers=3) as _ex_a:
+                _futs_a = {_ex_a.submit(_analizar_uno, _p): _p for _p in _v2_pos}
+                for _fut in _AC_A(_futs_a):
+                    _done_a[0] += 1
+                    _tk_done, _res = _fut.result()
+                    _resultados_a[_tk_done] = _res
+                    _pct = _done_a[0] / _v2_n
+                    _cnt_a.info(f"🔍 {_tk_done} analizado — {_done_a[0]}/{_v2_n}")
+                    _prog_a.progress(_pct)
+
+            _cnt_a.empty()
+            _prog_a.empty()
+            st.session_state[_A_CACHE] = _resultados_a
+            st.session_state[_A_TS]    = _time_v2.time()
+            st.rerun()
+
+        # Mostrar resultados Botón A
+        if _A_CACHE in st.session_state and st.session_state[_A_CACHE]:
+            _DECISION_ICON = {
+                "Mantener": "🟢", "No_Aumentar": "🟡", "Aumentar_Parcial": "💚",
+                "Reducir": "🟠", "Salir": "🔴", "Revisar_Manual": "🟣",
+            }
+            _BLOCKER_COLOR = {
+                "NINGUNO": "#16A34A", "DILUCION": "#DC2626",
+                "EARN_PROXIMO": "#D97706", "TESIS_ROTA": "#DC2626",
+            }
+            for _tk, _it in st.session_state[_A_CACHE].items():
+                if not _it:
+                    st.caption(f"⚠️ {_tk}: sin datos")
+                    continue
+                _dec  = _it.get("decision_operativa", "-")
+                _ico  = _DECISION_ICON.get(_dec, "⚪")
+                _blk  = _it.get("blocker", "NINGUNO")
+                _blk_c= _BLOCKER_COLOR.get(_blk, "#64748B")
+                _rt   = _it.get("riesgo_total", 0)
+                _tesis= _it.get("estado_tesis", "-")
+                with st.expander(
+                    f"{_ico} {_tk} ({_it.get('portfolio','-')}) · "
+                    f"{_dec} · Riesgo {_rt} · {_tesis}",
+                    expanded=False):
+                    _c1, _c2 = st.columns(2)
+                    with _c1:
+                        st.markdown(f"**Catalizador:** {_it.get('tipo_catalizador','-')} — "
+                                    f"{_it.get('catalizador_principal','-')}")
+                        st.markdown(f"**Conclusión:** {_it.get('conclusion_trader','-')}")
+                        _di = _it.get("dilucion", {})
+                        if (_di or {}).get("estado","Sin_Dilucion") != "Sin_Dilucion":
+                            st.markdown(f"🚨 **Dilución:** {_di.get('estado')} — "
+                                        f"{_di.get('tipo','-')} · {_di.get('detalle','-')}")
+                    with _c2:
+                        st.markdown(
+                            f'<span style="background:{_blk_c};color:white;padding:2px 8px;'
+                            f'border-radius:6px;font-size:11px;font-weight:700">'
+                            f'Blocker: {_blk}</span>', unsafe_allow_html=True)
+                        _en = _it.get("earnings_proximo_90d", {})
+                        if (_en or {}).get("fecha","No_Disponible") != "No_Disponible":
+                            st.markdown(f"📅 **Earnings:** {_en.get('fecha')} "
+                                        f"(riesgo {_en.get('riesgo','-')})")
+                        st.markdown(f"**P(alza 5d):** {_it.get('p_alza_5d',0)}% · "
+                                    f"**P(alza 10d):** {_it.get('p_alza_10d',0)}%")
+                        _ce = _it.get("chain_event", {})
+                        if (_ce or {}).get("activa_cadena"):
+                            st.markdown(f"🔗 **Cadena:** {_ce.get('cadena_afectada','-')} "
+                                        f"({_ce.get('direccion_evento','-')})")
+                    st.caption(f"Confianza: {_it.get('confianza','-')}")
+
+        st.markdown("---")
+
+        # ── BOTÓN B ──────────────────────────────────────────────
+        st.markdown("### 🔗 Botón B — Cadena de Valor")
+
+        _chain_events = []
+        if _A_CACHE in st.session_state:
+            for _tk, _it in st.session_state[_A_CACHE].items():
+                _ce = (_it or {}).get("chain_event", {})
+                if (_ce or {}).get("activa_cadena"):
+                    _chain_events.append({"ticker": _tk, **_ce})
+
+        if not _chain_events:
+            st.markdown(
+                f'<div style="background:#FEF3C7;border:1px solid #FCD34D;'
+                f'border-radius:8px;padding:10px 14px;font-size:12px;color:#92400E">'
+                f'⏳ Ejecuta primero el <strong>Botón A</strong>. '
+                f'El Botón B se activa cuando hay eventos con cadena de valor.</div>',
+                unsafe_allow_html=True)
+        else:
+            st.caption(f"🔗 {len(_chain_events)} evento(s) con cadena de valor detectados por Botón A")
+            _btn_b = st.button(
+                f"🔗 Analizar Cadena de Valor ({len(_chain_events)} eventos)",
+                key="btn_v2_b", type="primary", use_container_width=True)
+
+            _B_CACHE = "noticias_v2_B"
+            _B_TS    = "noticias_v2_B_ts"
+
+            if _btn_b:
+                _fecha_b   = _dt_v2.date.today().isoformat()
+                _pos_simp_b = [{"ticker": str(p.get("Ticker","")).upper(),
+                                 "portfolio": p.get("_portfolio","")}
+                                for p in _v2_pos]
+                _user_b = _PROMPT_B_USER.format(
+                    fecha=_fecha_b,
+                    chain_events_json=_json_v2.dumps(_chain_events, ensure_ascii=False),
+                    posiciones_json=_json_v2.dumps(_pos_simp_b, ensure_ascii=False),
+                )
+                with st.spinner("🔗 Analizando cadena de valor..."):
+                    _raw_b = _llamar_gemini(
+                        system_prompt=_PROMPT_B_SYS,
+                        user_prompt=_user_b,
+                        max_tokens=3000,
+                        con_search=False,
+                        api_key=_v2_key,
+                    )
+                _res_b = []
+                if _raw_b:
+                    _raw_b = _raw_b.replace("```json","").replace("```","").strip()
+                    _s = _raw_b.find("["); _e = _raw_b.rfind("]") + 1
+                    if _s >= 0 and _e > _s:
+                        try: _res_b = _json_v2.loads(_raw_b[_s:_e])
+                        except Exception: pass
+                st.session_state[_B_CACHE] = _res_b
+                st.session_state[_B_TS]    = _time_v2.time()
+                st.rerun()
+
+            if _B_CACHE in st.session_state and st.session_state.get(_B_CACHE):
+                _SESGO_C = {
+                    "Alcista": "#16A34A", "Alcista_Debil": "#65A30D",
+                    "Neutral": "#64748B", "Bajista_Debil": "#D97706",
+                    "Bajista": "#DC2626",
+                }
+                for _it_b in st.session_state[_B_CACHE]:
+                    _sg   = _it_b.get("sesgo_precio","Neutral")
+                    _sg_c = _SESGO_C.get(_sg, "#64748B")
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:10px;'
+                        f'padding:8px 12px;border-left:4px solid {_sg_c};'
+                        f'background:#F8FAFC;border-radius:6px;margin-bottom:6px">'
+                        f'<span style="font-weight:800;font-size:13px">'
+                        f'{_it_b.get("ticker_origen","-")} → {_it_b.get("ticker_afectado","-")}</span>'
+                        f'<span style="background:{_sg_c};color:white;font-size:10px;'
+                        f'font-weight:700;padding:2px 8px;border-radius:5px">{_sg}</span>'
+                        f'<span style="font-size:11px;color:#64748B">'
+                        f'Score {_it_b.get("impacto_score",0)}</span>'
+                        f'<span style="font-size:11px;color:#64748B">'
+                        f'{_it_b.get("relacion","-")}</span>'
+                        f'<span style="font-size:10px;color:#94A3B8;margin-left:auto">'
+                        f'{_it_b.get("portfolio","-")} · {_it_b.get("accion_sugerida","-")}</span>'
+                        f'</div>', unsafe_allow_html=True)
+                    st.caption(f"　{_it_b.get('razon','-')}")
