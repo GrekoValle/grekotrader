@@ -6429,6 +6429,7 @@ def render_noticias_mini(tickers: list, titulo: str = "📰 Noticias del mercado
 #  Se descarga automáticamente desde Wikipedia al iniciar
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)  # cache 24 horas
+@st.cache_data(ttl=86400, show_spinner=False)
 def cargar_universo_dinamico() -> list:
     """
     Descarga componentes S&P500 + Nasdaq100 via múltiples fuentes.
@@ -6437,7 +6438,7 @@ def cargar_universo_dinamico() -> list:
     import yfinance as yf
 
     portfolio_personal = [
-        "NBIS","MRNA","CROX","APLD","ASTS","NVDA","CNC","CLOV",
+        "MRNA","CROX","APLD","ASTS","NVDA","CNC","CLOV",
         "NKE","XBI","TAN","VOO","IBIT","ETHA","SPY","IBRX",
     ]
     tickers = set(portfolio_personal)
@@ -6463,15 +6464,9 @@ def cargar_universo_dinamico() -> list:
     except Exception:
         pass
 
-    # Fuente 3: yfinance screener - top 500 por market cap
-    try:
-        screener = yf.screen("most_actives", count=500)
-        if screener and "quotes" in screener:
-            for q in screener["quotes"]:
-                if "symbol" in q:
-                    tickers.add(q["symbol"])
-    except Exception:
-        pass
+    # Fuente 3: yfinance screener — ELIMINADO
+    # yf.screen() cuelga la app al iniciar en Streamlit Cloud
+    # El universo curado de abajo ya cubre los tickers relevantes
 
     # Siempre ampliar con universo curado de alta calidad
     universo_curado = [
@@ -6572,6 +6567,94 @@ def get_vol_umbral(ticker: str, vol_ratio: float) -> tuple:
         cat    = "Sin datos"
     return vol_ratio >= umbral, cat, umbral
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _descargar_batch_universo(universo_tuple: tuple) -> dict:
+    """
+    v20: Descarga batch de TODOS los tickers del universo en UNA sola
+    llamada HTTP. Cacheada 24h con st.cache_data (memoria) + disco (.pkl).
+    
+    Doble capa de cache:
+    - st.cache_data(ttl=24h): mientras la app Streamlit está corriendo
+    - disco ~/.grekotrader_cache/: persiste entre reinicios en local
+    
+    En ambos entornos (local y Cloud) solo hace 1 request por día.
+    """
+    import yfinance as _yf_batch
+    import os, pickle, hashlib, datetime
+
+    universo = list(universo_tuple)
+    _cache_dir  = os.path.join(os.path.expanduser("~"), ".grekotrader_cache")
+    os.makedirs(_cache_dir, exist_ok=True)
+    _today      = datetime.date.today().isoformat()
+    _uhash      = hashlib.md5(str(sorted(universo)).encode()).hexdigest()[:8]
+    _cache_file = os.path.join(_cache_dir, f"scan_{_today}_{_uhash}.pkl")
+
+    # Intentar leer cache de disco primero
+    if os.path.exists(_cache_file):
+        try:
+            with open(_cache_file, "rb") as _f:
+                _data = pickle.load(_f)
+            if _data:
+                return _data
+        except Exception:
+            pass
+
+    # Sin cache — descargar en lotes de 100 (más resistente al rate limit)
+    _batch_data = {}
+    import time as _time_batch
+    _lote_size = 100
+    _lotes = [universo[i:i+_lote_size] for i in range(0, len(universo), _lote_size)]
+
+    for _i_lote, _lote in enumerate(_lotes):
+        for _intento in range(3):
+            try:
+                _raw = _yf_batch.download(
+                    " ".join(_lote), period="3mo",
+                    auto_adjust=True, progress=False, threads=True,
+                    group_by="ticker"
+                )
+                for _tk in _lote:
+                    try:
+                        if hasattr(_raw, "columns") and isinstance(
+                                _raw.columns, __import__("pandas").MultiIndex):
+                            if _tk not in _raw.columns.get_level_values(0):
+                                continue
+                            _cl = _raw[_tk]["Close"].dropna()
+                            _vl = _raw[_tk]["Volume"].dropna()
+                        else:
+                            _cl = _raw["Close"].dropna()
+                            _vl = _raw["Volume"].dropna()
+                        if len(_cl) >= 20:
+                            _batch_data[_tk] = {
+                                "close":  _cl.values,
+                                "volume": _vl.values
+                            }
+                    except Exception:
+                        continue
+                break  # lote exitoso — salir del retry loop
+            except Exception as _ex:
+                if "rate" in str(_ex).lower() or "429" in str(_ex):
+                    if _intento < 2:
+                        _time_batch.sleep(5 * (_intento + 1))
+                        continue
+                break  # error no recuperable
+
+        # Pausa breve entre lotes para no saturar Yahoo
+        if _i_lote < len(_lotes) - 1:
+            _time_batch.sleep(1)
+
+    # Guardar en disco para persistencia local
+    if _batch_data:
+        try:
+            with open(_cache_file, "wb") as _f:
+                pickle.dump(_batch_data, _f)
+        except Exception:
+            pass
+
+    return _batch_data
+
+
 def scan_tab(rsi_max: float, dd_min: float,
              score_min: int = 25, decisions: list = None,
              vol_min_k: float = 200,
@@ -6587,20 +6670,24 @@ def scan_tab(rsi_max: float, dd_min: float,
     candidatos = []
     try:
         import yfinance as yf
+        import os, pickle, hashlib
         _universo = universo if universo else SCAN_UNIVERSE
+
+        # v20: usar función cacheada (24h memoria + disco)
+        # → 0 requests a Yahoo en las ejecuciones 2-N del día
+        _batch_data = _descargar_batch_universo(tuple(_universo))
+
+        # ── Procesar cada ticker desde el batch (sin más red) ────────
         for tk in _universo:
             try:
-                stk  = yf.Ticker(tk)
-                # Usar 3mo para velocidad - suficiente para DD y RSI
-                try:
-                    hist = stk.history(period="3mo")
-                except Exception:
+                _td = _batch_data.get(tk)
+                if not _td:
                     continue
-                if hist.empty or len(hist) < 20:
+                close = _td["close"]
+                vol   = _td["volume"]
+                if len(close) < 20:
                     continue
 
-                close = hist["Close"].values
-                vol   = hist["Volume"].values
                 precio = float(close[-1])
                 pico   = float(close.max())
                 dd     = round((precio - pico) / pico * 100, 1)
@@ -6631,23 +6718,20 @@ def scan_tab(rsi_max: float, dd_min: float,
                 rsi_5d = float((100-100/(1+gain/(loss+1e-9))).iloc[-6]) if len(close)>=6 else rsi
                 rsi_t  = 5 if (rsi-rsi_5d)>3 else -3 if (rsi-rsi_5d)<-3 else 0
 
-                try:
-                    info    = stk.info or {}
-                except Exception:
-                    info = {}
-                beta_v  = float(info.get("beta", 1.5) or 1.5)
-                nombre  = info.get("shortName", tk)
-                sector  = info.get("sector", "-")
-                ingresos= float(info.get("totalRevenue", 0) or 0) / 1e6
-                bpa_v   = float(info.get("trailingEps", 0) or 0)
-                div_v   = float(info.get("dividendYield", 0) or 0) * 100
-                mar_v   = float(info.get("grossMargins", 0) or 0) * 100
-                si_v    = float(info.get("shortPercentOfFloat", 0) or 0) * 100
-
-                try:
-                    cal  = stk.calendar
-                    earn = str(cal["Earnings Date"][0])[:10] if (cal is not None and "Earnings Date" in cal) else "-"
-                except Exception:
+                # Sin .info — valores neutros para beta/sector/nombre
+                # (no afectan el score técnico NBIS que es el core)
+                beta_v  = 1.5
+                nombre  = tk
+                sector  = "-"
+                ingresos= 0.0
+                bpa_v   = 0.0
+                div_v   = 0.0
+                mar_v   = 0.0
+                si_v    = 0.0
+                earn    = get_earnings_single(tk)  # cache 1h — sin red extra
+                if earn and earn not in ("-","N/D",""):
+                    earn = earn[:10]
+                else:
                     earn = "-"
 
                 sector_map = {
@@ -10871,15 +10955,90 @@ def render_scan_tab(tab_key, titulo, emoji, color, color_bg, color_bor,
         f'<strong>Filtros automáticos:</strong> RSI <= {rsi_max}  - DD <= {dd_min}%  - Score >= {score_min}  - Vol >= 200K/día'+
         f'</div></div>', unsafe_allow_html=True)
 
-    col_btn, col_info = st.columns([2, 3])
-    with col_btn:
-        if st.button(f"🔍 Escanear {titulo}", width='stretch', key=f"btn_{tab_key}"):
+    # v20: 2 botones separados
+    # Botón 1: Scan completo 617 tickers — usar 1 vez/día (mañana)
+    # Botón 2: Refresh solo los candidatos actuales — usar en tus 7 horarios
+    _candidatos_key  = f"{tab_key}_candidatos_tks"   # tickers del último scan completo
+    _fases_prev_key  = f"{tab_key}_fases_prev"        # fases previas para detectar cambios
+    _tiene_candidatos = bool(st.session_state.get(_candidatos_key))
+
+    col_btn1, col_btn2, col_info = st.columns([2, 2, 3])
+    with col_btn1:
+        if st.button(f"🔍 Scan Completo ({len(SCAN_UNIVERSE)})",
+                     width='stretch', key=f"btn_{tab_key}",
+                     help="Escanea 617 tickers — usar 1 vez al día en la mañana"):
             with st.spinner(f"Escaneando ~{len(SCAN_UNIVERSE)} tickers..."):
-                resultado = scan_tab(rsi_max, dd_min, score_min, decisions, universo=SCAN_UNIVERSE[:st.session_state.get("universo_size", len(SCAN_UNIVERSE))], prob_nbis_min=prob_nbis_min)
+                resultado = scan_tab(rsi_max, dd_min, score_min, decisions,
+                                     universo=SCAN_UNIVERSE[:st.session_state.get("universo_size", len(SCAN_UNIVERSE))],
+                                     prob_nbis_min=prob_nbis_min)
                 st.session_state[tab_key] = resultado
+                if resultado is not None and not resultado.empty:
+                    st.session_state[_candidatos_key] = resultado["Ticker"].tolist()
+                    # Guardar fases actuales como referencia para detectar cambios
+                    st.session_state[_fases_prev_key] = {
+                        r["Ticker"]: r.get("Fase", "-")
+                        for _, r in resultado.iterrows()
+                    }
+                st.session_state[f"{tab_key}_ts"] = (
+                    f"· {__import__('datetime').datetime.now().strftime('%H:%M')} 🔍")
+
+    with col_btn2:
+        # Construir universo inteligente: Watchlist activa + candidatos del scan
+        _tks_wl = []
+        try:
+            _wl_df = leer_watchlist_sheets()
+            if _wl_df is not None and not _wl_df.empty and "Ticker" in _wl_df.columns:
+                _tks_wl = [str(t).upper() for t in _wl_df["Ticker"].dropna().tolist()]
+        except Exception:
+            pass
+        _tks_scan    = st.session_state.get(_candidatos_key, [])
+        _tks_refresh = list(dict.fromkeys(_tks_wl + _tks_scan))  # únicos, sin duplicados
+        _n_refresh   = len(_tks_refresh)
+
+        _btn_refresh = st.button(
+            f"⚡ Refresh Inteligente ({_n_refresh})",
+            width='stretch', key=f"btn_{tab_key}_refresh",
+            disabled=_n_refresh == 0,
+            help=f"Actualiza {len(_tks_wl)} Watchlist + {len(_tks_scan)} candidatos → {_n_refresh} tickers · 3-5 segundos",
+        )
+        if _btn_refresh and _n_refresh > 0:
+            with st.spinner(f"⚡ Actualizando {_n_refresh} tickers (Watchlist + candidatos)..."):
+                resultado_ref = scan_tab(rsi_max, dd_min, score_min, decisions,
+                                         universo=_tks_refresh,
+                                         prob_nbis_min=prob_nbis_min)
+            if resultado_ref is not None and not resultado_ref.empty:
+                # Detectar cambios de fase vs ejecución anterior
+                _fases_prev  = st.session_state.get(_fases_prev_key, {})
+                _tks_prev    = set(st.session_state.get(_candidatos_key, []))
+                _cambios     = []
+                for _, _row in resultado_ref.iterrows():
+                    _tk   = _row["Ticker"]
+                    _fase_nueva  = _row.get("Fase", "-")
+                    _fase_vieja  = _fases_prev.get(_tk, None)
+                    if _tk not in _tks_prev:
+                        resultado_ref.at[_, "_marca"] = "🟢 NUEVO"
+                        _cambios.append(f"🟢 **{_tk}** entró como {_fase_nueva}")
+                    elif _fase_vieja and _fase_vieja != _fase_nueva:
+                        resultado_ref.at[_, "_marca"] = f"🔄 {_fase_vieja}→{_fase_nueva}"
+                        _cambios.append(f"🔄 **{_tk}** {_fase_vieja} → {_fase_nueva}")
+                    else:
+                        resultado_ref.at[_, "_marca"] = "⚡"
+
+                st.session_state[tab_key] = resultado_ref
+                # Actualizar fases previas con las nuevas
+                st.session_state[_fases_prev_key] = {
+                    r["Ticker"]: r.get("Fase", "-")
+                    for _, r in resultado_ref.iterrows()
+                }
+                st.session_state[f"{tab_key}_ts"] = (
+                    f"· {__import__('datetime').datetime.now().strftime('%H:%M')} ⚡")
+                # Mostrar alerta si hubo cambios de fase
+                if _cambios:
+                    st.success(f"🔔 **Cambios detectados:** {' · '.join(_cambios[:5])}")
+
     with col_info:
         if st.session_state.get(tab_key) is not None:
-            n = len(st.session_state[tab_key])
+            n  = len(st.session_state[tab_key])
             ts = st.session_state.get(f"{tab_key}_ts", "")
             st.markdown(
                 f'<div style="font-size:11px;color:{G if n>0 else TXT_MUT};padding-top:8px">'+
