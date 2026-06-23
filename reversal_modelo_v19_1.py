@@ -18416,9 +18416,10 @@ with tab_score:
             f'</div>', unsafe_allow_html=True)
 
     if "_score_rows_base" not in st.session_state:
-        with st.spinner("📡 Calculando Score MVALLE..."):
+        _sc_status = st.status("📡 Calculando Score MVALLE...", expanded=True)
+        with _sc_status:
             _cnt_sc = st.empty()
-            _cnt_sc.info("📋 1 de 3: Leyendo posiciones Greko + MVALLE...")
+            _cnt_sc.write("📋 1 de 3: Leyendo posiciones Greko + MVALLE...")
             import time as _tsc2
             import datetime as _dtsc_main
 
@@ -18482,7 +18483,7 @@ with tab_score:
                 st.session_state["_score_total_m3"]      = len(_df_m3_sc)
 
                 # ── PASO 2: yf.download BATCH — RSI/MACD/DD + SPY live ──
-                _cnt_sc.info(f"⚡ 2 de 3: Descargando datos live para {len(_tks_sc)} acciones...")
+                _cnt_sc.write(f"⚡ 2 de 3: Descargando datos live para {len(_tks_sc)} acciones...")
                 _live_sc   = {}   # {ticker: {rsi, macd, dd, precio}}
                 _spy_rsi_live = 0.0
                 if _tks_sc:
@@ -18527,21 +18528,44 @@ with tab_score:
                             except Exception: pass
                     except Exception: pass
 
-                # ── PASO 3: yf.info por ticker — fundamentales live ─────
-                _cnt_sc.info(f"📊 3 de 3: Cargando fundamentales para {len(_tks_sc)} acciones...")
+                # ── PASO 3: yf.info en PARALELO (4 workers) ──────────────
+                # Antes: secuencial 3-8s/ticker × N tickers = hasta 10+ min
+                # Ahora: 4 simultáneos → ~4x más rápido
+                _cnt_sc.write(f"📊 3 de 3: Cargando fundamentales para {len(_tks_sc)} acciones...")
                 _fund_sc = {}
                 if _tks_sc:
                     try:
                         import yfinance as _yf_sc_info
                         import datetime as _dt_sc_info
-                        for _i_sc, _tk_sc in enumerate(_tks_sc):
-                            _cnt_sc.info(f"⚡ {_i_sc+1} de {len(_tks_sc)}: {_tk_sc}")
+                        from concurrent.futures import ThreadPoolExecutor as _TPE_sc, as_completed as _AC_sc
+
+                        def _fetch_info_one(tk):
                             try:
-                                _inf_sc  = _yf_sc_info.Ticker(_tk_sc).info or {}
+                                return tk, _yf_sc_info.Ticker(tk).info or {}, _yf_sc_info.Ticker(tk).news or []
+                            except Exception:
+                                return tk, {}, []
+
+                        _prefetch = {}
+                        _done_pre = [0]
+                        with _TPE_sc(max_workers=4) as _ex_sc:
+                            _futs_sc = {_ex_sc.submit(_fetch_info_one, tk): tk for tk in _tks_sc}
+                            for _fut_sc in _AC_sc(_futs_sc):
+                                _done_pre[0] += 1
+                                try:
+                                    _tk_r, _inf_r, _nws_r = _fut_sc.result()
+                                    _prefetch[_tk_r] = (_inf_r, _nws_r)
+                                except Exception:
+                                    _tk_r = _futs_sc[_fut_sc]
+                                    _prefetch[_tk_r] = ({}, [])
+                                _cnt_sc.write(f"⬇️ {_tk_r} ✓ — {_done_pre[0]}/{len(_tks_sc)}")
+
+                        for _i_sc, _tk_sc in enumerate(_tks_sc):
+                            _cnt_sc.write(f"⚡ Calculando {_i_sc+1}/{len(_tks_sc)}: {_tk_sc}")
+                            _inf_sc, _news_idx_pre = _prefetch.get(_tk_sc, ({}, []))
+                            try:
                                 _n_an    = int(_inf_sc.get("numberOfAnalystOpinions",0) or 0)
                                 _rec_mean = float(_inf_sc.get("recommendationMean",3.0) or 3.0)
                                 _rec_key  = str(_inf_sc.get("recommendationKey","-") or "-").lower()
-                                # Calcular % Buy desde numberOfBuyAnalysts si disponible
                                 _n_strong_buy = int(_inf_sc.get("numberOfStrongBuyAnalysts",0) or 0)
                                 _n_buy        = int(_inf_sc.get("numberOfBuyAnalysts",0) or 0)
                                 _n_hold       = int(_inf_sc.get("numberOfHoldAnalysts",0) or 0)
@@ -18651,9 +18675,9 @@ with tab_score:
                                     ],
                                 }
                                 try:
-                                    import yfinance as _yf_idx
                                     import re as _re_idx
-                                    _news_idx = _yf_idx.Ticker(_tk_sc).news or []
+                                    # v19.2: usar noticias del prefetch paralelo
+                                    _news_idx = _news_idx_pre or []
                                     _hoy_idx  = _dt_sc_info.date.today()
                                     for _news_item in _news_idx[:25]:
                                         _title_idx = str(_news_item.get("title","") or "").lower()
@@ -19458,7 +19482,11 @@ with tab_score:
 
             _nbis_rows_new.sort(key=lambda x: x["TOTAL"], reverse=True)
             _mom_rows_new.sort(key=lambda x:  x["TOTAL"], reverse=True)
+            _n_total = len(_nbis_rows_new) + len(_mom_rows_new)
             _cnt_sc.empty()
+            _sc_status.update(
+                label=f"✅ Score MVALLE listo — {_n_total} candidatos ({len(_nbis_rows_new)} NBIS · {len(_mom_rows_new)} Momentum)",
+                state="complete", expanded=False)
             st.session_state["_score_rows_base"] = (_nbis_rows_new, _mom_rows_new)
             st.session_state["_score_cache_ts"]  = _tsc2.time()
             st.session_state["_score_total_m3"]  = len(_nbis_rows_new)+len(_mom_rows_new)
@@ -19573,9 +19601,11 @@ with tab_score:
             if _cands_cs:
                 # v19.3 fix definitivo: separar "nunca calculado" de "calculado con fallo"
                 # El bucle infinito ocurría porque:
-                # v19.2 fix: simplificado — sin escape anti-stuck que causaba
-                # loop de reruns y el diálogo "Clear caches".
-                # Una sola pasada: calcular todos los pendientes, guardar, rerun si hubo cambios.
+                # v19.2 fix: sin st.rerun() — causa loop "Clear caches"
+                # El C-Score se calcula, se guarda en session_state, y el
+                # render de las cards usa session_state directamente.
+                # El próximo rerun natural (interacción del usuario) mostrará
+                # el C-Score actualizado sin necesidad de forzar uno aquí.
                 _cs_pending = [r for r in _cands_cs
                                if f"cscore_{r['Ticker']}" not in st.session_state]
                 if _cs_pending:
@@ -19594,16 +19624,13 @@ with tab_score:
                             return row["Ticker"], _cs
                         with _TpE_cs(max_workers=4) as _ex_cs:
                             _cs_results = list(_ex_cs.map(_calc_cs, _cs_pending))
-                    _cs_changed = False
+                    # Guardar en session_state — sin rerun
                     for _tk_cs, _cs_res in _cs_results:
-                        if st.session_state.get(f"cscore_{_tk_cs}") != _cs_res:
-                            st.session_state[f"cscore_{_tk_cs}"] = _cs_res
-                            _cs_changed = True
+                        st.session_state[f"cscore_{_tk_cs}"] = _cs_res
+                    # Actualizar C_Score en los rows para este render
                     for _r in _nbis_rows + _mom_rows:
                         _r["C_Score"] = st.session_state.get(
                             f"cscore_{_r['Ticker']}", {}).get("c_total")
-                    if _cs_changed:
-                        st.rerun()
             # Agrupar por sector
             # Agrupar por sector preservando orden por score (mejor primero)
             _nbis_sectores = {}
@@ -19929,13 +19956,17 @@ with tab_score:
                              "#FFFBEB" if _vered.startswith("🟡") else "#F8FAFC"
                     _vreason = "calculando C-Score..."
 
-                st.markdown(
-                    f'<div style="padding:6px 10px;margin-bottom:4px;background:{_vbg};'
-                    f'border:1px solid {_vc}60;border-top:none;border-left:3px solid {_vc};'
-                    f'border-bottom:3px solid {_vc};border-radius:0 0 6px 6px">'
-                    f'<span style="font-size:12px;font-weight:900;color:{_vc}">{_vered}</span>'
-                    f'<span style="font-size:10px;color:{_vc}90;margin-left:8px">{_vreason}</span>'
-                    f'</div>', unsafe_allow_html=True)
+                # Mostrar veredicto solo si no hay N10 IA calculado aún
+                # (cuando hay N10 IA, el veredicto cruzado ya incluye todo)
+                _n10_ya_calculado = bool(st.session_state.get(f"n10_nbis_{_rn['Ticker']}"))
+                if not _n10_ya_calculado:
+                    st.markdown(
+                        f'<div style="padding:6px 10px;margin-bottom:4px;background:{_vbg};'
+                        f'border:1px solid {_vc}60;border-top:none;border-left:3px solid {_vc};'
+                        f'border-bottom:3px solid {_vc};border-radius:0 0 6px 6px">'
+                        f'<span style="font-size:12px;font-weight:900;color:{_vc}">{_vered}</span>'
+                        f'<span style="font-size:10px;color:{_vc}90;margin-left:8px">{_vreason}</span>'
+                        f'</div>', unsafe_allow_html=True)
 
                 # ── v19.3 ESPERAR CAT — mostrar QUÉ catalizador esperar ──
                 if "ESPERAR" in _vered:
