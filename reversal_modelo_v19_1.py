@@ -16270,6 +16270,12 @@ with tab8:
 
 # ══ TAB SCORE MVALLE v4 — 2 secciones con datos reales ════════
 with tab_score:
+    # ══ BANDERAS DE DIAGNÓSTICO v19.2 ══════════════════════════
+    # Cada bandera aparece en pantalla cuando el código llega ahí.
+    # Si el tab se queda en blanco en una bandera → el error está
+    # entre esa bandera y la siguiente.
+    _dbg = st.empty()
+    _dbg.caption("🚩 F1: Tab iniciando...")
     _mostrar_banner_sin_creditos("score")
     # ── ETF sectorial → temperatura del área (Fase 1 · solo informativo) ────
     _ETF_MAP = {
@@ -18333,6 +18339,7 @@ with tab_score:
     # Banner macro con SPY RSI live (calculado en el batch)
     _spy_rsi_banner = st.session_state.get("_spy_rsi_for_banner", 0)
     _banner_mercado_macro(_spy_rsi_banner)
+    _dbg.caption("🚩 F2: Funciones definidas · Banner mercado OK")
 
     # Botón recalcular + live
     _sc1, _sc2, _sc3 = st.columns([1,1,2])
@@ -18369,6 +18376,7 @@ with tab_score:
             f'</div>', unsafe_allow_html=True)
 
     if "_score_rows_base" not in st.session_state:
+        _dbg.caption("🚩 F3: Iniciando scan (no hay cache)")
         _sc_status = st.status("📡 Calculando Score MVALLE...", expanded=True)
         with _sc_status:
             _cnt_sc = st.empty()
@@ -19443,8 +19451,10 @@ with tab_score:
             st.session_state["_score_rows_base"] = (_nbis_rows_new, _mom_rows_new)
             st.session_state["_score_cache_ts"]  = _tsc2.time()
             st.session_state["_score_total_m3"]  = len(_nbis_rows_new)+len(_mom_rows_new)
+            _dbg.caption("🚩 F4: Scan completo — guardado en cache")
 
     _nbis_rows, _mom_rows = st.session_state.get("_score_rows_base", ([],[]))
+    _dbg.caption(f"🚩 F5: Datos listos — {len(_nbis_rows)} NBIS · {len(_mom_rows)} Momentum · iniciando render")
 
     # ── Botón Live (opcional) ─────────────────────────────────
     if _btn_live and (_nbis_rows or _mom_rows):
@@ -19519,6 +19529,7 @@ with tab_score:
                 f'</div>', unsafe_allow_html=True)
 
         # ══ SECCIÓN NBIS ══════════════════════════════════════
+        _dbg.caption(f"🚩 F6: Render NBIS ({len(_nbis_rows)} filas)")
         if _nbis_rows:
             # Mostrar resumen rápido: cuántas en cada estado
             _n_entrar = sum(1 for r in _nbis_rows if r.get("Rec","").startswith("✅"))
@@ -19551,6 +19562,7 @@ with tab_score:
 
             # Calcular C-Score en background para candidatos Score≥12 (NBIS + Momentum)
             _cands_cs = [r for r in _nbis_rows + _mom_rows if r["TOTAL"] >= 12]
+            _dbg.caption(f"🚩 F7: C-Score pendiente ({len(_cands_cs)} candidatos)")
             if _cands_cs:
                 # v19.3 fix definitivo: separar "nunca calculado" de "calculado con fallo"
                 # El bucle infinito ocurría porque:
@@ -22489,6 +22501,7 @@ Devuelve array JSON:
 
 
 with tab_noticias_v2:
+    st.caption("🔧 Noticias IA v2 iniciando...")
     import json as _json_v2
     import datetime as _dt_v2
     import time as _time_v2
